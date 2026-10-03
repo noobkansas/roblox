@@ -10,6 +10,17 @@
 	  · 去掉十字线
 	  · 外框细淡：Thickness 1, Transparency 0.85
 	  · ZIndexBehavior 回 Sibling
+可调参数（脚本顶部）：
+天线高度 160 POLE_HEIGHT
+天线粗细 0.8 POLE_THICK
+天线离头距离 2 ANTENNA_BOTTOM_OFFSET
+名字字号 18 NAME_TEXT_SIZE
+距离字号 14 DIST_TEXT_SIZE
+雷达半径 150 RADAR_RADIUS
+雷达范围 375 RADAR_MAX_DIST
+雷达点大小 7 RADAR_DOT_SIZE
+刷新间隔 0.05 REFRESH_RATE
+显示自己 false SHOW_FOR_SELF
 ]]
 
 print("[Antenna V11] 脚本开始加载...")
