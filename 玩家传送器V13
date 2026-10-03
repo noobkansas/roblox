@@ -1,0 +1,2214 @@
+--[[ 玩家传送管理器 v13 · 支持 ^ 本地坐标前缀 ]]--
+local SCRIPT_ID   = "PlayerTpMgr"
+local VERSION     = 13
+local CFG_VERSION = 13
+
+local HDL, HDR_H, TITLE_H, ROW_H = 14, 30, 38, 28
+local SAVE_FILE = "PlayerTpMgr.json"
+local SAVE_INT  = 15
+local DBL_MS    = 400
+
+local Players = game:GetService("Players")
+local UIS     = game:GetService("UserInputService")
+local RS      = game:GetService("RunService")
+local Tween   = game:GetService("TweenService")
+local Http    = game:GetService("HttpService")
+local LP      = Players.LocalPlayer
+
+local gE = (type(getgenv) == "function" and getgenv()) or _G
+local pv = gE[SCRIPT_ID]
+if type(pv) == "table" and type(pv.version) == "number" then
+    if pv.version >= VERSION then warn("["..SCRIPT_ID.."] 已在运行"); return end
+    if type(pv.destroy) == "function" then pcall(pv.destroy) end
+end
+
+local Th = {
+    Bg=Color3.fromRGB(22,22,26), Sur=Color3.fromRGB(33,33,40),
+    Sec=Color3.fromRGB(28,28,34), Str=Color3.fromRGB(58,58,70),
+    Txt=Color3.fromRGB(236,236,246), Sub=Color3.fromRGB(148,148,165),
+    Acc=Color3.fromRGB(88,140,255), AccD=Color3.fromRGB(44,72,130),
+    Ok=Color3.fromRGB(86,200,122), Err=Color3.fromRGB(240,92,92),
+    Warn=Color3.fromRGB(240,180,80), Hdl=Color3.fromRGB(230,230,240),
+    Grn=Color3.fromRGB(60,140,90), BluBtn=Color3.fromRGB(60,100,190),
+}
+
+local St = {
+    mode = "smooth", speed = 30, prec = 10,
+    noclip = "persistent", path = "direct", bypass = "off",
+    stealthMaxStep = 18,
+    tpMode = "single",
+    interval = 1.5, stickyRate = 60,
+    offset = { x = "0", y = "5", z = "0" },   -- v13: 字符串，可带 ^ 前缀
+    localOffset = false,                       -- 全局默认：无 ^ 时是否本地
+    lockPos = true,
+    tpTargets = {}, camList = {},
+    selAll = {}, selTp = {}, selCam = {},
+    multi = true, sortBy = "none", sortAsc = true,
+    camCurrent = nil, tempFollow = nil,
+    mainX = 40, mainY = 60, mainW = 560, mainH = 800,
+    mainMin = false, hidden = false,
+    blocks = {},
+}
+
+local NOCLIP_OPTS = {{id="off",label="关"},{id="basic",label="基础"},{id="all",label="全部"},{id="persistent",label="持续"}}
+local PATH_OPTS   = {{id="direct",label="直线"},{id="lift",label="抬升"},{id="bezier",label="曲线"}}
+local BYPASS_OPTS = {{id="off",label="关闭"},{id="walk",label="物理"},{id="hybrid",label="混合"},{id="stealth",label="隐蔽"}}
+local BYPASS_DESC = {
+    off="直接 CFrame，最快，最明显",
+    walk="Humanoid:Move + WalkSpeed（速度≤300）",
+    hybrid="每帧 CFrame + 朝向对齐（无速度残留）",
+    stealth="混合 + 缓动/曲线/微停/地面吸附",
+}
+
+local hasFile = type(writefile)=="function" and type(readfile)=="function" and type(isfile)=="function"
+
+local function saveCfg()
+    if not hasFile then return end
+    local dump = {}
+    for k, v in pairs(St) do dump[k] = v end
+    dump._cfgVersion = CFG_VERSION
+    local ok, en = pcall(function() return Http:JSONEncode(dump) end)
+    if ok and en then pcall(writefile, SAVE_FILE, en) end
+end
+
+local function loadCfg()
+    if not hasFile then return end
+    local ok, ex = pcall(isfile, SAVE_FILE)
+    if not ok or not ex then return end
+    local ok2, c = pcall(readfile, SAVE_FILE)
+    if not ok2 or type(c) ~= "string" then return end
+    local ok3, d = pcall(function() return Http:JSONDecode(c) end)
+    if not ok3 or type(d) ~= "table" then return end
+    if tonumber(d._cfgVersion or 0) > CFG_VERSION then return end
+    for k, v in pairs(d) do
+        if k:sub(1,1) ~= "_" then
+            if k == "offset" and type(v) == "table" then
+                St.offset.x = tostring(v.x or "0")
+                St.offset.y = tostring(v.y or "5")
+                St.offset.z = tostring(v.z or "0")
+            elseif (k == "tpTargets" or k == "camList") and type(v) == "table" then
+                local arr = {}
+                for _, uid in ipairs(v) do local n = tonumber(uid); if n then table.insert(arr, n) end end
+                St[k] = arr
+            elseif k == "blocks" and type(v) == "table" then
+                St.blocks = v
+            elseif k == "selected" or k == "selAll" or k == "selTp" or k == "selCam" then
+            else
+                St[k] = v
+            end
+        end
+    end
+end
+loadCfg()
+if type(St.blocks) ~= "table" then St.blocks = {} end
+if type(St.tpTargets) ~= "table" then St.tpTargets = {} end
+if type(St.camList) ~= "table" then St.camList = {} end
+if type(St.offset) ~= "table" then St.offset = {x="0",y="5",z="0"} end
+-- v13: 数字旧格式转字符串
+if type(St.offset.x) == "number" then St.offset.x = tostring(St.offset.x) end
+if type(St.offset.y) == "number" then St.offset.y = tostring(St.offset.y) end
+if type(St.offset.z) == "number" then St.offset.z = tostring(St.offset.z) end
+if type(St.offset.x) ~= "string" then St.offset.x = "0" end
+if type(St.offset.y) ~= "string" then St.offset.y = "5" end
+if type(St.offset.z) ~= "string" then St.offset.z = "0" end
+St.selAll = {}; St.selTp = {}; St.selCam = {}
+if not St.stickyRate or St.stickyRate < 1 then St.stickyRate = 60 end
+
+local Conns = {}
+local dead = false
+local function trk(c) table.insert(Conns, c); return c end
+
+local zCounter = 1000
+local function nextZ() zCounter = zCounter + 1; return zCounter end
+
+local function mk(cls, props, kids)
+    local i = Instance.new(cls)
+    local p
+    if props then
+        for k, v in pairs(props) do
+            if k == "Parent" then p = v
+            else pcall(function() i[k] = v end) end
+        end
+    end
+    if kids then for _, c in ipairs(kids) do c.Parent = i end end
+    if p then i.Parent = p end
+    return i
+end
+
+local function guiP()
+    if type(gethui) == "function" then
+        local ok, r = pcall(gethui)
+        if ok and r and typeof(r) == "Instance" and r ~= game then
+            local ok2 = pcall(function() local t=Instance.new("Folder"); t.Parent=r; t:Destroy() end)
+            if ok2 then return r end
+        end
+    end
+    local ok, cg = pcall(function() return game:GetService("CoreGui") end)
+    if ok and cg then
+        local ok2 = pcall(function() local t=Instance.new("Folder"); t.Parent=cg; t:Destroy() end)
+        if ok2 then return cg end
+    end
+    return LP:FindFirstChildOfClass("PlayerGui") or LP:WaitForChild("PlayerGui")
+end
+
+local function cl(v, lo, hi) if v < lo then return lo end if v > hi then return hi end return v end
+local function clSpd(v) return cl(math.floor((tonumber(v) or 30)+0.5), 1, 200000) end
+local function clPrec(v) return cl(math.floor((tonumber(v) or 10)+0.5), 1, 500) end
+local function clStep(v) return cl(math.floor((tonumber(v) or 18)+0.5), 1, 500) end
+local function clInterval(v) return cl(tonumber(v) or 1.5, 0.01, 60) end
+local function clRate(v) return cl(math.floor((tonumber(v) or 60)+0.5), 1, 240) end
+local function inRect(px, py, obj)
+    local p, s = obj.AbsolutePosition, obj.AbsoluteSize
+    if not p or not s then return false end
+    return px >= p.X and px <= p.X + s.X and py >= p.Y and py <= p.Y + s.Y
+end
+
+-- ==================== v13: 偏移解析（支持 ^ 前缀） ====================
+-- 返回: Vector3(数值), boolean(是否任意轴带 ^)
+local function parseOffset()
+    local function parseAxis(str, def)
+        str = tostring(str or ""):gsub("^%s+", ""):gsub("%s+$", "")
+        local isLocal = false
+        if str:sub(1,1) == "^" then
+            isLocal = true
+            str = str:sub(2):gsub("^%s+", "")
+        end
+        local n = tonumber(str)
+        if not n then n = def end
+        return n, isLocal
+    end
+    local ox, lx = parseAxis(St.offset.x, 0)
+    local oy, ly = parseAxis(St.offset.y, 5)
+    local oz, lz = parseAxis(St.offset.z, 0)
+    return Vector3.new(ox, oy, oz), (lx or ly or lz)
+end
+
+local sg = mk("ScreenGui", {
+    Name = "PlayerTpMgr", ResetOnSpawn = false, IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 999999,
+})
+sg.Parent = guiP()
+
+local notifGui = mk("ScreenGui", {
+    Name = "PlayerTpMgr_Notif", ResetOnSpawn = false, IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 1000000,
+})
+notifGui.Parent = guiP()
+local notifHolder = mk("Frame", {
+    AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -20, 1, -20),
+    Size = UDim2.fromOffset(280, 0), AutomaticSize = Enum.AutomaticSize.Y,
+    BackgroundTransparency = 1, Parent = notifGui,
+})
+mk("UIListLayout", {
+    FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder,
+    Padding=UDim.new(0,8), HorizontalAlignment=Enum.HorizontalAlignment.Right,
+    VerticalAlignment=Enum.VerticalAlignment.Bottom, Parent=notifHolder,
+})
+
+local nid = 0
+local function notify(title, msg, dur, color)
+    if dead then return end
+    nid = nid + 1
+    local card = mk("Frame", {
+        Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y,
+        BackgroundColor3=Th.Sur, BackgroundTransparency=1, BorderSizePixel=0,
+        LayoutOrder=nid, Parent=notifHolder,
+    })
+    local stroke = mk("UIStroke", { Color=color or Th.Str, Thickness=1, Transparency=1, Parent=card })
+    mk("UICorner", { CornerRadius=UDim.new(0,8), Parent=card })
+    mk("UIPadding", { PaddingTop=UDim.new(0,10), PaddingBottom=UDim.new(0,10), PaddingLeft=UDim.new(0,14), PaddingRight=UDim.new(0,14), Parent=card })
+    mk("UIListLayout", { FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,3), Parent=card })
+    local tl = mk("TextLabel", {
+        Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1,
+        Font=Enum.Font.GothamBold, TextSize=13, TextColor3=color or Th.Txt,
+        TextXAlignment=Enum.TextXAlignment.Left, TextWrapped=true, Text=title,
+        TextTransparency=1, LayoutOrder=1, Parent=card,
+    })
+    local ml = mk("TextLabel", {
+        Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1,
+        Font=Enum.Font.Gotham, TextSize=12, TextColor3=Th.Sub,
+        TextXAlignment=Enum.TextXAlignment.Left, TextWrapped=true, Text=msg or "",
+        TextTransparency=1, LayoutOrder=2, Parent=card,
+    })
+    local fi = TweenInfo.new(0.25, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    Tween:Create(card, fi, {BackgroundTransparency=0}):Play()
+    Tween:Create(stroke, fi, {Transparency=0}):Play()
+    Tween:Create(tl, fi, {TextTransparency=0}):Play()
+    Tween:Create(ml, fi, {TextTransparency=0}):Play()
+    task.delay(dur or 3, function()
+        if dead or not card.Parent then return end
+        local fo = TweenInfo.new(0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+        Tween:Create(card, fo, {BackgroundTransparency=1}):Play()
+        Tween:Create(stroke, fo, {Transparency=1}):Play()
+        Tween:Create(tl, fo, {TextTransparency=1}):Play()
+        Tween:Create(ml, fo, {TextTransparency=1}):Play()
+        task.delay(0.4, function() if not dead and card.Parent then card:Destroy() end end)
+    end)
+end
+
+local dragState, resizeState = nil, nil
+local function startDrag(frame, inputPos, onEnd)
+    dragState = { frame=frame, startMouse=inputPos, startPos=frame.Position, onEnd=onEnd }
+end
+local function startResize(frame, inputPos, opts)
+    opts = opts or {}
+    resizeState = {
+        frame=frame, startMouse=inputPos,
+        startSize=Vector2.new(frame.AbsoluteSize.X, frame.AbsoluteSize.Y),
+        minW=opts.minW or 200, minH=opts.minH or 60,
+        maxW=opts.maxW or 1200, maxH=opts.maxH or 1600,
+        onEnd=opts.onEnd,
+    }
+end
+
+trk(UIS.InputChanged:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement
+       and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if dragState and dragState.frame.Parent then
+        local d = input.Position - dragState.startMouse
+        dragState.frame.Position = UDim2.new(
+            dragState.startPos.X.Scale, dragState.startPos.X.Offset + d.X,
+            dragState.startPos.Y.Scale, dragState.startPos.Y.Offset + d.Y
+        )
+    end
+    if resizeState and resizeState.frame.Parent then
+        local d = input.Position - resizeState.startMouse
+        local w = cl(resizeState.startSize.X + d.X, resizeState.minW, resizeState.maxW)
+        local h = cl(resizeState.startSize.Y + d.Y, resizeState.minH, resizeState.maxH)
+        resizeState.frame.Size = UDim2.fromOffset(w, h)
+    end
+end))
+trk(UIS.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
+        if dragState then if dragState.onEnd then pcall(dragState.onEnd) end; dragState = nil end
+        if resizeState then if resizeState.onEnd then pcall(resizeState.onEnd) end; resizeState = nil end
+    end
+end))
+
+local main = mk("Frame", {
+    Name="Main", Position=UDim2.fromOffset(St.mainX, St.mainY),
+    Size=UDim2.fromOffset(St.mainW, St.mainH),
+    BackgroundColor3=Th.Bg, BorderSizePixel=0, Active=true,
+    ClipsDescendants=true, ZIndex=100, Parent=sg,
+})
+mk("UICorner", { CornerRadius=UDim.new(0,10), Parent=main })
+mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=main })
+
+local mHdr = mk("Frame", {
+    Name="Hdr", Size=UDim2.new(1,0,0,TITLE_H), BackgroundColor3=Th.Sur,
+    BorderSizePixel=0, Active=true, ZIndex=101, Parent=main,
+})
+mk("UICorner", { CornerRadius=UDim.new(0,10), Parent=mHdr })
+mk("TextLabel", {
+    Size=UDim2.new(1,-84,1,0), Position=UDim2.fromOffset(14,0),
+    BackgroundTransparency=1, Font=Enum.Font.GothamBold, TextSize=14,
+    TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left,
+    Text="玩家传送 / 摄像机", ZIndex=102, Parent=mHdr, Active=false,
+})
+local mMin = mk("TextButton", {
+    Size=UDim2.fromOffset(26,26), Position=UDim2.new(1,-64,0.5,-13),
+    BackgroundColor3=Th.Bg, BorderSizePixel=0, AutoButtonColor=true,
+    Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Th.Sub, Text="—",
+    ZIndex=102, Parent=mHdr,
+})
+mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=mMin })
+mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=mMin })
+local mCls = mk("TextButton", {
+    Size=UDim2.fromOffset(26,26), Position=UDim2.new(1,-34,0.5,-13),
+    BackgroundColor3=Th.Err, BorderSizePixel=0, AutoButtonColor=true,
+    Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Color3.fromRGB(255,255,255), Text="X",
+    ZIndex=102, Parent=mHdr,
+})
+mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=mCls })
+
+local cScroll = mk("ScrollingFrame", {
+    Name="Scroll", Size=UDim2.new(1,0,1,-TITLE_H), Position=UDim2.fromOffset(0,TITLE_H),
+    BackgroundTransparency=1, BorderSizePixel=0,
+    CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y,
+    ScrollBarThickness=4, ScrollBarImageColor3=Th.Str, ZIndex=101, Parent=main,
+})
+local cInner = mk("Frame", {
+    Name="Inner", Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y,
+    BackgroundTransparency=1, ZIndex=101, Parent=cScroll,
+})
+mk("UIListLayout", {
+    Name="IL", FillDirection=Enum.FillDirection.Vertical,
+    SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,8), Parent=cInner,
+})
+mk("UIPadding", {
+    PaddingTop=UDim.new(0,10), PaddingBottom=UDim.new(0,10),
+    PaddingLeft=UDim.new(0,10), PaddingRight=UDim.new(0,10), Parent=cInner,
+})
+
+local mRH = mk("Frame", {
+    Name="RH", AnchorPoint=Vector2.new(1,1), Position=UDim2.new(1,-4,1,-4),
+    Size=UDim2.fromOffset(HDL,HDL), BackgroundColor3=Th.Hdl,
+    BackgroundTransparency=0.15, BorderSizePixel=0, Active=true,
+    ZIndex=900, Parent=main,
+})
+mk("UICorner", { CornerRadius=UDim.new(0,3), Parent=mRH })
+
+trk(mHdr.InputBegan:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1
+       and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if dragState then return end
+    if inRect(input.Position.X, input.Position.Y, mMin) then return end
+    if inRect(input.Position.X, input.Position.Y, mCls) then return end
+    main.ZIndex = nextZ(); mHdr.ZIndex = main.ZIndex + 1
+    startDrag(main, input.Position, function()
+        St.mainX = main.Position.X.Offset; St.mainY = main.Position.Y.Offset; saveCfg()
+    end)
+end))
+trk(mRH.InputBegan:Connect(function(input)
+    if input.UserInputType ~= Enum.UserInputType.MouseButton1
+       and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    startResize(main, input.Position, {
+        minW=320, minH=220, maxW=900, maxH=1400,
+        onEnd=function()
+            St.mainW = main.AbsoluteSize.X; St.mainH = main.AbsoluteSize.Y; saveCfg()
+        end,
+    })
+end))
+
+local function applyMainMin()
+    if St.mainMin then
+        main.Size = UDim2.fromOffset(main.AbsoluteSize.X, TITLE_H)
+        cScroll.Visible = false; mMin.Text = "+"; mRH.Visible = false
+    else
+        main.Size = UDim2.fromOffset(St.mainW, St.mainH)
+        cScroll.Visible = true; mMin.Text = "—"; mRH.Visible = true
+    end
+end
+trk(mMin.MouseButton1Click:Connect(function()
+    St.mainMin = not St.mainMin; applyMainMin(); saveCfg()
+end))
+
+local allBlocks = {}
+local function getBlockState(id)
+    if not St.blocks[id] then St.blocks[id] = {} end
+    local b = St.blocks[id]
+    b.detached = b.detached or false
+    b.minimized = b.minimized or false
+    b.detX = b.detX or 140
+    b.detY = b.detY or 120
+    b.detW = b.detW or 380
+    b.detH = b.detH or 320
+    return b
+end
+
+local function applyGlobalVisibility()
+    main.Visible = not St.hidden
+    for _, bl in pairs(allBlocks) do
+        if bl.host == "detached" then bl.frame.Visible = not St.hidden end
+    end
+end
+
+local function createBlock(cfg)
+    local id = cfg.id
+    local bst = getBlockState(id)
+    local frm = mk("Frame", {
+        Name="Blk_"..id, Size=UDim2.new(1,0,0,HDR_H),
+        BackgroundColor3=Th.Sec, BorderSizePixel=0, Active=true,
+        ClipsDescendants=true, LayoutOrder=cfg.order or 100,
+        ZIndex=110, Parent=cInner,
+    })
+    mk("UICorner", { CornerRadius=UDim.new(0,8), Parent=frm })
+    mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=frm })
+
+    local hdr = mk("Frame", {
+        Name="H", Size=UDim2.new(1,0,0,HDR_H), BackgroundColor3=Th.Sur,
+        BorderSizePixel=0, Active=true, ZIndex=1, Parent=frm,
+    })
+    mk("UICorner", { CornerRadius=UDim.new(0,8), Parent=hdr })
+    mk("TextLabel", {
+        Size=UDim2.new(1,-96,1,0), Position=UDim2.fromOffset(12,0),
+        BackgroundTransparency=1, Font=Enum.Font.GothamBold, TextSize=12,
+        TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left,
+        Text=cfg.title, ZIndex=2, Parent=hdr, Active=false,
+    })
+    local minBtn = mk("TextButton", {
+        Size=UDim2.fromOffset(26,26), Position=UDim2.new(1,-64,0.5,-13),
+        BackgroundColor3=Th.Bg, BorderSizePixel=0, AutoButtonColor=true,
+        Font=Enum.Font.GothamBold, TextSize=16, TextColor3=Th.Txt, Text="—",
+        ZIndex=2, Parent=hdr,
+    })
+    mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=minBtn })
+    mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=minBtn })
+    local detBtn = mk("TextButton", {
+        Size=UDim2.fromOffset(26,26), Position=UDim2.new(1,-34,0.5,-13),
+        BackgroundColor3=Th.BluBtn, BorderSizePixel=0, AutoButtonColor=true,
+        Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Color3.fromRGB(255,255,255), Text="⇱",
+        ZIndex=2, Parent=hdr,
+    })
+    mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=detBtn })
+
+    local body = mk("Frame", {
+        Name="B", Size=UDim2.new(1,0,0,0), Position=UDim2.fromOffset(0,HDR_H),
+        AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1,
+        ZIndex=1, Parent=frm,
+    })
+    mk("UIListLayout", {
+        Name="IL", FillDirection=Enum.FillDirection.Vertical,
+        SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,6), Parent=body,
+    })
+    mk("UIPadding", {
+        PaddingTop=UDim.new(0,8), PaddingBottom=UDim.new(0,8),
+        PaddingLeft=UDim.new(0,10), PaddingRight=UDim.new(0,10), Parent=body,
+    })
+    local rh = mk("Frame", {
+        Name="RH", AnchorPoint=Vector2.new(1,1), Position=UDim2.new(1,-4,1,-4),
+        Size=UDim2.fromOffset(HDL,HDL), BackgroundColor3=Th.Hdl,
+        BackgroundTransparency=0.15, BorderSizePixel=0, Active=true,
+        Visible=false, ZIndex=60, Parent=frm,
+    })
+    mk("UICorner", { CornerRadius=UDim.new(0,3), Parent=rh })
+
+    local self = {
+        id=id, frame=frm, header=hdr, body=body, toggle=minBtn, rh=rh,
+        detBtn=detBtn, host="main", scrollFrame=nil, layoutOrder=cfg.order or 100,
+    }
+
+    local function updateHandle()
+        rh.Visible = (self.host == "detached" and not bst.minimized)
+        if self.host == "detached" then
+            detBtn.Text = "⇲"; detBtn.BackgroundColor3 = Th.Grn
+        else
+            detBtn.Text = "⇱"; detBtn.BackgroundColor3 = Th.BluBtn
+        end
+    end
+    local function refreshHeight()
+        if self.host ~= "main" then return end
+        if bst.minimized then frm.Size = UDim2.new(1,0,0,HDR_H)
+        else
+            local bh = body.AbsoluteSize.Y
+            if bh and bh > 0 then frm.Size = UDim2.new(1,0,0,HDR_H + bh) end
+        end
+    end
+    trk(body:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
+        if self.host == "main" then refreshHeight() end
+    end))
+
+    local function applyMinimized()
+        body.Visible = not bst.minimized
+        minBtn.Text = bst.minimized and "+" or "—"
+        if self.host == "main" then refreshHeight()
+        else
+            if bst.minimized then frm.Size = UDim2.fromOffset(frm.AbsoluteSize.X, HDR_H)
+            else frm.Size = UDim2.fromOffset(bst.detW, bst.detH) end
+        end
+        updateHandle()
+    end
+    self.applyMinimized = applyMinimized
+
+    trk(minBtn.MouseButton1Click:Connect(function()
+        bst.minimized = not bst.minimized; applyMinimized(); saveCfg()
+    end))
+
+    if cfg.build then cfg.build(body, self) end
+
+    trk(rh.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+           and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if self.host ~= "detached" then return end
+        startResize(frm, input.Position, {
+            minW=220, minH=HDR_H+20, maxW=900, maxH=1400,
+            onEnd=function()
+                bst.detW = frm.AbsoluteSize.X; bst.detH = frm.AbsoluteSize.Y; saveCfg()
+            end,
+        })
+    end))
+
+    function self:detach()
+        if self.host == "detached" then return end
+        local finalW = bst.detW or 380
+        local finalH = bst.detH or math.max(200, HDR_H + body.AbsoluteSize.Y + 20)
+        bst.detW, bst.detH = finalW, finalH
+        frm.Size = UDim2.fromOffset(finalW, finalH)
+        frm.Parent = sg
+        frm.Position = UDim2.fromOffset(bst.detX, bst.detY)
+        frm.ZIndex = nextZ()
+        local sf = mk("ScrollingFrame", {
+            Name="SF", Size=UDim2.new(1,0,1,-HDR_H), Position=UDim2.fromOffset(0,HDR_H),
+            BackgroundTransparency=1, BorderSizePixel=0,
+            CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y,
+            ScrollBarThickness=4, ScrollBarImageColor3=Th.Str, ZIndex=1, Parent=frm,
+        })
+        body.Parent = sf; body.Position = UDim2.fromOffset(0,0); body.Size = UDim2.new(1,0,0,0)
+        self.scrollFrame = sf
+        self.host = "detached"; bst.detached = true
+        applyMinimized(); applyGlobalVisibility()
+    end
+
+    function self:attach()
+        if self.host ~= "detached" then return end
+        if self.scrollFrame then
+            body.Parent = frm; self.scrollFrame:Destroy(); self.scrollFrame = nil
+        end
+        frm.Parent = cInner; frm.Position = UDim2.fromOffset(0,0); frm.ZIndex = 110
+        frm.LayoutOrder = self.layoutOrder
+        body.Position = UDim2.fromOffset(0,HDR_H); body.Size = UDim2.new(1,0,0,0)
+        self.host = "main"; bst.detached = false
+        applyMinimized(); applyGlobalVisibility()
+    end
+
+    trk(hdr.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1
+           and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if dragState then return end
+        local ix, iy = input.Position.X, input.Position.Y
+        if inRect(ix, iy, minBtn) then return end
+        if inRect(ix, iy, detBtn) then return end
+        local now = tick()
+        local isDbl = (now - (self._lastClick or 0)) < (DBL_MS / 1000)
+        self._lastClick = now
+        if isDbl then
+            if self.host == "main" then self:detach() else self:attach() end
+            return
+        end
+        if self.host == "detached" then
+            frm.ZIndex = nextZ()
+            startDrag(frm, input.Position, function()
+                bst.detX = frm.Position.X.Offset; bst.detY = frm.Position.Y.Offset; saveCfg()
+            end)
+        end
+    end))
+    trk(detBtn.MouseButton1Click:Connect(function()
+        if self.host == "main" then self:detach() else self:attach() end
+        saveCfg()
+    end))
+
+    allBlocks[id] = self
+    if bst.detached then task.defer(function() if not dead then self:detach() end end)
+    else applyMinimized() end
+    return self
+end
+
+-- ==================== 工具 ====================
+local function getMyRoot()
+    local ch = LP.Character
+    return ch and ch:FindFirstChild("HumanoidRootPart") or nil
+end
+local function getPlayerRoot(plr)
+    if not plr then return nil end
+    local ch = plr.Character
+    return ch and ch:FindFirstChild("HumanoidRootPart") or nil
+end
+local function isPlayerAlive(plr)
+    if not plr or not plr.Parent then return false end
+    local ch = plr.Character
+    if not ch then return false end
+    local hum = ch:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return false end
+    return ch:FindFirstChild("HumanoidRootPart") ~= nil
+end
+local function inList(list, uid)
+    for _, v in ipairs(list) do if v == uid then return true end end
+    return false
+end
+local function addToList(list, uid)
+    if not inList(list, uid) then table.insert(list, uid) end
+end
+local function removeFromList(list, uid)
+    for i = #list, 1, -1 do if list[i] == uid then table.remove(list, i) end end
+end
+
+-- v13: 使用 parseOffset（含 ^ 检测）
+local function computeDestAndFace(targetRoot)
+    local offsetVec, anyLocal = parseOffset()
+    local useLocal = anyLocal or St.localOffset
+    if not useLocal or not targetRoot or not targetRoot.Parent then
+        return targetRoot.Position + offsetVec, nil
+    end
+    local tCF = targetRoot.CFrame
+    local look = tCF.LookVector
+    local flatLook = Vector3.new(look.X, 0, look.Z)
+    if flatLook.Magnitude < 0.001 then flatLook = Vector3.new(0, 0, -1) end
+    flatLook = flatLook.Unit
+    local right = flatLook:Cross(Vector3.new(0, 1, 0))
+    local offsetWorld = right * offsetVec.X + Vector3.new(0, offsetVec.Y, 0) + flatLook * offsetVec.Z
+    local dest = targetRoot.Position + offsetWorld
+    return dest, CFrame.lookAt(dest, dest + flatLook)
+end
+
+-- ==================== 穿墙 ====================
+local persistentNoclip = {}
+local function trackPersistent(part)
+    if persistentNoclip[part] then return end
+    persistentNoclip[part] = {cc=part.CanCollide, ct=part.CanTouch}
+    part.CanCollide = false
+end
+local function restorePersistent()
+    local n = 0
+    for part, data in pairs(persistentNoclip) do
+        if part and part.Parent then
+            pcall(function() part.CanCollide = data.cc; part.CanTouch = data.ct end)
+            n = n + 1
+        end
+    end
+    table.clear(persistentNoclip)
+    return n
+end
+local function applyNoclipTransient()
+    if St.noclip == "off" or St.noclip == "persistent" then return nil end
+    local ch = LP.Character
+    if not ch then return nil end
+    local sv = {}
+    local parts = {}
+    if St.noclip == "basic" then
+        local r = ch:FindFirstChild("HumanoidRootPart")
+        if r then parts = {r} end
+    else
+        for _, p in ipairs(ch:GetDescendants()) do
+            if p:IsA("BasePart") then table.insert(parts, p) end
+        end
+    end
+    for _, p in ipairs(parts) do
+        sv[p] = {cc=p.CanCollide, ct=p.CanTouch}
+        p.CanCollide = false
+    end
+    return sv
+end
+local function restoreNoclipTransient(sv)
+    if not sv then return end
+    for p, s in pairs(sv) do
+        if p and p.Parent then
+            pcall(function() p.CanCollide = s.cc; p.CanTouch = s.ct end)
+        end
+    end
+end
+local function applyNoclipPersistent()
+    if St.noclip ~= "persistent" then return end
+    local ch = LP.Character
+    if not ch then return end
+    for _, p in ipairs(ch:GetDescendants()) do
+        if p:IsA("BasePart") then trackPersistent(p) end
+    end
+    local r = ch:FindFirstChild("HumanoidRootPart")
+    if r then trackPersistent(r) end
+end
+
+-- ==================== 传送引擎 ====================
+local function buildS(r)
+    local ch = LP.Character
+    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    return {
+        ch=ch, r=r, hum=hum,
+        origWalkSpeed = hum and hum.WalkSpeed or 16,
+        origJumpPower = hum and hum.JumpPower or 50,
+        origAutoRotate = hum and hum.AutoRotate or true,
+        origAutoJump = hum and hum.AutoJumpEnabled or true,
+        startTime = os.clock(),
+        lastDirH=nil, faceBlend=0,
+        curvePhase = math.random() * math.pi * 2,
+        rayTimer=0, startPos=r.Position, bv=nil,
+    }
+end
+
+local function hardSet(r, S, dest, faceCF)
+    if faceCF then r.CFrame = faceCF
+    else
+        local rp = r.CFrame - r.CFrame.Position
+        r.CFrame = CFrame.new(dest) * rp
+    end
+    pcall(function()
+        r.AssemblyLinearVelocity = Vector3.zero
+        r.AssemblyAngularVelocity = Vector3.zero
+    end)
+    if S and S.hum and S.hum.Parent then S.hum:Move(Vector3.zero, false) end
+end
+
+local function stepWalk(S, tgt, dt)
+    local r = S.r
+    if not r or not r.Parent then return true end
+    local hum = S.hum
+    if not hum or not hum.Parent then return true end
+    local pos = r.Position
+    local diff = tgt - pos
+    local horizDiff = Vector3.new(diff.X, 0, diff.Z)
+    local horizDist = horizDiff.Magnitude
+    local vertDist = diff.Y
+    if not S.bv and math.abs(vertDist) > 8 then
+        local bv = Instance.new("BodyVelocity")
+        bv.MaxForce = Vector3.new(0, math.huge, 0); bv.P = 2000
+        bv.Velocity = Vector3.new(0, math.sign(vertDist) * math.min(math.abs(vertDist) * 3, 300), 0)
+        bv.Parent = r; S.bv = bv
+    end
+    if S.bv then
+        if math.abs(vertDist) < 5 then S.bv:Destroy(); S.bv = nil
+        else S.bv.Velocity = Vector3.new(0, math.sign(vertDist) * math.min(math.abs(vertDist) * 3, 300), 0) end
+    end
+    if horizDist > 3 then hum:Move(horizDiff.Unit, false) else hum:Move(Vector3.zero, false) end
+    return (horizDist < 3 and math.abs(vertDist) < 5)
+end
+
+local function stepCFrame(S, tgt, dt, stealth, faceCF)
+    local r = S.r
+    if not r or not r.Parent then return true end
+    local pos = r.Position
+    local diff = tgt - pos
+    local dist = diff.Magnitude
+    local rp = r.CFrame - r.CFrame.Position
+    local arriveEps = math.max(0.1, 1 / math.max(1, St.prec))
+    if dist <= arriveEps then
+        if faceCF then r.CFrame = faceCF
+        else r.CFrame = CFrame.new(tgt) * rp end
+        pcall(function()
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.AssemblyAngularVelocity = Vector3.zero
+        end)
+        if S.hum and S.hum.Parent then S.hum:Move(Vector3.zero, false) end
+        return true
+    end
+    local speedMul = 1
+    if stealth then
+        local elapsed = os.clock() - S.startTime
+        local easeIn = 0.12
+        if elapsed < easeIn then speedMul = elapsed / easeIn end
+        local easeOutDist = 0.15 * St.speed
+        if dist < easeOutDist then speedMul = math.min(speedMul, dist / easeOutDist) end
+        if speedMul < 0.08 then speedMul = 0.08 end
+        speedMul = speedMul * (1 + (math.random() - 0.5) * 0.1)
+    end
+    local maxMove = St.speed * dt * speedMul
+    if maxMove > 100000 then maxMove = 100000 end
+    local move = math.min(maxMove, dist)
+    if move <= 0.0001 then
+        pcall(function()
+            r.AssemblyLinearVelocity = Vector3.new(0, r.AssemblyLinearVelocity.Y, 0)
+            r.AssemblyAngularVelocity = Vector3.zero
+        end)
+        return false
+    end
+    local stepCount = 1
+    if stealth then
+        local prec = math.max(1, St.prec)
+        stepCount = math.max(1, math.floor(move * prec))
+        if stepCount > 240 then stepCount = 240 end
+        local maxStep = St.stealthMaxStep or 18
+        if move / stepCount > maxStep then
+            stepCount = math.max(1, math.ceil(move / maxStep))
+            if stepCount > 400 then stepCount = 400 end
+        end
+    end
+    local stepMove = move / stepCount
+    local curPos = pos
+    for i = 1, stepCount do
+        local d = tgt - curPos
+        local remain = d.Magnitude
+        if remain < 0.001 then break end
+        local sd = math.min(stepMove, remain)
+        local dir = d.Unit
+        local offset = Vector3.zero
+        if stealth then
+            S.curvePhase = S.curvePhase + (dt / stepCount) * 1.8
+            local perp = Vector3.new(-d.Z, 0, d.X)
+            if perp.Magnitude > 0.01 then
+                offset = perp.Unit * math.sin(S.curvePhase) * 1.5 * 0.01 * sd
+            end
+        end
+        curPos = curPos + dir * sd + offset
+    end
+    local reached = (tgt - curPos).Magnitude <= arriveEps
+    if stealth and S.ch then
+        S.rayTimer = (S.rayTimer or 0) + dt
+        if S.rayTimer >= 0.05 then
+            S.rayTimer = 0
+            local params = RaycastParams.new()
+            params.FilterDescendantsInstances = {S.ch}
+            params.FilterType = Enum.RaycastFilterType.Exclude
+            local res = workspace:Raycast(curPos + Vector3.new(0, 8, 0), Vector3.new(0, -160, 0), params)
+            if res then
+                local dY = curPos.Y - res.Position.Y
+                if dY > -5 and dY < 10 then
+                    curPos = Vector3.new(curPos.X, res.Position.Y + 3, curPos.Z)
+                end
+            end
+        end
+    end
+    local finalCF
+    if faceCF then
+        finalCF = CFrame.lookAt(curPos, curPos + faceCF.LookVector)
+    else
+        local dispH = Vector3.new(curPos.X - pos.X, 0, curPos.Z - pos.Z)
+        if dispH.Magnitude > 0.001 then
+            if not S.lastDirH then
+                S.lastDirH = dispH.Unit; S.faceBlend = 0
+            else
+                S.faceBlend = S.faceBlend + (1 - S.faceBlend) * math.min(dt * 12, 1)
+                local blended = S.lastDirH:Lerp(dispH.Unit, S.faceBlend)
+                if blended.Magnitude > 0.01 then S.lastDirH = blended.Unit else S.lastDirH = dispH.Unit end
+            end
+            finalCF = CFrame.lookAt(curPos, curPos + S.lastDirH)
+        else
+            finalCF = CFrame.new(curPos) * rp
+        end
+    end
+    r.CFrame = finalCF
+    if stealth then
+        pcall(function()
+            local actualDisp = curPos - pos
+            r.AssemblyLinearVelocity = actualDisp / math.max(dt, 1/240)
+            r.AssemblyAngularVelocity = Vector3.zero
+        end)
+    else
+        pcall(function()
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.AssemblyAngularVelocity = Vector3.zero
+        end)
+    end
+    if S.hum and S.hum.Parent then S.hum:Move(Vector3.zero, false) end
+    if stealth and S.ch then
+        local hum = S.ch:FindFirstChildOfClass("Humanoid")
+        if hum then
+            local vel = r.AssemblyLinearVelocity
+            local hs = math.sqrt(vel.X*vel.X + vel.Z*vel.Z)
+            local cur = hum:GetState()
+            if hs > 2 then
+                if cur ~= Enum.HumanoidStateType.Running and cur ~= Enum.HumanoidStateType.Jumping and cur ~= Enum.HumanoidStateType.Freefall then
+                    hum:ChangeState(Enum.HumanoidStateType.Running)
+                end
+            elseif hs < 0.5 then
+                if cur == Enum.HumanoidStateType.Running then
+                    hum:ChangeState(Enum.HumanoidStateType.Landed)
+                end
+            end
+        end
+    end
+    return reached
+end
+
+local function stepInstant(S, tgt, faceCF)
+    local r = S.r
+    if not r or not r.Parent then return true end
+    if faceCF then r.CFrame = faceCF
+    else
+        local rp = r.CFrame - r.CFrame.Position
+        r.CFrame = CFrame.new(tgt) * rp
+    end
+    pcall(function()
+        r.AssemblyLinearVelocity = Vector3.zero
+        r.AssemblyAngularVelocity = Vector3.zero
+    end)
+    if S.hum and S.hum.Parent then S.hum:Move(Vector3.zero, false) end
+    return true
+end
+
+local function engineStep(S, tgt, dt, faceCF)
+    local byp = St.bypass
+    if byp == "walk" then return stepWalk(S, tgt, dt)
+    elseif byp == "hybrid" then return stepCFrame(S, tgt, dt, false, faceCF)
+    elseif byp == "stealth" then return stepCFrame(S, tgt, dt, true, faceCF)
+    else
+        if St.mode == "teleport" then return stepInstant(S, tgt, faceCF)
+        else return stepCFrame(S, tgt, dt, false, faceCF) end
+    end
+end
+
+local function cleanupS(S)
+    if not S then return end
+    if S.bv then pcall(function() S.bv:Destroy() end); S.bv = nil end
+    if S.hum and S.hum.Parent then
+        pcall(function()
+            S.hum.WalkSpeed = S.origWalkSpeed
+            S.hum.JumpPower = S.origJumpPower
+            if S.origAutoRotate ~= nil then S.hum.AutoRotate = S.origAutoRotate end
+            if S.origAutoJump ~= nil then S.hum.AutoJumpEnabled = S.origAutoJump end
+            S.hum:Move(Vector3.zero, false)
+        end)
+    end
+end
+
+local function doTpFixed(plr)
+    local r = getMyRoot()
+    if not r then return false end
+    local tR = getPlayerRoot(plr)
+    if not tR then return false end
+    local nocSv
+    if St.noclip == "persistent" then applyNoclipPersistent()
+    else nocSv = applyNoclipTransient() end
+    local dest, faceCF = computeDestAndFace(tR)
+    if St.mode == "teleport" and St.bypass == "off" then
+        if faceCF then r.CFrame = faceCF
+        else
+            local rp = r.CFrame - r.CFrame.Position
+            r.CFrame = CFrame.new(dest) * rp
+        end
+        pcall(function()
+            r.AssemblyLinearVelocity = Vector3.zero
+            r.AssemblyAngularVelocity = Vector3.zero
+        end)
+        local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        if hum then hum:Move(Vector3.zero, false) end
+        restoreNoclipTransient(nocSv)
+        if St.noclip == "persistent" then applyNoclipPersistent() end
+        return true
+    end
+    local S = buildS(r)
+    if St.bypass == "walk" then
+        if S.hum then S.hum.WalkSpeed = math.min(St.speed, 300) end
+    end
+    local done = false
+    local conn
+    conn = RS.Heartbeat:Connect(function(dt)
+        if dead or done then return end
+        if not r or not r.Parent then done = true; conn:Disconnect(); cleanupS(S); return end
+        local newTR = getPlayerRoot(plr)
+        if not newTR then done = true; conn:Disconnect(); cleanupS(S)
+            restoreNoclipTransient(nocSv); return
+        end
+        local curDest, curFace = computeDestAndFace(newTR)
+        if St.bypass == "walk" and S.hum and S.hum.Parent then
+            local ws = math.min(St.speed, 300)
+            if S.hum.WalkSpeed < ws then S.hum.WalkSpeed = ws end
+        end
+        if engineStep(S, curDest, dt, curFace) then
+            done = true; conn:Disconnect(); cleanupS(S)
+            if St.noclip == "persistent" then applyNoclipPersistent()
+            else restoreNoclipTransient(nocSv) end
+        end
+    end)
+    return true
+end
+
+-- ==================== 传送任务 ====================
+local tpTask = nil
+
+local function stopTpTask(silent)
+    if tpTask then
+        tpTask.running = false
+        if tpTask.S then cleanupS(tpTask.S) end
+        if tpTask.nocSv then restoreNoclipTransient(tpTask.nocSv) end
+        if tpTask.conn then pcall(function() tpTask.conn:Disconnect() end) end
+        tpTask = nil
+        if not silent then notify("传送", "已停止", 1.5, Th.Sub) end
+    end
+end
+
+local function startTpTask(uids)
+    if tpTask and tpTask.running then
+        notify("传送", "已有传送任务运行中", 2, Th.Warn); return
+    end
+    if not uids or #uids == 0 then
+        notify("传送", "传送列表选中为空", 2, Th.Warn); return
+    end
+    local nocSv
+    if St.noclip == "persistent" then applyNoclipPersistent()
+    else nocSv = applyNoclipTransient() end
+    tpTask = {
+        running=true, mode=St.tpMode, uids=uids,
+        idx=1, phase="moving", elapsed=0, stickyAcc=0,
+        S=nil, nocSv=nocSv, conn=nil,
+    }
+    local modeLabel = ({single="单次", sticky="粘滞", loop="循环"})[St.tpMode] or St.tpMode
+    notify("传送", string.format("[%s] 开始 · %d 目标 · 间隔%.2fs", modeLabel, #uids, St.interval), 2, Th.Ok)
+    tpTask.conn = RS.Heartbeat:Connect(function(dt)
+        if dead or not tpTask or not tpTask.running then return end
+        if #tpTask.uids == 0 then stopTpTask(true); notify("传送", "任务列表为空", 2, Th.Warn); return end
+        if tpTask.idx > #tpTask.uids then
+            if tpTask.mode == "loop" then
+                tpTask.idx = 1; tpTask.phase = "moving"; tpTask.elapsed = 0; tpTask.stickyAcc = 0
+            else
+                stopTpTask(true); notify("传送", "已完成", 2, Th.Ok); return
+            end
+        end
+        local uid = tpTask.uids[tpTask.idx]
+        local plr = Players:GetPlayerByUserId(uid)
+        if not plr or not isPlayerAlive(plr) then
+            tpTask.idx = tpTask.idx + 1
+            tpTask.phase = "moving"; tpTask.elapsed = 0; tpTask.stickyAcc = 0
+            if tpTask.S then cleanupS(tpTask.S); tpTask.S = nil end
+            return
+        end
+        local r = getMyRoot()
+        if not r then return end
+        if not tpTask.S or tpTask.S.r ~= r then
+            if tpTask.S then cleanupS(tpTask.S) end
+            tpTask.S = buildS(r)
+            if tpTask.S.hum and tpTask.S.hum.Parent then
+                pcall(function()
+                    tpTask.S.hum.AutoRotate = false
+                    tpTask.S.hum.AutoJumpEnabled = false
+                end)
+            end
+        end
+        local S = tpTask.S
+        local tR = getPlayerRoot(plr)
+        if not tR then
+            tpTask.idx = tpTask.idx + 1; tpTask.phase = "moving"; tpTask.elapsed = 0; tpTask.stickyAcc = 0
+            return
+        end
+        local dest, faceCF = computeDestAndFace(tR)
+        if tpTask.phase == "waiting" then
+            tpTask.elapsed = tpTask.elapsed + dt
+            if St.lockPos then
+                tpTask.stickyAcc = tpTask.stickyAcc + dt
+                local period = 1 / math.max(1, St.stickyRate)
+                while tpTask.stickyAcc >= period do
+                    tpTask.stickyAcc = tpTask.stickyAcc - period
+                    hardSet(r, S, dest, faceCF)
+                end
+            end
+            if tpTask.elapsed >= St.interval then
+                tpTask.idx = tpTask.idx + 1
+                tpTask.phase = "moving"; tpTask.elapsed = 0; tpTask.stickyAcc = 0
+            end
+            return
+        end
+        if St.bypass == "walk" and S.hum and S.hum.Parent then
+            local ws = math.min(St.speed, 300)
+            if S.hum.WalkSpeed < ws then S.hum.WalkSpeed = ws end
+        end
+        if engineStep(S, dest, dt, faceCF) then
+            tpTask.phase = "waiting"; tpTask.elapsed = 0; tpTask.stickyAcc = 0
+        end
+    end)
+end
+
+local function setCamTarget(uid)
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    if uid then
+        local plr = Players:GetPlayerByUserId(uid)
+        if not plr then setCamTarget(nil); return end
+        local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+        if not hum then notify("摄像机", "目标无角色", 1.5, Th.Warn); return end
+        cam.CameraSubject = hum
+        St.camCurrent = uid; St.tempFollow = nil
+    else
+        local myHum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        cam.CameraSubject = myHum
+        St.camCurrent = nil; St.tempFollow = nil
+    end
+    saveCfg()
+    for _, bl in pairs(allBlocks) do
+        if bl._updCamStatus then pcall(bl._updCamStatus) end
+    end
+end
+
+-- ==================== 行工厂 ====================
+local function makeAllRow(parent, order, plr)
+    local row = mk("TextButton", {
+        Size=UDim2.new(1,0,0,ROW_H), BackgroundColor3=Th.Sur,
+        BackgroundTransparency=0.5, BorderSizePixel=0,
+        LayoutOrder=order, AutoButtonColor=false, Text="", Parent=parent,
+    })
+    row:SetAttribute("isRow", true)
+    mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=row })
+    mk("UIStroke", { Color=Th.Str, Thickness=1, Transparency=0.5, Parent=row })
+    local dot = mk("Frame", {
+        Size=UDim2.fromOffset(8,8), Position=UDim2.new(0,8,0.5,-4),
+        BackgroundColor3=Th.Ok, BorderSizePixel=0, ZIndex=2, Parent=row,
+    })
+    mk("UICorner", { CornerRadius=UDim.new(1,0), Parent=dot })
+    mk("UIStroke", { Color=Color3.fromRGB(0,0,0), Thickness=1, Transparency=0.4, Parent=dot })
+    local nameLbl = mk("TextLabel", {
+        Size=UDim2.new(1,-200,1,0), Position=UDim2.fromOffset(22,0),
+        BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=12,
+        TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left,
+        TextTruncate=Enum.TextTruncate.AtEnd,
+        Text = plr.DisplayName .. " (@" .. plr.Name .. ")",
+        ZIndex=2, Parent=row, Active=false,
+    })
+    local distLbl = mk("TextLabel", {
+        Size=UDim2.fromOffset(46,ROW_H), Position=UDim2.new(1,-168,0,0),
+        BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10,
+        TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Right,
+        Text="--", ZIndex=2, Parent=row, Active=false,
+    })
+    local function mini(text, xOff)
+        local b = mk("TextButton", {
+            Size=UDim2.fromOffset(26,ROW_H-8),
+            Position=UDim2.new(1,xOff,0.5,-(ROW_H-8)/2),
+            BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true,
+            Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt,
+            Text=text, ZIndex=3, Parent=row,
+        })
+        mk("UICorner", { CornerRadius=UDim.new(0,5), Parent=b })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
+        return b
+    end
+    return {
+        frame=row, dot=dot, nameLbl=nameLbl, distLbl=distLbl,
+        btnFollow=mini("跟",-116), btnTp=mini("传",-88),
+        btnTpList=mini("T",-60), btnCamList=mini("C",-32),
+    }
+end
+
+local function makeListRow(parent, order, plr, actionLabel)
+    local row = mk("Frame", {
+        Size=UDim2.new(1,0,0,ROW_H), BackgroundColor3=Th.Sur,
+        BackgroundTransparency=0.5, BorderSizePixel=0,
+        LayoutOrder=order, Parent=parent,
+    })
+    row:SetAttribute("isRow", true)
+    mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=row })
+    mk("UIStroke", { Color=Th.Str, Thickness=1, Transparency=0.5, Parent=row })
+    local dot = mk("Frame", {
+        Size=UDim2.fromOffset(8,8), Position=UDim2.new(0,8,0.5,-4),
+        BackgroundColor3=Th.Ok, BorderSizePixel=0, ZIndex=2, Parent=row,
+    })
+    mk("UICorner", { CornerRadius=UDim.new(1,0), Parent=dot })
+    mk("UIStroke", { Color=Color3.fromRGB(0,0,0), Thickness=1, Transparency=0.4, Parent=dot })
+    local clickArea = mk("TextButton", {
+        Size=UDim2.new(1,-160,1,0), BackgroundTransparency=1,
+        AutoButtonColor=false, Text="", ZIndex=2, Parent=row,
+    })
+    local nameLbl = mk("TextLabel", {
+        Size=UDim2.new(1,-60,1,0), Position=UDim2.fromOffset(22,0),
+        BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=12,
+        TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left,
+        TextTruncate=Enum.TextTruncate.AtEnd,
+        Text = plr.DisplayName .. " (@" .. plr.Name .. ")",
+        ZIndex=3, Parent=clickArea, Active=false,
+    })
+    local distLbl = mk("TextLabel", {
+        Size=UDim2.fromOffset(46,ROW_H), Position=UDim2.new(1,-50,0,0),
+        BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10,
+        TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Right,
+        Text="--", ZIndex=3, Parent=clickArea, Active=false,
+    })
+    local function mini(text, xOff, col)
+        local b = mk("TextButton", {
+            Size=UDim2.fromOffset(24,ROW_H-8),
+            Position=UDim2.new(1,xOff,0.5,-(ROW_H-8)/2),
+            BackgroundColor3=col or Th.Sur, BorderSizePixel=0, AutoButtonColor=true,
+            Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt,
+            Text=text, ZIndex=3, Parent=row,
+        })
+        mk("UICorner", { CornerRadius=UDim.new(0,5), Parent=b })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
+        return b
+    end
+    local btnAct = mini(actionLabel, -58, Th.AccD)
+    local btnRm = mini("×", -32, Th.Sur)
+    btnRm.TextColor3 = Th.Err
+    return { frame=row, dot=dot, clickArea=clickArea, nameLbl=nameLbl,
+             distLbl=distLbl, btnAct=btnAct, btnRm=btnRm }
+end
+
+-- ==================== 渲染 ====================
+local allListInner, tpListInner, camListInner
+local allRows, tpRows, camRows = {}, {}, {}
+local allEmpty, tpEmpty, camEmpty
+local refreshAllSel, refreshTpSel, refreshCamSel
+local infoAllLbl, infoTpLbl, infoCamLbl
+local renderAllListFn, renderTpListFn, renderCamListFn
+local renderAllList, renderTpList, renderCamList
+
+local function clearRows(container)
+    for _, c in ipairs(container:GetChildren()) do
+        if c:GetAttribute("isRow") then c:Destroy() end
+    end
+end
+
+local function sortPlayerArr(arr)
+    if St.sortBy == "name" then
+        table.sort(arr, function(a, b)
+            local an, bn = a.Name:lower(), b.Name:lower()
+            if St.sortAsc then return an < bn else return an > bn end
+        end)
+    elseif St.sortBy == "distance" then
+        local myRoot = getMyRoot()
+        local myPos = myRoot and myRoot.Position
+        if myPos then
+            table.sort(arr, function(a, b)
+                local aR = getPlayerRoot(a); local bR = getPlayerRoot(b)
+                local aD = aR and (aR.Position - myPos).Magnitude or math.huge
+                local bD = bR and (bR.Position - myPos).Magnitude or math.huge
+                if St.sortAsc then return aD < bD else return aD > bD end
+            end)
+        end
+    end
+    return arr
+end
+
+local function collectSelUids(list, selTable)
+    local arr = {}
+    for _, uid in ipairs(list) do if selTable[uid] then table.insert(arr, uid) end end
+    return arr
+end
+local function countAlive(list)
+    local n = 0
+    for _, uid in ipairs(list) do
+        local plr = Players:GetPlayerByUserId(uid)
+        if plr and isPlayerAlive(plr) then n = n + 1 end
+    end
+    return n
+end
+local function countSel(list, selTable)
+    local n = 0
+    for _, uid in ipairs(list) do if selTable[uid] then n = n + 1 end end
+    return n
+end
+
+refreshAllSel = function()
+    for uid, r in pairs(allRows) do
+        if St.selAll[uid] then
+            r.frame.BackgroundColor3 = Th.AccD; r.frame.BackgroundTransparency = 0.05
+        else
+            r.frame.BackgroundColor3 = Th.Sur; r.frame.BackgroundTransparency = 0.5
+        end
+    end
+    if infoAllLbl then
+        local total, alive = 0, 0
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr ~= LP then total = total + 1; if isPlayerAlive(plr) then alive = alive + 1 end end
+        end
+        infoAllLbl.Text = string.format("在线 %d · 有效 %d · 已选 %d", total, alive, countSel(
+            (function() local a={}; for _,p in ipairs(Players:GetPlayers()) do if p~=LP then table.insert(a,p.UserId) end end return a end)(),
+            St.selAll))
+    end
+end
+
+refreshTpSel = function()
+    for uid, r in pairs(tpRows) do
+        if St.selTp[uid] then
+            r.frame.BackgroundColor3 = Th.AccD; r.frame.BackgroundTransparency = 0.05
+        else
+            r.frame.BackgroundColor3 = Th.Sur; r.frame.BackgroundTransparency = 0.5
+        end
+    end
+    if infoTpLbl then
+        infoTpLbl.Text = string.format("共 %d · 有效 %d · 已选 %d",
+            #St.tpTargets, countAlive(St.tpTargets), countSel(St.tpTargets, St.selTp))
+    end
+end
+
+refreshCamSel = function()
+    for uid, r in pairs(camRows) do
+        local isLocked = (St.camCurrent == uid)
+        if isLocked then
+            r.frame.BackgroundColor3 = Th.Grn; r.frame.BackgroundTransparency = 0.05
+        elseif St.selCam[uid] then
+            r.frame.BackgroundColor3 = Th.AccD; r.frame.BackgroundTransparency = 0.05
+        else
+            r.frame.BackgroundColor3 = Th.Sur; r.frame.BackgroundTransparency = 0.5
+        end
+    end
+    if infoCamLbl then
+        infoCamLbl.Text = string.format("共 %d · 有效 %d · 已选 %d",
+            #St.camList, countAlive(St.camList), countSel(St.camList, St.selCam))
+    end
+end
+
+local function toggleSelIn(selTable, uid)
+    if St.multi then
+        if selTable[uid] then selTable[uid] = nil else selTable[uid] = true end
+    else
+        for k in pairs(selTable) do selTable[k] = nil end
+        selTable[uid] = true
+    end
+end
+
+renderAllListFn = function()
+    if dead or not allListInner then return end
+    clearRows(allListInner); allRows = {}
+    local arr = {}
+    for _, plr in ipairs(Players:GetPlayers()) do if plr ~= LP then table.insert(arr, plr) end end
+    arr = sortPlayerArr(arr)
+    local n = 0
+    for _, plr in ipairs(arr) do
+        n = n + 1
+        local uid = plr.UserId
+        local r = makeAllRow(allListInner, n, plr)
+        local function upd()
+            r.dot.BackgroundColor3 = isPlayerAlive(plr) and Th.Ok or Th.Err
+            local inTp = inList(St.tpTargets, uid)
+            local inCam = inList(St.camList, uid)
+            r.btnTpList.BackgroundColor3 = inTp and Th.AccD or Th.Sur
+            r.btnTpList.TextColor3 = inTp and Color3.fromRGB(255,255,255) or Th.Txt
+            r.btnCamList.BackgroundColor3 = (St.camCurrent == uid) and Th.Grn or (inCam and Th.AccD or Th.Sur)
+            r.btnCamList.TextColor3 = (inCam or St.camCurrent == uid) and Color3.fromRGB(255,255,255) or Th.Txt
+            if St.tempFollow == uid then
+                r.btnFollow.BackgroundColor3 = Th.Warn; r.btnFollow.TextColor3 = Color3.fromRGB(0,0,0)
+            else
+                r.btnFollow.BackgroundColor3 = Th.Sur; r.btnFollow.TextColor3 = Th.Txt
+            end
+            if St.selAll[uid] then
+                r.frame.BackgroundColor3 = Th.AccD; r.frame.BackgroundTransparency = 0.05
+            else
+                r.frame.BackgroundColor3 = Th.Sur; r.frame.BackgroundTransparency = 0.5
+            end
+        end
+        r._upd = upd; upd()
+        trk(r.frame.MouseButton1Click:Connect(function() toggleSelIn(St.selAll, uid); refreshAllSel() end))
+        trk(r.btnFollow.MouseButton1Click:Connect(function()
+            if not isPlayerAlive(plr) then notify("跟随","目标无效",1.5,Th.Warn); return end
+            local cam = workspace.CurrentCamera
+            local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+            if cam and hum then
+                cam.CameraSubject = hum
+                St.camCurrent = nil; St.tempFollow = uid
+                notify("跟随", "临时跟随 "..plr.Name.."（点画面取消）", 2, Th.Ok)
+                for _, rr in pairs(allRows) do if rr._upd then rr._upd() end end
+                for _, bl in pairs(allBlocks) do if bl._updCamStatus then pcall(bl._updCamStatus) end end
+            end
+        end))
+        trk(r.btnTp.MouseButton1Click:Connect(function()
+            if not isPlayerAlive(plr) then notify("传送","目标无效",1.5,Th.Warn); return end
+            doTpFixed(plr); notify("传送", "→ "..plr.Name, 1.2, Th.Ok)
+        end))
+        trk(r.btnTpList.MouseButton1Click:Connect(function()
+            local ok = pcall(function()
+                if inList(St.tpTargets, uid) then
+                    removeFromList(St.tpTargets, uid); St.selTp[uid] = nil
+                else addToList(St.tpTargets, uid) end
+                saveCfg()
+                if renderTpListFn then renderTpListFn() end
+                upd()
+            end)
+            if not ok then warn("[PlayerTpMgr] T 按钮失败") end
+        end))
+        trk(r.btnCamList.MouseButton1Click:Connect(function()
+            local ok = pcall(function()
+                if inList(St.camList, uid) then
+                    removeFromList(St.camList, uid); St.selCam[uid] = nil
+                    if St.camCurrent == uid then setCamTarget(nil) end
+                else addToList(St.camList, uid) end
+                saveCfg()
+                if renderCamListFn then renderCamListFn() end
+                upd()
+            end)
+            if not ok then warn("[PlayerTpMgr] C 按钮失败") end
+        end))
+        allRows[uid] = r
+    end
+    allEmpty.Visible = (n == 0)
+    refreshAllSel()
+end
+
+renderTpListFn = function()
+    if dead or not tpListInner then return end
+    clearRows(tpListInner); tpRows = {}
+    local arr = {}
+    for _, uid in ipairs(St.tpTargets) do
+        local plr = Players:GetPlayerByUserId(uid)
+        if plr then table.insert(arr, plr) end
+    end
+    arr = sortPlayerArr(arr)
+    local n = 0
+    for _, plr in ipairs(arr) do
+        n = n + 1
+        local uid = plr.UserId
+        local r = makeListRow(tpListInner, n, plr, "传")
+        local function upd() r.dot.BackgroundColor3 = isPlayerAlive(plr) and Th.Ok or Th.Err end
+        r._upd = upd; upd()
+        trk(r.clickArea.MouseButton1Click:Connect(function() toggleSelIn(St.selTp, uid); refreshTpSel() end))
+        trk(r.btnAct.MouseButton1Click:Connect(function()
+            if not isPlayerAlive(plr) then notify("传送","目标无效",1.5,Th.Warn); return end
+            doTpFixed(plr); notify("传送", "→ "..plr.Name, 1.2, Th.Ok)
+        end))
+        trk(r.btnRm.MouseButton1Click:Connect(function()
+            pcall(function()
+                removeFromList(St.tpTargets, uid); St.selTp[uid] = nil
+                saveCfg()
+                if renderTpListFn then renderTpListFn() end
+                if allRows[uid] and allRows[uid]._upd then allRows[uid]._upd() end
+            end)
+        end))
+        tpRows[uid] = r
+    end
+    tpEmpty.Visible = (n == 0)
+    refreshTpSel()
+end
+
+renderCamListFn = function()
+    if dead or not camListInner then return end
+    clearRows(camListInner); camRows = {}
+    local arr = {}
+    for _, uid in ipairs(St.camList) do
+        local plr = Players:GetPlayerByUserId(uid)
+        if plr then table.insert(arr, plr) end
+    end
+    arr = sortPlayerArr(arr)
+    local n = 0
+    for _, plr in ipairs(arr) do
+        n = n + 1
+        local uid = plr.UserId
+        local r = makeListRow(camListInner, n, plr, "锁")
+        local function upd()
+            r.dot.BackgroundColor3 = isPlayerAlive(plr) and Th.Ok or Th.Err
+            if St.camCurrent == uid then r.btnAct.Text = "解"; r.btnAct.BackgroundColor3 = Th.Grn
+            else r.btnAct.Text = "锁"; r.btnAct.BackgroundColor3 = Th.AccD end
+        end
+        r._upd = upd; upd()
+        trk(r.clickArea.MouseButton1Click:Connect(function() toggleSelIn(St.selCam, uid); refreshCamSel() end))
+        trk(r.btnAct.MouseButton1Click:Connect(function()
+            if St.camCurrent == uid then setCamTarget(nil)
+            else
+                if not isPlayerAlive(plr) then notify("摄像机","目标无效",1.5,Th.Warn); return end
+                setCamTarget(uid)
+            end
+            if renderCamListFn then renderCamListFn() end
+            for _, rr in pairs(allRows) do if rr._upd then rr._upd() end end
+        end))
+        trk(r.btnRm.MouseButton1Click:Connect(function()
+            pcall(function()
+                removeFromList(St.camList, uid); St.selCam[uid] = nil
+                if St.camCurrent == uid then setCamTarget(nil) end
+                saveCfg()
+                if renderCamListFn then renderCamListFn() end
+                if allRows[uid] and allRows[uid]._upd then allRows[uid]._upd() end
+            end)
+        end))
+        camRows[uid] = r
+    end
+    camEmpty.Visible = (n == 0)
+    refreshCamSel()
+end
+
+renderAllList = renderAllListFn
+renderTpList = renderTpListFn
+renderCamList = renderCamListFn
+
+-- ==================== Block: 传送控制 ====================
+createBlock({
+    id = "tp_ctrl", title = "传送控制（作用于传送列表）", order = 1,
+    build = function(bd, self)
+        local modeRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=1, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=modeRow })
+        mk("TextLabel", { Size=UDim2.fromOffset(38,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="模式", LayoutOrder=0, Parent=modeRow })
+        local defs = {{"single","单次"},{"sticky","粘滞"},{"loop","循环"}}
+        local mBtns = {}
+        local hintLbl = mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="", LayoutOrder=2, Parent=bd })
+        local modeHint = {
+            single="单次：走到目标 → 钉住（间隔时间） → 下一个",
+            sticky="粘滞：走到目标 → 钉住（间隔时间） → 下一个",
+            loop="循环：单次 + 走完回到第一个，重复",
+        }
+        local function paintModes()
+            for mid, bb in pairs(mBtns) do
+                if mid == St.tpMode then bb.BackgroundColor3 = Th.Acc; bb.TextColor3 = Color3.fromRGB(255,255,255)
+                else bb.BackgroundColor3 = Th.Sur; bb.TextColor3 = Th.Txt end
+            end
+            hintLbl.Text = modeHint[St.tpMode] or ""
+        end
+        for i, m in ipairs(defs) do
+            local b = mk("TextButton", { Size=UDim2.new(1/3,-16,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text=m[2], LayoutOrder=i, Parent=modeRow })
+            mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=b })
+            mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
+            mBtns[m[1]] = b
+            trk(b.MouseButton1Click:Connect(function() St.tpMode = m[1]; paintModes(); saveCfg() end))
+        end
+        paintModes()
+        local ivRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=3, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=ivRow })
+        mk("TextLabel", { Size=UDim2.fromOffset(70,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="列表间隔", LayoutOrder=0, Parent=ivRow })
+        local ivBox = mk("TextBox", { Size=UDim2.new(1,-140,1,0), BackgroundColor3=Th.Bg, BorderSizePixel=0, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text=string.format("%.2f", St.interval), ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center, LayoutOrder=1, Parent=ivRow })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=ivBox })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=ivBox })
+        mk("TextLabel", { Size=UDim2.fromOffset(70,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="秒/目标", LayoutOrder=2, Parent=ivRow })
+        trk(ivBox.FocusLost:Connect(function()
+            St.interval = clInterval(ivBox.Text); ivBox.Text = string.format("%.2f", St.interval); saveCfg()
+        end))
+        local srRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=4, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=srRow })
+        mk("TextLabel", { Size=UDim2.fromOffset(70,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="同步频率", LayoutOrder=0, Parent=srRow })
+        local srBox = mk("TextBox", { Size=UDim2.new(1,-140,1,0), BackgroundColor3=Th.Bg, BorderSizePixel=0, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text=tostring(St.stickyRate), ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center, LayoutOrder=1, Parent=srRow })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=srBox })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=srBox })
+        mk("TextLabel", { Size=UDim2.fromOffset(70,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="Hz (1-240)", LayoutOrder=2, Parent=srRow })
+        trk(srBox.FocusLost:Connect(function()
+            St.stickyRate = clRate(srBox.Text); srBox.Text = tostring(St.stickyRate); saveCfg()
+        end))
+
+        -- 偏移（v13: 支持 ^ 前缀）
+        local offLabel = mk("TextLabel", {
+            Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham,
+            TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left,
+            Text="偏移（在值前加 ^ 表示本地：^5 / ^-5）", LayoutOrder=5, Parent=bd,
+        })
+        local offRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=6, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=offRow })
+        mk("TextLabel", { Size=UDim2.fromOffset(38,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="偏移", LayoutOrder=0, Parent=offRow })
+        local offBoxes = {}
+        for i, ax in ipairs({"x","y","z"}) do
+            local bx = mk("TextBox", {
+                Size=UDim2.new(1/3,-14,1,0), BackgroundColor3=Th.Bg, BorderSizePixel=0,
+                Font=Enum.Font.Gotham, TextSize=12, TextColor3=Th.Txt,
+                PlaceholderText=ax:upper(), PlaceholderColor3=Color3.fromRGB(92,92,108),
+                Text=tostring(St.offset[ax] or "0"),
+                ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center,
+                LayoutOrder=i, Parent=offRow,
+            })
+            mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=bx })
+            mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=bx })
+            offBoxes[ax] = bx
+            trk(bx.FocusLost:Connect(function()
+                -- v13: 保留字符串（含 ^ 前缀），仅做去空格
+                local raw = tostring(bx.Text or ""):gsub("^%s+", ""):gsub("%s+$", "")
+                if raw == "" then raw = "0" end
+                St.offset[ax] = raw
+                bx.Text = raw
+                saveCfg()
+            end))
+        end
+
+        local switchRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=7, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=switchRow })
+        local locB = mk("TextButton", { Size=UDim2.new(0.5,-2,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="", LayoutOrder=1, Parent=switchRow })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=locB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=locB })
+        local function paintLoc()
+            locB.Text = St.localOffset and "全局本地 ON" or "全局本地 OFF"
+            locB.BackgroundColor3 = St.localOffset and Th.AccD or Th.Sur
+        end
+        paintLoc()
+        trk(locB.MouseButton1Click:Connect(function() St.localOffset = not St.localOffset; paintLoc(); saveCfg() end))
+        local lockB = mk("TextButton", { Size=UDim2.new(0.5,-2,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="", LayoutOrder=2, Parent=switchRow })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=lockB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=lockB })
+        local function paintLock()
+            lockB.Text = St.lockPos and "钉住位置 ON" or "钉住位置 OFF"
+            lockB.BackgroundColor3 = St.lockPos and Th.Grn or Th.Sur
+        end
+        paintLock()
+        trk(lockB.MouseButton1Click:Connect(function() St.lockPos = not St.lockPos; paintLock(); saveCfg() end))
+        mk("TextLabel", {
+            Size=UDim2.new(1,0,0,40), BackgroundTransparency=1, Font=Enum.Font.Gotham,
+            TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left,
+            TextWrapped=true, LayoutOrder=8, Parent=bd,
+            Text="^5 = 本地前 5 · ^-5 = 本地后 5 · x=右, y=上, z=前\n任一轴带 ^ → 全部按本地坐标处理（覆盖全局开关）\n本地模式朝向 = 目标朝向（背对背）",
+        })
+        local actRow = mk("Frame", { Size=UDim2.new(1,0,0,30), BackgroundTransparency=1, LayoutOrder=9, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,6), Parent=actRow })
+        local startB = mk("TextButton", { Size=UDim2.new(0.5,-3,1,0), BackgroundColor3=Th.Acc, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Color3.fromRGB(255,255,255), Text="传送选中", LayoutOrder=1, Parent=actRow })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=startB })
+        local stopB = mk("TextButton", { Size=UDim2.new(0.5,-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Err, Text="停止", LayoutOrder=2, Parent=actRow })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=stopB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=stopB })
+        trk(startB.MouseButton1Click:Connect(function()
+            local uids = collectSelUids(St.tpTargets, St.selTp)
+            if #uids == 0 then
+                if #St.tpTargets == 0 then notify("传送", "传送列表为空", 2, Th.Warn); return end
+                uids = {}
+                for _, uid in ipairs(St.tpTargets) do table.insert(uids, uid) end
+                notify("传送", "未选中，使用整个传送列表", 1.5, Th.Sub)
+            end
+            startTpTask(uids)
+        end))
+        trk(stopB.MouseButton1Click:Connect(function() stopTpTask() end))
+    end,
+})
+
+-- ==================== Block: 传送列表 ====================
+createBlock({
+    id = "tp_list", title = "传送列表", order = 2,
+    build = function(bd, self)
+        local advB = mk("TextButton", { Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="高级选择 ▾", LayoutOrder=0, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=advB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=advB })
+        local advP = mk("Frame", { Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundColor3=Th.Sec, BorderSizePixel=0, LayoutOrder=1, Visible=false, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=advP })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=advP })
+        mk("UIPadding", { PaddingTop=UDim.new(0,6), PaddingBottom=UDim.new(0,6), PaddingLeft=UDim.new(0,6), PaddingRight=UDim.new(0,6), Parent=advP })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=advP })
+        local function btnRow(order)
+            local r = mk("Frame", { Size=UDim2.new(1,0,0,24), BackgroundTransparency=1, LayoutOrder=order, Parent=advP })
+            mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=r })
+            return r
+        end
+        local function mkBtn(parent, txt, order, fn)
+            local b = mk("TextButton", { Size=UDim2.new(1/3,-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text=txt, LayoutOrder=order, Parent=parent })
+            mk("UICorner", { CornerRadius=UDim.new(0,5), Parent=b })
+            mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
+            trk(b.MouseButton1Click:Connect(function()
+                pcall(function() fn(); refreshTpSel() end)
+            end))
+            return b
+        end
+        local rowA = btnRow(1)
+        mkBtn(rowA, "全选", 1, function() for _, uid in ipairs(St.tpTargets) do St.selTp[uid] = true end end)
+        mkBtn(rowA, "反选", 2, function()
+            for _, uid in ipairs(St.tpTargets) do if St.selTp[uid] then St.selTp[uid] = nil else St.selTp[uid] = true end end
+        end)
+        mkBtn(rowA, "清空", 3, function() for k in pairs(St.selTp) do St.selTp[k] = nil end end)
+        local rowB = btnRow(2)
+        mkBtn(rowB, "选有效", 1, function()
+            for k in pairs(St.selTp) do St.selTp[k] = nil end
+            for _, uid in ipairs(St.tpTargets) do
+                local plr = Players:GetPlayerByUserId(uid)
+                if plr and isPlayerAlive(plr) then St.selTp[uid] = true end
+            end
+        end)
+        mkBtn(rowB, "选无效", 2, function()
+            for k in pairs(St.selTp) do St.selTp[k] = nil end
+            for _, uid in ipairs(St.tpTargets) do
+                local plr = Players:GetPlayerByUserId(uid)
+                if not plr or not isPlayerAlive(plr) then St.selTp[uid] = true end
+            end
+        end)
+        mkBtn(rowB, "取消选择", 3, function() for k in pairs(St.selTp) do St.selTp[k] = nil end end)
+        local rowC = btnRow(3)
+        mkBtn(rowC, "移出选中", 1, function()
+            local n = 0
+            for _, uid in ipairs(collectSelUids(St.tpTargets, St.selTp)) do
+                removeFromList(St.tpTargets, uid); St.selTp[uid] = nil; n = n + 1
+            end
+            if n > 0 then
+                saveCfg()
+                if renderTpListFn then renderTpListFn() end
+                for _, r in pairs(allRows) do if r._upd then r._upd() end end
+            end
+        end)
+        mkBtn(rowC, "移出无效", 2, function()
+            local n = 0
+            for _, uid in ipairs(St.tpTargets) do
+                local plr = Players:GetPlayerByUserId(uid)
+                if not plr or not isPlayerAlive(plr) then removeFromList(St.tpTargets, uid); St.selTp[uid] = nil; n = n + 1 end
+            end
+            if n > 0 then
+                saveCfg()
+                if renderTpListFn then renderTpListFn() end
+                for _, r in pairs(allRows) do if r._upd then r._upd() end end
+            end
+        end)
+        mk("TextButton", { Size=UDim2.new(1/3,-3,1,0), BackgroundTransparency=1, Text="", LayoutOrder=3, Parent=rowC })
+        infoTpLbl = mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="", LayoutOrder=4, Parent=advP })
+        local advOpen = false
+        local function applyAdv()
+            advP.Visible = advOpen
+            advB.Text = advOpen and "高级选择 ▴" or "高级选择 ▾"
+            advB.BackgroundColor3 = advOpen and Th.AccD or Th.Sur
+        end
+        applyAdv()
+        trk(advB.MouseButton1Click:Connect(function() advOpen = not advOpen; applyAdv() end))
+        mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="点击行=选中 · 传=单独传送 · ×=移除", LayoutOrder=2, Parent=bd })
+        local sv = mk("ScrollingFrame", { Size=UDim2.new(1,0,0,160), BackgroundColor3=Th.Bg, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=4, ScrollBarImageColor3=Th.Str, LayoutOrder=3, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=sv })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=sv })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=sv })
+        mk("UIPadding", { PaddingTop=UDim.new(0,4), PaddingBottom=UDim.new(0,4), PaddingLeft=UDim.new(0,4), PaddingRight=UDim.new(0,4), Parent=sv })
+        tpListInner = sv
+        tpEmpty = mk("TextLabel", { Size=UDim2.new(1,0,0,24), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, Text="空 · 从总列表 T 按钮加入", LayoutOrder=4, Parent=bd })
+        local clrB = mk("TextButton", { Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="清空列表", LayoutOrder=5, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=clrB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=clrB })
+        trk(clrB.MouseButton1Click:Connect(function()
+            St.tpTargets = {}; St.selTp = {}; stopTpTask(true)
+            saveCfg()
+            if renderTpListFn then renderTpListFn() end
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
+        end))
+    end,
+})
+
+-- ==================== Block: 摄像机控制 ====================
+createBlock({
+    id = "cam_ctrl", title = "摄像机控制（作用于摄像机列表）", order = 3,
+    build = function(bd, self)
+        local status = mk("Frame", { Size=UDim2.new(1,0,0,30), BackgroundColor3=Th.Bg, BorderSizePixel=0, LayoutOrder=1, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=status })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=status })
+        local lbl = mk("TextLabel", { Size=UDim2.new(1,-16,1,0), Position=UDim2.fromOffset(10,0), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="未锁定", Parent=status })
+        local function upd()
+            if St.camCurrent then
+                local plr = Players:GetPlayerByUserId(St.camCurrent)
+                if plr then lbl.Text = "锁定 → "..plr.Name; lbl.TextColor3 = Th.Ok; return end
+            end
+            if St.tempFollow then
+                local plr = Players:GetPlayerByUserId(St.tempFollow)
+                if plr then lbl.Text = "临时跟随 → "..plr.Name; lbl.TextColor3 = Th.Warn; return end
+            end
+            lbl.Text = "未锁定"; lbl.TextColor3 = Th.Sub
+        end
+        self._updCamStatus = upd; upd()
+        local lockSelB = mk("TextButton", { Size=UDim2.new(1,0,0,28), BackgroundColor3=Th.Acc, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Color3.fromRGB(255,255,255), Text="锁定选中（取第一个）", LayoutOrder=2, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=lockSelB })
+        trk(lockSelB.MouseButton1Click:Connect(function()
+            local uids = collectSelUids(St.camList, St.selCam)
+            if #uids == 0 then notify("摄像机", "未在摄像机列表选中目标", 1.5, Th.Warn); return end
+            local uid = uids[1]
+            local plr = Players:GetPlayerByUserId(uid)
+            if not plr or not isPlayerAlive(plr) then notify("摄像机", "第一个选中无效", 1.5, Th.Warn); return end
+            setCamTarget(uid)
+            if renderCamListFn then renderCamListFn() end
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
+        end))
+        local unB = mk("TextButton", { Size=UDim2.new(1,0,0,28), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text="解除锁定", LayoutOrder=3, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=unB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=unB })
+        trk(unB.MouseButton1Click:Connect(function()
+            setCamTarget(nil)
+            if renderCamListFn then renderCamListFn() end
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
+        end))
+        local addB = mk("TextButton", { Size=UDim2.new(1,0,0,28), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text="将当前锁定加入传送列表", LayoutOrder=4, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=addB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=addB })
+        trk(addB.MouseButton1Click:Connect(function()
+            local target = St.camCurrent or St.tempFollow
+            if not target then notify("摄像机","未锁定目标",1.5,Th.Warn); return end
+            addToList(St.tpTargets, target); saveCfg()
+            if renderTpListFn then renderTpListFn() end
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
+            local plr = Players:GetPlayerByUserId(target)
+            notify("摄像机", "已加入传送列表："..(plr and plr.Name or "?"), 2, Th.Ok)
+        end))
+    end,
+})
+
+-- ==================== Block: 摄像机列表 ====================
+createBlock({
+    id = "cam_list", title = "摄像机列表", order = 4,
+    build = function(bd, self)
+        local advB = mk("TextButton", { Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="高级选择 ▾", LayoutOrder=0, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=advB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=advB })
+        local advP = mk("Frame", { Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundColor3=Th.Sec, BorderSizePixel=0, LayoutOrder=1, Visible=false, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=advP })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=advP })
+        mk("UIPadding", { PaddingTop=UDim.new(0,6), PaddingBottom=UDim.new(0,6), PaddingLeft=UDim.new(0,6), PaddingRight=UDim.new(0,6), Parent=advP })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=advP })
+        local function btnRow(order)
+            local r = mk("Frame", { Size=UDim2.new(1,0,0,24), BackgroundTransparency=1, LayoutOrder=order, Parent=advP })
+            mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=r })
+            return r
+        end
+        local function mkBtn(parent, txt, order, fn)
+            local b = mk("TextButton", { Size=UDim2.new(1/3,-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text=txt, LayoutOrder=order, Parent=parent })
+            mk("UICorner", { CornerRadius=UDim.new(0,5), Parent=b })
+            mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
+            trk(b.MouseButton1Click:Connect(function()
+                pcall(function() fn(); refreshCamSel() end)
+            end))
+            return b
+        end
+        local rowA = btnRow(1)
+        mkBtn(rowA, "全选", 1, function() for _, uid in ipairs(St.camList) do St.selCam[uid] = true end end)
+        mkBtn(rowA, "反选", 2, function()
+            for _, uid in ipairs(St.camList) do if St.selCam[uid] then St.selCam[uid] = nil else St.selCam[uid] = true end end
+        end)
+        mkBtn(rowA, "清空", 3, function() for k in pairs(St.selCam) do St.selCam[k] = nil end end)
+        local rowB = btnRow(2)
+        mkBtn(rowB, "选有效", 1, function()
+            for k in pairs(St.selCam) do St.selCam[k] = nil end
+            for _, uid in ipairs(St.camList) do
+                local plr = Players:GetPlayerByUserId(uid)
+                if plr and isPlayerAlive(plr) then St.selCam[uid] = true end
+            end
+        end)
+        mkBtn(rowB, "选无效", 2, function()
+            for k in pairs(St.selCam) do St.selCam[k] = nil end
+            for _, uid in ipairs(St.camList) do
+                local plr = Players:GetPlayerByUserId(uid)
+                if not plr or not isPlayerAlive(plr) then St.selCam[uid] = true end
+            end
+        end)
+        mkBtn(rowB, "取消选择", 3, function() for k in pairs(St.selCam) do St.selCam[k] = nil end end)
+        local rowC = btnRow(3)
+        mkBtn(rowC, "移出选中", 1, function()
+            local n = 0
+            for _, uid in ipairs(collectSelUids(St.camList, St.selCam)) do
+                removeFromList(St.camList, uid); St.selCam[uid] = nil; n = n + 1
+                if St.camCurrent == uid then setCamTarget(nil) end
+            end
+            if n > 0 then
+                saveCfg()
+                if renderCamListFn then renderCamListFn() end
+                for _, r in pairs(allRows) do if r._upd then r._upd() end end
+            end
+        end)
+        mkBtn(rowC, "移出无效", 2, function()
+            local n = 0
+            for _, uid in ipairs(St.camList) do
+                local plr = Players:GetPlayerByUserId(uid)
+                if not plr or not isPlayerAlive(plr) then
+                    removeFromList(St.camList, uid); St.selCam[uid] = nil; n = n + 1
+                    if St.camCurrent == uid then setCamTarget(nil) end
+                end
+            end
+            if n > 0 then
+                saveCfg()
+                if renderCamListFn then renderCamListFn() end
+                for _, r in pairs(allRows) do if r._upd then r._upd() end end
+            end
+        end)
+        mk("TextButton", { Size=UDim2.new(1/3,-3,1,0), BackgroundTransparency=1, Text="", LayoutOrder=3, Parent=rowC })
+        infoCamLbl = mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="", LayoutOrder=4, Parent=advP })
+        local advOpen = false
+        local function applyAdv()
+            advP.Visible = advOpen
+            advB.Text = advOpen and "高级选择 ▴" or "高级选择 ▾"
+            advB.BackgroundColor3 = advOpen and Th.AccD or Th.Sur
+        end
+        applyAdv()
+        trk(advB.MouseButton1Click:Connect(function() advOpen = not advOpen; applyAdv() end))
+        mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="点击行=选中 · 锁=锁定/解锁 · ×=移除", LayoutOrder=2, Parent=bd })
+        local sv = mk("ScrollingFrame", { Size=UDim2.new(1,0,0,160), BackgroundColor3=Th.Bg, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=4, ScrollBarImageColor3=Th.Str, LayoutOrder=3, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=sv })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=sv })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=sv })
+        mk("UIPadding", { PaddingTop=UDim.new(0,4), PaddingBottom=UDim.new(0,4), PaddingLeft=UDim.new(0,4), PaddingRight=UDim.new(0,4), Parent=sv })
+        camListInner = sv
+        camEmpty = mk("TextLabel", { Size=UDim2.new(1,0,0,24), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, Text="空 · 从总列表 C 按钮加入", LayoutOrder=4, Parent=bd })
+        local clrB = mk("TextButton", { Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="清空列表", LayoutOrder=5, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=clrB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=clrB })
+        trk(clrB.MouseButton1Click:Connect(function()
+            St.camList = {}; St.selCam = {}; setCamTarget(nil)
+            saveCfg()
+            if renderCamListFn then renderCamListFn() end
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
+        end))
+    end,
+})
+
+-- ==================== Block: 玩家总列表 ====================
+createBlock({
+    id = "all_players", title = "玩家总列表", order = 5,
+    build = function(bd, self)
+        local topRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=0, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=topRow })
+        local multiB = mk("TextButton", { Size=UDim2.new(0.5,-2,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="", LayoutOrder=1, Parent=topRow })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=multiB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=multiB })
+        local advB = mk("TextButton", { Size=UDim2.new(0.5,-2,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="高级选择 ▾", LayoutOrder=2, Parent=topRow })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=advB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=advB })
+        local advP = mk("Frame", { Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundColor3=Th.Sec, BorderSizePixel=0, LayoutOrder=1, Visible=false, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=advP })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=advP })
+        mk("UIPadding", { PaddingTop=UDim.new(0,6), PaddingBottom=UDim.new(0,6), PaddingLeft=UDim.new(0,6), PaddingRight=UDim.new(0,6), Parent=advP })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=advP })
+        local function btnRow(order)
+            local r = mk("Frame", { Size=UDim2.new(1,0,0,24), BackgroundTransparency=1, LayoutOrder=order, Parent=advP })
+            mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=r })
+            return r
+        end
+        local function mkBtn(parent, txt, order, fn, w)
+            local b = mk("TextButton", { Size=UDim2.new(w or (1/3),-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text=txt, LayoutOrder=order, Parent=parent })
+            mk("UICorner", { CornerRadius=UDim.new(0,5), Parent=b })
+            mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
+            trk(b.MouseButton1Click:Connect(function()
+                pcall(function() fn(); refreshAllSel() end)
+            end))
+            return b
+        end
+        local rowA = btnRow(1)
+        mkBtn(rowA, "全选", 1, function() for _, plr in ipairs(Players:GetPlayers()) do if plr ~= LP then St.selAll[plr.UserId] = true end end end)
+        mkBtn(rowA, "反选", 2, function()
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LP then
+                    if St.selAll[plr.UserId] then St.selAll[plr.UserId] = nil
+                    else St.selAll[plr.UserId] = true end
+                end
+            end
+        end)
+        mkBtn(rowA, "清空", 3, function() for k in pairs(St.selAll) do St.selAll[k] = nil end end)
+        local rowB = btnRow(2)
+        mkBtn(rowB, "选有效", 1, function()
+            for k in pairs(St.selAll) do St.selAll[k] = nil end
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LP and isPlayerAlive(plr) then St.selAll[plr.UserId] = true end
+            end
+        end)
+        mkBtn(rowB, "选无效", 2, function()
+            for k in pairs(St.selAll) do St.selAll[k] = nil end
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LP and not isPlayerAlive(plr) then St.selAll[plr.UserId] = true end
+            end
+        end)
+        mkBtn(rowB, "取消选择", 3, function() for k in pairs(St.selAll) do St.selAll[k] = nil end end)
+        local rowC = btnRow(3)
+        mkBtn(rowC, "选中→传送", 1, function()
+            local n = 0
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LP and St.selAll[plr.UserId] and not inList(St.tpTargets, plr.UserId) then
+                    addToList(St.tpTargets, plr.UserId); n = n + 1
+                end
+            end
+            saveCfg()
+            if renderTpListFn then renderTpListFn() end
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
+            notify("传送列表", string.format("加入 %d 个", n), 1.5, Th.Ok)
+        end, 0.5)
+        mkBtn(rowC, "选中→摄像机", 2, function()
+            local n = 0
+            for _, plr in ipairs(Players:GetPlayers()) do
+                if plr ~= LP and St.selAll[plr.UserId] and not inList(St.camList, plr.UserId) then
+                    addToList(St.camList, plr.UserId); n = n + 1
+                end
+            end
+            saveCfg()
+            if renderCamListFn then renderCamListFn() end
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
+            notify("摄像机列表", string.format("加入 %d 个", n), 1.5, Th.Ok)
+        end, 0.5)
+        infoAllLbl = mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="", LayoutOrder=4, Parent=advP })
+        local advOpen = false
+        local function applyAdv()
+            advP.Visible = advOpen
+            advB.Text = advOpen and "高级选择 ▴" or "高级选择 ▾"
+            advB.BackgroundColor3 = advOpen and Th.AccD or Th.Sur
+        end
+        applyAdv()
+        trk(advB.MouseButton1Click:Connect(function() advOpen = not advOpen; applyAdv() end))
+        local function paintMulti()
+            multiB.Text = "多选："..(St.multi and "开" or "关")
+            multiB.BackgroundColor3 = St.multi and Th.AccD or Th.Sur
+        end
+        paintMulti()
+        trk(multiB.MouseButton1Click:Connect(function() St.multi = not St.multi; paintMulti(); saveCfg() end))
+        mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="点击行=选中 · 跟=临时跟随 · 传=单独传送 · T=传送列表 · C=摄像机", LayoutOrder=2, Parent=bd })
+        local sv = mk("ScrollingFrame", { Size=UDim2.new(1,0,0,240), BackgroundColor3=Th.Bg, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=4, ScrollBarImageColor3=Th.Str, LayoutOrder=3, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=sv })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=sv })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=sv })
+        mk("UIPadding", { PaddingTop=UDim.new(0,4), PaddingBottom=UDim.new(0,4), PaddingLeft=UDim.new(0,4), PaddingRight=UDim.new(0,4), Parent=sv })
+        allListInner = sv
+        allEmpty = mk("TextLabel", { Size=UDim2.new(1,0,0,24), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, Text="暂无其他玩家", LayoutOrder=4, Parent=bd })
+    end,
+})
+
+-- ==================== Block: 传送引擎设置 ====================
+createBlock({
+    id = "settings", title = "传送引擎设置", order = 6,
+    build = function(bd, self)
+        local refs = {}
+        local r1 = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=1, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=r1 })
+        mk("TextLabel", { Size=UDim2.fromOffset(60,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="传送模式", LayoutOrder=0, Parent=r1 })
+        local smB = mk("TextButton", { Size=UDim2.new(0.5,-33,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="平滑", LayoutOrder=1, Parent=r1 })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=smB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=smB })
+        local tpB = mk("TextButton", { Size=UDim2.new(0.5,-33,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="瞬移", LayoutOrder=2, Parent=r1 })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=tpB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=tpB })
+        local function paintMode()
+            if St.mode == "smooth" then
+                smB.BackgroundColor3 = Th.Acc; smB.TextColor3 = Color3.fromRGB(255,255,255)
+                tpB.BackgroundColor3 = Th.Sur; tpB.TextColor3 = Th.Txt
+            else
+                smB.BackgroundColor3 = Th.Sur; smB.TextColor3 = Th.Txt
+                tpB.BackgroundColor3 = Th.Acc; tpB.TextColor3 = Color3.fromRGB(255,255,255)
+            end
+        end
+        paintMode()
+        trk(smB.MouseButton1Click:Connect(function() St.mode="smooth"; paintMode(); saveCfg() end))
+        trk(tpB.MouseButton1Click:Connect(function() St.mode="teleport"; paintMode(); saveCfg() end))
+        local r2 = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=2, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=r2 })
+        mk("TextLabel", { Size=UDim2.fromOffset(60,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="速度/精度", LayoutOrder=0, Parent=r2 })
+        local spB = mk("TextBox", { Size=UDim2.new(0.5,-33,1,0), BackgroundColor3=Th.Bg, BorderSizePixel=0, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text=tostring(St.speed), ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center, LayoutOrder=1, Parent=r2 })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=spB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=spB })
+        local pcB = mk("TextBox", { Size=UDim2.new(0.5,-33,1,0), BackgroundColor3=Th.Bg, BorderSizePixel=0, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text=tostring(St.prec), ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center, LayoutOrder=2, Parent=r2 })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=pcB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=pcB })
+        trk(spB.FocusLost:Connect(function() St.speed=clSpd(spB.Text); spB.Text=tostring(St.speed); saveCfg() end))
+        trk(pcB.FocusLost:Connect(function() St.prec=clPrec(pcB.Text); pcB.Text=tostring(St.prec); saveCfg() end))
+        mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="穿墙模式", LayoutOrder=3, Parent=bd })
+        local r3 = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=4, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=r3 })
+        local ncBtns = {}
+        for i, m in ipairs(NOCLIP_OPTS) do
+            local b = mk("TextButton", { Size=UDim2.new(1/4,-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text=m.label, LayoutOrder=i, Parent=r3 })
+            mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=b })
+            mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
+            ncBtns[m.id] = b
+            trk(b.MouseButton1Click:Connect(function() St.noclip = m.id; refs.paintNoclip(); saveCfg() end))
+        end
+        refs.paintNoclip = function()
+            for id, b in pairs(ncBtns) do
+                if id == St.noclip then b.BackgroundColor3 = Th.Acc; b.TextColor3 = Color3.fromRGB(255,255,255)
+                else b.BackgroundColor3 = Th.Sur; b.TextColor3 = Th.Txt end
+            end
+        end
+        refs.paintNoclip()
+        local rstB = mk("TextButton", { Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Warn, Text="↺ 恢复所有部件碰撞", LayoutOrder=5, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=rstB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=rstB })
+        trk(rstB.MouseButton1Click:Connect(function()
+            local n = restorePersistent()
+            notify("穿墙", string.format("已恢复 %d 个部件", n), 2, Th.Ok)
+        end))
+        mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="接近方式", LayoutOrder=6, Parent=bd })
+        local r4 = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=7, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=r4 })
+        local pthBtns = {}
+        for i, m in ipairs(PATH_OPTS) do
+            local b = mk("TextButton", { Size=UDim2.new(1/3,-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text=m.label, LayoutOrder=i, Parent=r4 })
+            mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=b })
+            mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
+            pthBtns[m.id] = b
+            trk(b.MouseButton1Click:Connect(function() St.path = m.id; refs.paintPath(); saveCfg() end))
+        end
+        refs.paintPath = function()
+            for id, b in pairs(pthBtns) do
+                if id == St.path then b.BackgroundColor3 = Th.Acc; b.TextColor3 = Color3.fromRGB(255,255,255)
+                else b.BackgroundColor3 = Th.Sur; b.TextColor3 = Th.Txt end
+            end
+        end
+        refs.paintPath()
+        mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="反检测（整体方案）", LayoutOrder=8, Parent=bd })
+        local r5 = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=9, Parent=bd })
+        mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=r5 })
+        local bypBtns = {}
+        for i, m in ipairs(BYPASS_OPTS) do
+            local b = mk("TextButton", { Size=UDim2.new(1/4,-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text=m.label, LayoutOrder=i, Parent=r5 })
+            mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=b })
+            mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
+            bypBtns[m.id] = b
+            trk(b.MouseButton1Click:Connect(function()
+                St.bypass = m.id; refs.paintBypass(); saveCfg()
+                notify("反检测", "已切换："..m.label, 2, Th.Ok)
+            end))
+        end
+        local descLbl = mk("TextLabel", {
+            Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, Font=Enum.Font.Gotham,
+            TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left,
+            TextWrapped=true, Text=BYPASS_DESC[St.bypass] or "", LayoutOrder=10, Parent=bd,
+        })
+        refs.paintBypass = function()
+            for id, b in pairs(bypBtns) do
+                if id == St.bypass then b.BackgroundColor3 = Th.Acc; b.TextColor3 = Color3.fromRGB(255,255,255)
+                else b.BackgroundColor3 = Th.Sur; b.TextColor3 = Th.Txt end
+            end
+            descLbl.Text = BYPASS_DESC[St.bypass] or ""
+        end
+        refs.paintBypass()
+        mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="隐蔽模式单帧最大位移 (1-500)", LayoutOrder=11, Parent=bd })
+        local stB = mk("TextBox", { Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Bg, BorderSizePixel=0, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text=tostring(St.stealthMaxStep), ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center, LayoutOrder=12, Parent=bd })
+        mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=stB })
+        mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=stB })
+        trk(stB.FocusLost:Connect(function()
+            St.stealthMaxStep = clStep(stB.Text); stB.Text = tostring(St.stealthMaxStep); saveCfg()
+        end))
+    end,
+})
+
+-- ==================== 事件 ====================
+trk(Players.PlayerAdded:Connect(function()
+    task.defer(function() if not dead then renderAllList() end end)
+end))
+trk(Players.PlayerRemoving:Connect(function(plr)
+    removeFromList(St.tpTargets, plr.UserId)
+    removeFromList(St.camList, plr.UserId)
+    St.selAll[plr.UserId] = nil
+    St.selTp[plr.UserId] = nil
+    St.selCam[plr.UserId] = nil
+    if St.camCurrent == plr.UserId then setCamTarget(nil) end
+    if St.tempFollow == plr.UserId then St.tempFollow = nil; setCamTarget(nil) end
+    saveCfg()
+    task.defer(function()
+        if dead then return end
+        renderAllList(); renderTpList(); renderCamList()
+    end)
+end))
+
+trk(LP.CharacterAdded:Connect(function()
+    if St.camCurrent then
+        local uid = St.camCurrent
+        task.delay(0.6, function()
+            if dead then return end
+            local plr = Players:GetPlayerByUserId(uid)
+            if plr then
+                local cam = workspace.CurrentCamera
+                local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+                if cam and hum then cam.CameraSubject = hum end
+            end
+        end)
+    elseif St.tempFollow then St.tempFollow = nil end
+end))
+
+trk(UIS.InputBegan:Connect(function(input, gpe)
+    if dead or gpe then return end
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
+        if St.tempFollow then
+            St.tempFollow = nil
+            setCamTarget(nil); renderCamList()
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
+            notify("跟随", "已取消临时跟随", 1.2, Th.Sub)
+        end
+    end
+end))
+
+local distTimer = 0
+trk(RS.Heartbeat:Connect(function(dt)
+    if dead then return end
+    distTimer = distTimer + dt
+    if distTimer < 0.3 then return end
+    distTimer = 0
+    local myRoot = getMyRoot()
+    local myPos = myRoot and myRoot.Position
+    local function updRows(rows)
+        for uid, r in pairs(rows) do
+            local plr = Players:GetPlayerByUserId(uid)
+            if not plr then r.distLbl.Text = "--"
+            else
+                if myPos then
+                    local tR = getPlayerRoot(plr)
+                    r.distLbl.Text = tR and string.format("%.0f", (tR.Position - myPos).Magnitude) or "--"
+                end
+                if r.dot then r.dot.BackgroundColor3 = isPlayerAlive(plr) and Th.Ok or Th.Err end
+            end
+        end
+    end
+    updRows(allRows); updRows(tpRows); updRows(camRows)
+    if infoAllLbl then refreshAllSel() end
+    if infoTpLbl then refreshTpSel() end
+    if infoCamLbl then refreshCamSel() end
+    if St.camCurrent then
+        local plr = Players:GetPlayerByUserId(St.camCurrent)
+        if not plr then setCamTarget(nil)
+        else
+            local cam = workspace.CurrentCamera
+            local hum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
+            if cam and hum and cam.CameraSubject ~= hum then cam.CameraSubject = hum end
+        end
+    end
+end))
+
+trk(UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.RightAlt then
+        St.hidden = not St.hidden
+        applyGlobalVisibility()
+        notify("面板", St.hidden and "已隐藏 (RightAlt 恢复)" or "已显示", 2,
+               St.hidden and Th.Warn or Th.Ok)
+    end
+end))
+
+local saveTimer = 0
+trk(RS.Heartbeat:Connect(function(dt)
+    if dead then return end
+    saveTimer = saveTimer + dt
+    if saveTimer >= SAVE_INT then saveTimer = 0; saveCfg() end
+end))
+
+applyMainMin()
+applyGlobalVisibility()
+renderAllList()
+renderTpList()
+renderCamList()
+
+local Api
+local function destroy()
+    if dead then return end
+    dead = true
+    stopTpTask(true)
+    restorePersistent()
+    local cam = workspace.CurrentCamera
+    if cam then
+        local myHum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
+        pcall(function() cam.CameraSubject = myHum end)
+    end
+    saveCfg()
+    for _, c in ipairs(Conns) do pcall(function() c:Disconnect() end) end
+    table.clear(Conns)
+    pcall(function() sg:Destroy() end)
+    pcall(function() notifGui:Destroy() end)
+    if gE[SCRIPT_ID] == Api then gE[SCRIPT_ID] = nil end
+end
+trk(mCls.MouseButton1Click:Connect(destroy))
+
+Api = { version = VERSION, state = St, destroy = destroy, gui = sg }
+gE[SCRIPT_ID] = Api
+
+notify("玩家传送管理器", "v"..VERSION.." 已加载 · RightAlt 隐藏", 3, Th.Ok)
+if not hasFile then
+    task.delay(3.6, function() notify("提示", "文件存档不可用", 3, Th.Warn) end)
+end
