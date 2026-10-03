@@ -1,8 +1,7 @@
---[[ 坐标管理器 v55 · 反检测集成 · 弹簧相机 · 实时 UI ]]
+--[[ 坐标管理器 v57.2 · 第三人称相机 · 抬升保高 · 中断反馈 · 分游戏存储 · 撤回栈 ]]
 local SCRIPT_ID = "CoordinateManager"
-local VERSION = 55
+local VERSION = 57
 
---===== 反检测层集成（必须在最前） =====
 local ANTI = rawget(_G, "__CM_ANTI")
 local _guiSfx = tostring(math.random(100000, 999999))
 local _apiKey = "__CM_" .. tostring(math.random(1000000, 9999999))
@@ -17,7 +16,8 @@ local SET_MIN_W, SET_MIN_H = 260, 120
 local SET_MAX_W = 620
 local HDL, HDR_H, TITLE_H = 14, 30, 38
 local DBL_MS, RESET_HOLD = 400, 3
-local SAVE_FILE = "CoordinateManager_config.json"
+local HOLD_REPLACE_MS = 2000
+local UNDO_MAX = 100
 local SAVE_INTERVAL = 15
 
 local AXES = {"x","y","z"}
@@ -68,6 +68,16 @@ local Tween = game:GetService("TweenService")
 local Http = game:GetService("HttpService")
 local LP = Players.LocalPlayer
 
+local GAME_ID = 0
+do
+	local ok, id = pcall(function() return game.GameId end)
+	if ok and type(id) == "number" then GAME_ID = id end
+end
+local GAME_TAG = (GAME_ID > 0) and ("g" .. tostring(GAME_ID)) or "default"
+local SAVE_DIR = "CoordinateManager"
+local SAVE_FILE = SAVE_DIR .. "/" .. GAME_TAG .. ".json"
+local STATE_FILE = SAVE_DIR .. "/ui_state.json"
+
 local gE = (type(getgenv)=="function" and getgenv()) or _G
 local pv = gE[SCRIPT_ID]
 if type(pv) == "table" and type(pv.version) == "number" and pv.version >= VERSION then
@@ -79,7 +89,6 @@ if type(pv) == "table" then
 	if type(pv.destroy) == "function" then pcall(pv.destroy) end
 end
 
---========== 剪贴板 / 文件 API ==========
 local _G0 = (type(getgenv)=="function" and getgenv()) or _G
 local function _fCS()
 	if type(setclipboard)=="function" then return setclipboard end
@@ -119,42 +128,114 @@ local _clipSet, _clipGet = _fCS(), _fCG()
 local hasClip = _clipSet ~= nil and _clipGet ~= nil
 local hasFile = type(writefile)=="function" and type(readfile)=="function" and type(isfile)=="function"
 
+if hasFile then
+	pcall(function()
+		if type(makefolder) == "function" then pcall(makefolder, SAVE_DIR)
+		elseif type(createfolder) == "function" then pcall(createfolder, SAVE_DIR) end
+	end)
+end
+
 local defMainPos = UDim2.new(0.5, -180, 0, 60)
 local defSetPos  = UDim2.new(1, -360, 0, 60)
 
---========== 状态 ==========
-local St = {}
+local St = {
+	saved = {}, inputs = {x="",y="",z=""},
+	undoStack = {}, redoStack = {},
+	nid = 1, mode = "teleport", speed = 60, prec = 10,
+	noclip = "persistent", path = "direct", bypass = "off",
+	stealthMaxStep = 18, liftHeight = 30, asc = true,
+	mainW = 360, mainH = 300, setW = 360, setH = 480,
+	blockSizes = {}, hook = false, godmode = false, anticframe = false,
+	nograv = false, camStable = true, raycastBlind = false, writeProtect = false,
+	maxServerSpeed = 200, sel = {}, multi = false,
+	min = false, advOpen = false, _diagShown = false,
+}
+
+local UIState = {
+	mainPos = defMainPos, setPos = defSetPos,
+	mainVisible = true, setVisible = false,
+	blockStates = {},
+}
+
+local function decode(t)
+	local ok, d = pcall(function() return Http:JSONDecode(t) end)
+	if ok and type(d) == "table" then return d end
+end
 local function loadFromFile()
 	if not hasFile then return nil end
 	local ok, ex = pcall(isfile, SAVE_FILE); if not ok or not ex then return nil end
 	local ok2, c = pcall(readfile, SAVE_FILE); if not ok2 or type(c)~="string" or #c<2 then return nil end
-	local ok3, d = pcall(function() return Http:JSONDecode(c) end)
-	if ok3 and type(d)=="table" then
-		if d.saved and type(d.saved)~="table" then d.saved = nil end
-		if d.blockSizes and type(d.blockSizes)~="table" then d.blockSizes = nil end
-		return d
-	end
+	return decode(c)
 end
 local function saveToFile()
 	if not hasFile then return false end
 	local cfg = {
 		saved=St.saved, mode=St.mode, speed=St.speed, prec=St.prec,
 		noclip=St.noclip, path=St.path, bypass=St.bypass, stealthMaxStep=St.stealthMaxStep,
+		liftHeight=St.liftHeight,
 		nid=St.nid, asc=St.asc, mainW=St.mainW, mainH=St.mainH, setW=St.setW, setH=St.setH,
 		blockSizes=St.blockSizes, hook=St.hook, godmode=St.godmode, anticframe=St.anticframe,
 		nograv=St.nograv, camStable=St.camStable,
 		raycastBlind=St.raycastBlind, writeProtect=St.writeProtect,
-		maxServerSpeed=St.maxServerSpeed,
+		maxServerSpeed=St.maxServerSpeed, gameId=GAME_ID,
 	}
 	local ok, en = pcall(function() return Http:JSONEncode(cfg) end)
 	if not ok or not en then return false end
 	return (pcall(writefile, SAVE_FILE, en))
 end
+local function ud2s(u)
+	if typeof(u) == "UDim2" then
+		return string.format("%d,%d,%d,%d", u.X.Scale*10000, u.X.Offset, u.Y.Scale*10000, u.Y.Offset)
+	end
+	return nil
+end
+local function s2ud(s)
+	if type(s) ~= "string" then return nil end
+	local a,b,c,d = s:match("^(%-?%d+),(%-?%d+),(%-?%d+),(%-?%d+)$")
+	if not a then return nil end
+	return UDim2.new(tonumber(a)/10000, tonumber(b), tonumber(c)/10000, tonumber(d))
+end
+local function saveUIState()
+	if not hasFile then return end
+	local t = {
+		mainPos = ud2s(UIState.mainPos), setPos = ud2s(UIState.setPos),
+		mainVisible = UIState.mainVisible, setVisible = UIState.setVisible,
+		blockStates = {},
+	}
+	for id, b in pairs(UIState.blockStates) do
+		t.blockStates[id] = {min = b.min, detach = b.detach, detPos = ud2s(b.detPos)}
+	end
+	local ok, en = pcall(function() return Http:JSONEncode(t) end)
+	if not ok then return end
+	pcall(writefile, STATE_FILE, en)
+end
+local function loadUIState()
+	if not hasFile then return end
+	local ok, ex = pcall(isfile, STATE_FILE); if not ok or not ex then return end
+	local ok2, c = pcall(readfile, STATE_FILE); if not ok2 then return end
+	local d = decode(c); if type(d) ~= "table" then return end
+	if type(d.mainPos)=="string" then UIState.mainPos = s2ud(d.mainPos) or defMainPos end
+	if type(d.setPos)=="string" then UIState.setPos = s2ud(d.setPos) or defSetPos end
+	if type(d.mainVisible)=="boolean" then UIState.mainVisible = d.mainVisible end
+	if type(d.setVisible)=="boolean" then UIState.setVisible = d.setVisible end
+	if type(d.blockStates)=="table" then
+		for id, b in pairs(d.blockStates) do
+			if type(b) == "table" then
+				UIState.blockStates[id] = {
+					min = b.min == true, detach = b.detach == true,
+					detPos = type(b.detPos)=="string" and s2ud(b.detPos) or nil,
+				}
+			end
+		end
+	end
+end
+
 local fileData = loadFromFile()
-local src = fileData or inherit
-if type(src)=="table" then
+loadUIState()
+
+if type(fileData) == "table" then
+	local src = fileData
 	St.saved = (type(src.saved)=="table") and src.saved or {}
-	St.inputs = {x="",y="",z=""}
 	St.mode = (type(src.mode)=="string") and src.mode or "teleport"
 	St.speed = tonumber(src.speed) or 60
 	St.prec = tonumber(src.prec) or 10
@@ -162,6 +243,7 @@ if type(src)=="table" then
 	St.path = (type(src.path)=="string") and src.path or "direct"
 	St.bypass = (type(src.bypass)=="string") and src.bypass or "off"
 	St.stealthMaxStep = tonumber(src.stealthMaxStep) or 18
+	St.liftHeight = tonumber(src.liftHeight) or 30
 	St.nid = tonumber(src.nid) or 1
 	St.asc = src.asc ~= false
 	St.mainW = tonumber(src.mainW) or 360
@@ -177,20 +259,18 @@ if type(src)=="table" then
 	St.raycastBlind = src.raycastBlind == true
 	St.writeProtect = src.writeProtect == true
 	St.maxServerSpeed = tonumber(src.maxServerSpeed) or 200
-else
-	St.saved={}; St.inputs={x="",y="",z=""}
-	St.mode="teleport"; St.speed=60; St.prec=10
-	St.noclip="persistent"; St.path="direct"; St.bypass="off"
-	St.stealthMaxStep=18; St.nid=1; St.asc=true
-	St.mainW=360; St.mainH=300; St.setW=360; St.setH=480
-	St.blockSizes={}; St.hook=false; St.godmode=false; St.anticframe=false
-	St.nograv=false; St.camStable=true
-	St.raycastBlind=false; St.writeProtect=false
-	St.maxServerSpeed=200
+elseif type(inherit) == "table" then
+	for k, v in pairs(inherit) do
+		if St[k] == nil then St[k] = v end
+	end
+	if type(inherit.saved) == "table" then St.saved = inherit.saved end
+	if type(inherit.inputs) == "table" then St.inputs = inherit.inputs end
+	St.sel = {}; St.multi = false; St.min = false; St.advOpen = false
 end
-St._diagShown = false
+
 if not St.stealthMaxStep or St.stealthMaxStep < 1 then St.stealthMaxStep = 18 end
 if not St.maxServerSpeed or St.maxServerSpeed < 50 then St.maxServerSpeed = 200 end
+if not St.liftHeight or St.liftHeight < 1 then St.liftHeight = 30 end
 
 local Th = {
 	Bg=Color3.fromRGB(22,22,26), Sur=Color3.fromRGB(33,33,40),
@@ -201,7 +281,6 @@ local Th = {
 	Warn=Color3.fromRGB(240,180,80), Hdl=Color3.fromRGB(230,230,240),
 }
 
--- 全局：传送宽限期
 local TP_BUSY = { untilT = 0, grace = 1.5 }
 local function tpBusyMark(sec)
 	local t = os.clock() + (sec or TP_BUSY.grace)
@@ -210,6 +289,8 @@ end
 local function tpBusyIsBusy()
 	return os.clock() < TP_BUSY.untilT
 end
+
+local INTERRUPT = { flag = false }
 
 local Conns = {}
 local dead = false
@@ -249,11 +330,10 @@ local function clSpd(v) return cl(math.floor((tonumber(v) or 60)+0.5), 1, 20000)
 local function clPrec(v) return cl(math.floor((tonumber(v) or 10)+0.5), 1, 500) end
 local function clStep(v) return cl(math.floor((tonumber(v) or 18)+0.5), 1, 5000) end
 local function clSrv(v) return cl(math.floor((tonumber(v) or 200)+0.5), 30, 2000) end
-
+local function clLift(v) return cl(math.floor((tonumber(v) or 30)+0.5), 1, 500) end
 local function toClip(t) if not _clipSet then return false end return (pcall(_clipSet, t)) end
 local function fromClip() if not _clipGet then return nil end local ok, r = pcall(_clipGet); if ok and type(r)=="string" then return r end end
 
---========== 数学表达式 ==========
 local function evalMathExpr(expr, cur)
 	expr = tostring(expr):gsub("%s+", ""); if expr == "" then return nil end
 	local pos = 1
@@ -297,37 +377,22 @@ local function evalMathExpr(expr, cur)
 	return v
 end
 
---========== 网络所有权 ==========
 local OWNER = {enabled=false, conn=nil, lastTry=0, interval=0.35, confirmed=false, lastResult="", notified=false}
 function OWNER.claimCharacter()
-	local ch = LP.Character
-	if not ch then return false end
-	local hrp = ch:FindFirstChild("HumanoidRootPart")
-	if not hrp then return false end
+	local ch = LP.Character; if not ch then return false end
+	local hrp = ch:FindFirstChild("HumanoidRootPart"); if not hrp then return false end
 	local cur = nil
 	pcall(function() cur = hrp:GetNetworkOwner() end)
-	if cur == LP then
-		OWNER.confirmed = true
-		OWNER.lastResult = "already-owner"
-		return true
-	end
+	if cur == LP then OWNER.confirmed = true; OWNER.lastResult = "already-owner"; return true end
 	local ok = pcall(function() hrp:SetNetworkOwner(LP) end)
 	if ok then
 		pcall(function() cur = hrp:GetNetworkOwner() end)
-		if cur == LP or cur == nil then
-			OWNER.confirmed = true
-			OWNER.lastResult = "success"
-			return true
-		end
+		if cur == LP or cur == nil then OWNER.confirmed = true; OWNER.lastResult = "success"; return true end
 	end
 	if not ok then
 		pcall(function() hrp:SetNetworkOwnershipAuto() end)
 		pcall(function() cur = hrp:GetNetworkOwner() end)
-		if cur == LP then
-			OWNER.confirmed = true
-			OWNER.lastResult = "auto-success"
-			return true
-		end
+		if cur == LP then OWNER.confirmed = true; OWNER.lastResult = "auto-success"; return true end
 	end
 	OWNER.lastResult = "locked"
 	return false
@@ -339,8 +404,7 @@ function OWNER.start()
 		if dead or not OWNER.enabled then return end
 		OWNER.lastTry = OWNER.lastTry + dt
 		if OWNER.lastTry >= OWNER.interval then
-			OWNER.lastTry = 0
-			OWNER.claimCharacter()
+			OWNER.lastTry = 0; OWNER.claimCharacter()
 		end
 	end)
 end
@@ -349,7 +413,6 @@ function OWNER.stop()
 	if OWNER.conn then OWNER.conn:Disconnect(); OWNER.conn = nil end
 end
 
---========== HOOK (保守版) ==========
 local HOOK = {
 	installed=false, oldIndex=nil, oldNewIndex=nil, oldNamecall=nil,
 	fakeCF=setmetatable({}, {__mode="k"}),
@@ -357,69 +420,35 @@ local HOOK = {
 	fakeVel=setmetatable({}, {__mode="k"}),
 	fakeHealth=setmetatable({}, {__mode="k"}),
 	blocked=setmetatable({}, {__mode="k"}),
-	lastEnsure=0,
-	raycastBlind=false, writeProtect=false, internalCall=false,
-	antiKick=true,
-	V3ZERO = Vector3.new(0, 0, 0),
+	lastEnsure=0, raycastBlind=false, writeProtect=false, internalCall=false,
+	antiKick=true, V3ZERO = Vector3.new(0, 0, 0),
 }
 function HOOK.supported() return type(hookmetamethod)=="function" and type(typeof)=="function" end
-
 function HOOK.setCF(part, cf)
 	if not part or not part.Parent then return end
-	local old = HOOK.internalCall
-	HOOK.internalCall = true
-	pcall(function() part.CFrame = cf end)
-	HOOK.internalCall = old
-end
-function HOOK.setPos(part, pos)
-	if not part or not part.Parent then return end
-	local old = HOOK.internalCall
-	HOOK.internalCall = true
-	pcall(function() part.Position = pos end)
-	HOOK.internalCall = old
+	local old = HOOK.internalCall; HOOK.internalCall = true
+	pcall(function() part.CFrame = cf end); HOOK.internalCall = old
 end
 function HOOK.setVel(part, v)
 	if not part or not part.Parent then return end
-	local old = HOOK.internalCall
-	HOOK.internalCall = true
-	pcall(function() part.AssemblyLinearVelocity = v end)
-	HOOK.internalCall = old
+	local old = HOOK.internalCall; HOOK.internalCall = true
+	pcall(function() part.AssemblyLinearVelocity = v end); HOOK.internalCall = old
 end
 function HOOK.setAngVel(part, v)
 	if not part or not part.Parent then return end
-	local old = HOOK.internalCall
-	HOOK.internalCall = true
-	pcall(function() part.AssemblyAngularVelocity = v end)
-	HOOK.internalCall = old
+	local old = HOOK.internalCall; HOOK.internalCall = true
+	pcall(function() part.AssemblyAngularVelocity = v end); HOOK.internalCall = old
 end
 function HOOK.setHum(hum, prop, val)
 	if not hum or not hum.Parent then return end
-	local old = HOOK.internalCall
-	HOOK.internalCall = true
-	pcall(function() hum[prop] = val end)
-	HOOK.internalCall = old
+	local old = HOOK.internalCall; HOOK.internalCall = true
+	pcall(function() hum[prop] = val end); HOOK.internalCall = old
 end
-
 function HOOK.install()
 	if not HOOK.supported() then return false end
 	if HOOK.installed then return true end
-
 	local ok1, oldI = pcall(hookmetamethod, game, "__index", function(self, key)
 		if typeof(self) == "Instance" then
-			local f = HOOK.fakeCF[self]
-			if f then
-				if key == "CFrame" then return f end
-				if key == "Position" then return f.Position end
-				if key == "X" then return f.X end
-				if key == "Y" then return f.Y end
-				if key == "Z" then return f.Z end
-				if key == "Rotation" then return f.Rotation end
-			end
-			if HOOK.fakeVel[self] then
-				if key == "Velocity" or key == "AssemblyLinearVelocity" or key == "AssemblyAngularVelocity" then
-					return HOOK.V3ZERO
-				end
-			end
 			local fws = HOOK.fakeWS[self]
 			if fws then
 				if key == "WalkSpeed" then return fws end
@@ -432,7 +461,6 @@ function HOOK.install()
 	end)
 	if not ok1 then return false end
 	HOOK.oldIndex = oldI
-
 	local ok2, oldN = pcall(hookmetamethod, game, "__newindex", function(self, key, value)
 		if HOOK.writeProtect and not HOOK.internalCall and typeof(self) == "Instance" then
 			if HOOK.fakeCF[self] and (key == "CFrame" or key == "Position") then return end
@@ -443,7 +471,6 @@ function HOOK.install()
 		return HOOK.oldNewIndex(self, key, value)
 	end)
 	if ok2 then HOOK.oldNewIndex = oldN end
-
 	local ok3, oldNC = pcall(hookmetamethod, game, "__namecall", function(self, ...)
 		if typeof(self) == "Instance" then
 			local m = getnamecallmethod()
@@ -464,7 +491,6 @@ function HOOK.install()
 	HOOK.installed = true
 	return true
 end
-
 function HOOK.uninstall()
 	if not HOOK.installed then return end
 	pcall(function() if HOOK.oldIndex then hookmetamethod(game, "__index", HOOK.oldIndex) end end)
@@ -472,7 +498,6 @@ function HOOK.uninstall()
 	pcall(function() if HOOK.oldNamecall then hookmetamethod(game, "__namecall", HOOK.oldNamecall) end end)
 	HOOK.installed = false
 end
-
 function HOOK.ensure(dt)
 	HOOK.lastEnsure = (HOOK.lastEnsure or 0) + (dt or 0)
 	if HOOK.lastEnsure < 2 then return end
@@ -480,7 +505,6 @@ function HOOK.ensure(dt)
 	if not HOOK.supported() then return end
 	if not HOOK.installed then pcall(HOOK.install) end
 end
-
 function HOOK.realCF(part)
 	if not part then return nil end
 	if not HOOK.installed or not HOOK.oldIndex then return part.CFrame end
@@ -505,14 +529,7 @@ end
 function HOOK.updateFake(part, dt, maxSpeed)
 	local f = HOOK.fakeCF[part]; if not f then return end
 	local real = HOOK.realCF(part); if not real then return end
-	local diff = real.Position - f.Position; local dist = diff.Magnitude
-	local step = (maxSpeed or 16) * dt
-	if dist <= step or dist < 0.05 then HOOK.fakeCF[part] = real
-	else
-		local np = f.Position + diff.Unit * step
-		local rot = real - real.Position
-		HOOK.fakeCF[part] = CFrame.new(np) * rot
-	end
+	HOOK.fakeCF[part] = real
 	local hum = part:FindFirstChildOfClass("Humanoid")
 	if hum and HOOK.fakeHealth[hum] then HOOK.fakeHealth[hum] = hum.MaxHealth or 100 end
 end
@@ -521,14 +538,11 @@ function HOOK.blockRemote(r, s)
 	HOOK.blocked[r] = s and true or nil
 end
 function HOOK.withInternal(fn, ...)
-	local old = HOOK.internalCall
-	HOOK.internalCall = true
-	local ok, r = pcall(fn, ...)
-	HOOK.internalCall = old
+	local old = HOOK.internalCall; HOOK.internalCall = true
+	local ok, r = pcall(fn, ...); HOOK.internalCall = old
 	if ok then return r end
 end
 
---========== 无重力 ==========
 local GRAV = {enabled=false, conn=nil, force=nil}
 function GRAV.start()
 	if GRAV.conn then return end
@@ -538,88 +552,108 @@ function GRAV.start()
 		local ch = LP.Character; if not ch then return end
 		local r = ch:FindFirstChild("HumanoidRootPart"); if not r then return end
 		local bf = GRAV.force
-		if not bf or not bf.Parent then
+		if not bf or not bf.Parent or bf.Parent ~= r then
+			if bf then pcall(function() bf:Destroy() end) end
 			bf = Instance.new("BodyForce")
 			bf.Name = "CM_NoGravity"
 			bf.Force = Vector3.new(0, r:GetMass() * workspace.Gravity, 0)
 			bf.Parent = r
 			GRAV.force = bf
-		else bf.Force = Vector3.new(0, r:GetMass() * workspace.Gravity, 0) end
+		else
+			bf.Force = Vector3.new(0, r:GetMass() * workspace.Gravity, 0)
+		end
+		local hum = ch:FindFirstChildOfClass("Humanoid")
+		if hum then
+			pcall(function()
+				hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+				hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+			end)
+		end
 	end)
 end
 function GRAV.stop()
 	GRAV.enabled = false
 	if GRAV.conn then GRAV.conn:Disconnect(); GRAV.conn = nil end
 	if GRAV.force then pcall(function() GRAV.force:Destroy() end); GRAV.force = nil end
+	local ch = LP.Character
+	if ch then
+		local hum = ch:FindFirstChildOfClass("Humanoid")
+		if hum then
+			pcall(function()
+				hum:SetStateEnabled(Enum.HumanoidStateType.FallingDown, true)
+				hum:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, true)
+			end)
+		end
+	end
 end
 
---========== 角色守护 ===========
-local guardState = {char=nil, root=nil, hum=nil, lastRealCF=nil, lastCheck=0, _pendingRollback=nil, _pendingCount=0}
-local function updateGuard()
-	local ch = LP.Character
-	if ch ~= guardState.char then
-		guardState.char = ch
-		guardState.root = ch and ch:FindFirstChild("HumanoidRootPart")
-		guardState.hum = ch and ch:FindFirstChildOfClass("Humanoid")
-		guardState.lastRealCF = nil
-		guardState._pendingRollback = nil
-		guardState._pendingCount = 0
+do
+	local guardState = {char=nil, root=nil, hum=nil, lastRealCF=nil, lastCheck=0, _pendingRollback=nil, _pendingCount=0}
+	local function updateGuard()
+		local ch = LP.Character
+		if ch ~= guardState.char then
+			guardState.char = ch
+			guardState.root = ch and ch:FindFirstChild("HumanoidRootPart")
+			guardState.hum = ch and ch:FindFirstChildOfClass("Humanoid")
+			guardState.lastRealCF = nil
+			guardState._pendingRollback = nil
+			guardState._pendingCount = 0
+		end
+		if not guardState.root and ch then
+			guardState.root = ch:FindFirstChild("HumanoidRootPart")
+			guardState.hum = ch and ch:FindFirstChildOfClass("Humanoid")
+		end
 	end
-	if not guardState.root and ch then
-		guardState.root = ch:FindFirstChild("HumanoidRootPart")
-		guardState.hum = ch:FindFirstChildOfClass("Humanoid")
-	end
-end
-trk(RS.Heartbeat:Connect(function(dt)
-	if dead then return end
-	if St.hook then HOOK.ensure(dt) end
-	updateGuard()
-	local r, hum = guardState.root, guardState.hum
-	if not r or not r.Parent or not hum or not hum.Parent then return end
-	if St.godmode and hum.Health <= 0.01 and hum.MaxHealth > 0 then
-		pcall(function() hum.Health = hum.MaxHealth end)
-	end
-	if St.anticframe then
-		guardState.lastCheck = guardState.lastCheck + dt
-		if guardState.lastCheck >= 0.15 then
-			guardState.lastCheck = 0
-			local real = HOOK.realCF(r)
-			if real then
-				local busy = tpBusyIsBusy() or (task_ and task_.cn ~= nil)
-				if busy then
-					guardState.lastRealCF = real
-					guardState._pendingRollback = nil
-					guardState._pendingCount = 0
-				else
-					if guardState.lastRealCF then
-						local moved = (real.Position - guardState.lastRealCF.Position).Magnitude
-						if moved > 150 then
-							if guardState._pendingRollback then
-								guardState._pendingCount = guardState._pendingCount + 1
-								if guardState._pendingCount >= 2 then
-									HOOK.setCF(r, guardState._pendingRollback)
-									guardState._pendingRollback = nil
-									guardState._pendingCount = 0
+	trk(RS.Heartbeat:Connect(function(dt)
+		if dead then return end
+		if St.hook then HOOK.ensure(dt) end
+		updateGuard()
+		local r, hum = guardState.root, guardState.hum
+		if not r or not r.Parent or not hum or not hum.Parent then return end
+		if St.godmode and hum.Health <= 0.01 and hum.MaxHealth > 0 then
+			pcall(function() hum.Health = hum.MaxHealth end)
+		end
+		if St.anticframe then
+			guardState.lastCheck = guardState.lastCheck + dt
+			if guardState.lastCheck >= 0.15 then
+				guardState.lastCheck = 0
+				local real = HOOK.realCF(r)
+				if real then
+					local busy = tpBusyIsBusy() or (task_ and task_.cn ~= nil)
+					if busy then
+						guardState.lastRealCF = real
+						guardState._pendingRollback = nil
+						guardState._pendingCount = 0
+					else
+						if guardState.lastRealCF then
+							local moved = (real.Position - guardState.lastRealCF.Position).Magnitude
+							if moved > 150 then
+								if guardState._pendingRollback then
+									guardState._pendingCount = guardState._pendingCount + 1
+									if guardState._pendingCount >= 2 then
+										HOOK.setCF(r, guardState._pendingRollback)
+										guardState._pendingRollback = nil
+										guardState._pendingCount = 0
+									end
+								else
+									guardState._pendingRollback = guardState.lastRealCF
+									guardState._pendingCount = 1
 								end
 							else
-								guardState._pendingRollback = guardState.lastRealCF
-								guardState._pendingCount = 1
+								guardState._pendingRollback = nil
+								guardState._pendingCount = 0
+								guardState.lastRealCF = real
 							end
 						else
-							guardState._pendingRollback = nil
-							guardState._pendingCount = 0
 							guardState.lastRealCF = real
 						end
-					else
-						guardState.lastRealCF = real
 					end
 				end
 			end
 		end
-	end
-end))
+	end))
+end
 
---========== 方向解析 ==========
 local function parseDir(raw)
 	local t = tostring(raw or ""):gsub("%s+", "")
 	if t == "" then return nil end
@@ -630,45 +664,27 @@ local function parseDir(raw)
 	return nil
 end
 
---========== GUI 基础 ==========
 local zCounter = 1000
 local function nextZ() zCounter = zCounter + 1; return zCounter end
-
--- 随机命名 GUI（反检测）
 local sg = mk("ScreenGui", {Name="RBX_Gui_".._guiSfx, ResetOnSpawn=false, IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=999999})
 sg.Parent = guiP()
 local notifGui = mk("ScreenGui", {Name="RBX_Notif_".._guiSfx, ResetOnSpawn=false, IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=1000000})
 notifGui.Parent = guiP()
-
--- 标记给反检测层
-if ANTI and ANTI.mark then
-	ANTI.mark(sg)
-	ANTI.mark(notifGui)
-end
-
-local function protectGui(obj)
-	if not obj then return end
-	pcall(function()
-		obj.AncestryChanged:Connect(function(_, parent)
-			if dead then return end
-			if not parent then
-				task.defer(function()
-					if not dead and obj then pcall(function() obj.Parent = guiP() end) end
-				end)
-			end
-		end)
-	end)
-end
-protectGui(sg); protectGui(notifGui)
+if ANTI and ANTI.mark then ANTI.mark(sg); ANTI.mark(notifGui) end
 
 local notifH = mk("Frame", {Name="NH", AnchorPoint=Vector2.new(1,1), Position=UDim2.new(1,-20,1,-20), Size=UDim2.fromOffset(300,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1, ZIndex=1, Parent=notifGui})
 mk("UIListLayout", {FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,8), HorizontalAlignment=Enum.HorizontalAlignment.Right, VerticalAlignment=Enum.VerticalAlignment.Bottom, Parent=notifH})
 
-local nc = 0
-local function notify(title, message, duration, color)
+local mHi = mk("Frame", {Name="MH", BackgroundColor3=Th.Acc, BackgroundTransparency=0.75, BorderSizePixel=0, ZIndex=9000, Visible=false, Parent=sg})
+mk("UICorner", {CornerRadius=UDim.new(0,8), Parent=mHi})
+mk("UIStroke", {Color=Th.Acc, Thickness=3, Transparency=0.1, Parent=mHi})
+
+local UIX = {_nc = 0, drag = nil}
+function UIX.notify(title, message, duration, color)
 	if dead then return end
-	nc = nc + 1
-	local card = mk("Frame", {Name="C"..nc, Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundColor3=Th.Sur, BackgroundTransparency=1, BorderSizePixel=0, LayoutOrder=nc, ZIndex=2, Parent=notifH})
+	UIX._nc = UIX._nc + 1
+	local n = UIX._nc
+	local card = mk("Frame", {Name="C"..n, Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundColor3=Th.Sur, BackgroundTransparency=1, BorderSizePixel=0, LayoutOrder=n, ZIndex=2, Parent=notifH})
 	local cs = mk("UIStroke", {Color=color or Th.Str, Thickness=1, Transparency=1, Parent=card})
 	mk("UICorner", {CornerRadius=UDim.new(0,8), Parent=card})
 	mk("UIPadding", {PaddingTop=UDim.new(0,10), PaddingBottom=UDim.new(0,10), PaddingLeft=UDim.new(0,14), PaddingRight=UDim.new(0,14), Parent=card})
@@ -690,50 +706,72 @@ local function notify(title, message, duration, color)
 		task.delay(0.45, function() if not dead and card and card.Parent then card:Destroy() end end)
 	end)
 end
-
-local mHi = mk("Frame", {Name="MH", BackgroundColor3=Th.Acc, BackgroundTransparency=0.75, BorderSizePixel=0, ZIndex=9000, Visible=false, Parent=sg})
-mk("UICorner", {CornerRadius=UDim.new(0,8), Parent=mHi})
-mk("UIStroke", {Color=Th.Acc, Thickness=3, Transparency=0.1, Parent=mHi})
-local function showHiAt(p, s) mHi.Position=UDim2.fromOffset(p.X, p.Y); mHi.Size=UDim2.fromOffset(s.X, s.Y); mHi.Visible=true end
-local function hideHi() mHi.Visible = false end
-
-local dragState = nil
-local function startDrag(frame, ip, opts)
-	dragState = {frame=frame, startMouse=ip, startPos=frame.Position, opts=opts}
+function UIX.protectGui(obj)
+	if not obj then return end
+	pcall(function()
+		obj.AncestryChanged:Connect(function(_, parent)
+			if dead then return end
+			if not parent then
+				task.defer(function()
+					if not dead and obj then pcall(function() obj.Parent = guiP() end) end
+				end)
+			end
+		end)
+	end)
+end
+function UIX.showHiAt(p, s) mHi.Position=UDim2.fromOffset(p.X, p.Y); mHi.Size=UDim2.fromOffset(s.X, s.Y); mHi.Visible=true end
+function UIX.hideHi() mHi.Visible = false end
+function UIX.startDrag(frame, ip, opts)
+	UIX.drag = {frame=frame, startMouse=ip, startPos=frame.Position, opts=opts}
 	frame.ZIndex = nextZ()
 	if opts and opts.onZ then opts.onZ() end
 end
-local function stopDrag()
-	if not dragState then return end
-	local st = dragState; dragState = nil; hideHi()
-	if st.opts and st.opts.onEnd then pcall(st.opts.onEnd) end
+function UIX.stopDrag()
+	if not UIX.drag then return end
+	local d = UIX.drag; UIX.drag = nil; UIX.hideHi()
+	if d.opts and d.opts.onEnd then pcall(d.opts.onEnd) end
 end
+
+UIX.protectGui(sg); UIX.protectGui(notifGui)
 trk(UIS.InputChanged:Connect(function(input)
-	if not dragState or not dragState.frame.Parent then return end
+	if not UIX.drag or not UIX.drag.frame.Parent then return end
 	if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
-	local d = input.Position - dragState.startMouse
-	dragState.frame.Position = UDim2.new(dragState.startPos.X.Scale, dragState.startPos.X.Offset + d.X, dragState.startPos.Y.Scale, dragState.startPos.Y.Offset + d.Y)
-	if dragState.opts and dragState.opts.onDrag then pcall(dragState.opts.onDrag) end
+	local d = input.Position - UIX.drag.startMouse
+	UIX.drag.frame.Position = UDim2.new(UIX.drag.startPos.X.Scale, UIX.drag.startPos.X.Offset + d.X, UIX.drag.startPos.Y.Scale, UIX.drag.startPos.Y.Offset + d.Y)
+	if UIX.drag.opts and UIX.drag.opts.onDrag then pcall(UIX.drag.opts.onDrag) end
 end))
 trk(UIS.InputEnded:Connect(function(input)
-	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then stopDrag() end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then UIX.stopDrag() end
 end))
-trk(UIS.WindowFocusReleased:Connect(function() stopDrag() end))
+trk(UIS.WindowFocusReleased:Connect(function() UIX.stopDrag() end))
 
 local allHidden = false
 
---========== 相机管理器（临界阻尼弹簧） ==========
-local camMgr = {
-	active = false, conn = nil,
-	savedType = nil, savedSubject = nil,
-	restoreJob = nil, relOffset = nil, camVel = nil,
+-- ========== 摄像机模块 v57.2（第三人称跟随 + 自由旋转 + 平方刚度追赶） ==========
+local CAM = {
+	active = false,
+	conn = nil,
+	restoreJob = nil,
+	savedType = nil,
+	savedSubject = nil,
+	smoothPos = nil,
+	posVel = nil,
+	focusOffset = Vector3.new(0, 2, 0),
+	distance = 14,
+	accumYaw = 0,
+	accumPitch = 20,
+	yawInputAccum = 0,
+	pitchInputAccum = 0,
+	fovSaved = nil,
+	sens = 0.4,
 }
-local function camMgr_restore()
+
+function CAM.restore()
 	local cam = workspace.CurrentCamera
 	if not cam then return end
-	local subj = camMgr.savedSubject
+	local subj = CAM.savedSubject
 	if subj and (typeof(subj) ~= "Instance" or not subj.Parent) then subj = nil end
-	if camMgr.savedType then pcall(function() cam.CameraType = camMgr.savedType end)
+	if CAM.savedType then pcall(function() cam.CameraType = CAM.savedType end)
 	else pcall(function() cam.CameraType = Enum.CameraType.Custom end) end
 	if subj then pcall(function() cam.CameraSubject = subj end)
 	else
@@ -741,33 +779,44 @@ local function camMgr_restore()
 		local hum = ch and ch:FindFirstChildOfClass("Humanoid")
 		if hum then pcall(function() cam.CameraSubject = hum end) end
 	end
-	camMgr.savedType = nil; camMgr.savedSubject = nil
-	camMgr.relOffset = nil; camMgr.camVel = nil
+	if CAM.fovSaved then pcall(function() cam.FieldOfView = CAM.fovSaved end); CAM.fovSaved = nil end
+	CAM.savedType = nil; CAM.savedSubject = nil
+	CAM.smoothPos = nil; CAM.posVel = nil
 end
-local function camMgr_start()
+
+function CAM.start()
 	local cam = workspace.CurrentCamera
-	if not cam or camMgr.active then return end
-	if camMgr.restoreJob then
-		pcall(function() task.cancel(camMgr.restoreJob) end)
-		camMgr.restoreJob = nil
-	end
+	if not cam or CAM.active then return end
+	if CAM.restoreJob then pcall(function() task.cancel(CAM.restoreJob) end); CAM.restoreJob = nil end
 	if cam.CameraType ~= Enum.CameraType.Scriptable then
-		camMgr.savedType = cam.CameraType
-		camMgr.savedSubject = cam.CameraSubject
+		CAM.savedType = cam.CameraType
+		CAM.savedSubject = cam.CameraSubject
+		CAM.fovSaved = cam.FieldOfView
 	end
-	local ch = LP.Character
-	local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-	if hrp then
-		camMgr.relOffset = cam.CFrame.Position - hrp.Position
-	else
-		camMgr.relOffset = Vector3.new(0, 4, 12)
-	end
-	camMgr.active = true
-	camMgr.camVel = Vector3.new(0, 0, 0)
+	CAM.smoothPos = cam.CFrame.Position
+	CAM.posVel = Vector3.new(0, 0, 0)
+	local lv = cam.CFrame.LookVector
+	CAM.accumYaw = math.deg(math.atan2(-lv.X, -lv.Z))
+	CAM.accumPitch = math.deg(math.asin(cl(lv.Y, -1, 1)))
+	if CAM.accumPitch > 80 then CAM.accumPitch = 80 end
+	if CAM.accumPitch < -80 then CAM.accumPitch = -80 end
+	CAM.yawInputAccum = 0
+	CAM.pitchInputAccum = 0
+	CAM.active = true
 	pcall(function() cam.CameraType = Enum.CameraType.Scriptable end)
-	if camMgr.conn then return end
-	camMgr.conn = RS.RenderStepped:Connect(function(dt)
-		if dead or not camMgr.active then return end
+
+	local mouseConn = UIS.InputChanged:Connect(function(input)
+		if dead or not CAM.active then return end
+		if input.UserInputType == Enum.UserInputType.MouseMovement then
+			CAM.yawInputAccum = CAM.yawInputAccum + input.Delta.X
+			CAM.pitchInputAccum = CAM.pitchInputAccum + input.Delta.Y
+		end
+	end)
+	table.insert(Conns, mouseConn)
+
+	if CAM.conn then return end
+	CAM.conn = RS.RenderStepped:Connect(function(dt)
+		if dead or not CAM.active then return end
 		local c = workspace.CurrentCamera
 		if not c then return end
 		if c.CameraType ~= Enum.CameraType.Scriptable then
@@ -776,66 +825,87 @@ local function camMgr_start()
 		local ch = LP.Character
 		local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
 		if not hrp then return end
-		local realPos = HOOK.realPos(hrp) or hrp.Position
-		if not camMgr.relOffset then
-			camMgr.relOffset = c.CFrame.Position - realPos
-			return
+		local charPos = HOOK.realPos(hrp) or hrp.Position
+
+		local dX, dY = 0, 0
+		if UIS.GetMouseDelta then
+			local ok, d = pcall(function() return UIS:GetMouseDelta() end)
+			if ok and d and (d.X ~= 0 or d.Y ~= 0) then
+				dX = d.X; dY = d.Y
+			end
 		end
-		if not camMgr.camVel then camMgr.camVel = Vector3.new(0,0,0) end
-		local targetPos = realPos + camMgr.relOffset
-		local curPos = c.CFrame.Position
-		local delta = targetPos - curPos
-		local dist = delta.Magnitude
-		if dist > 300 then
-			local rot = c.CFrame - c.CFrame.Position
-			pcall(function() c.CFrame = CFrame.new(targetPos) * rot end)
-			camMgr.camVel = Vector3.new(0, 0, 0)
-			return
+		if dX == 0 and dY == 0 then
+			dX = CAM.yawInputAccum
+			dY = CAM.pitchInputAccum
 		end
-		if dist < 0.02 then
-			camMgr.camVel = camMgr.camVel * 0.5
-			return
+		CAM.yawInputAccum = 0
+		CAM.pitchInputAccum = 0
+
+		if dX ~= 0 or dY ~= 0 then
+			CAM.accumYaw = CAM.accumYaw - dX * CAM.sens
+			CAM.accumPitch = CAM.accumPitch + dY * CAM.sens
+			if CAM.accumPitch > 80 then CAM.accumPitch = 80 end
+			if CAM.accumPitch < -80 then CAM.accumPitch = -80 end
+			while CAM.accumYaw > 180 do CAM.accumYaw = CAM.accumYaw - 360 end
+			while CAM.accumYaw < -180 do CAM.accumYaw = CAM.accumYaw + 360 end
 		end
-		local stiff = 25 + dist * 1.5
-		local damp = 2 * math.sqrt(stiff)
-		local sdt = math.min(dt, 1/30)
-		if sdt < 1/240 then sdt = 1/240 end
-		local accel = delta * stiff - camMgr.camVel * damp
-		camMgr.camVel = camMgr.camVel + accel * sdt
-		local maxSpd = 800
-		local spd = camMgr.camVel.Magnitude
-		if spd > maxSpd then camMgr.camVel = camMgr.camVel.Unit * maxSpd end
-		local newPos = curPos + camMgr.camVel * sdt
-		local rot = c.CFrame - c.CFrame.Position
-		pcall(function() c.CFrame = CFrame.new(newPos) * rot end)
+
+		local lookDir = CFrame.fromEulerAnglesYXZ(math.rad(CAM.accumPitch), math.rad(CAM.accumYaw), 0).LookVector
+		local focus = charPos + CAM.focusOffset
+		local targetPos = focus - lookDir * CAM.distance
+
+		local posDelta = targetPos - CAM.smoothPos
+		local posDist = posDelta.Magnitude
+		if posDist > 500 then
+			CAM.smoothPos = targetPos
+			CAM.posVel = Vector3.new(0, 0, 0)
+		elseif posDist > 0.005 then
+			local stiffness = 80 + posDist * posDist * 0.7
+			if stiffness > 14000 then stiffness = 14000 end
+			local damping = 2 * math.sqrt(stiffness) * 0.9
+			local sdt = math.min(dt, 1/30)
+			if sdt < 1/240 then sdt = 1/240 end
+			local accel = posDelta * stiffness - CAM.posVel * damping
+			CAM.posVel = CAM.posVel + accel * sdt
+			local maxSpd = 7000
+			if CAM.posVel.Magnitude > maxSpd then CAM.posVel = CAM.posVel.Unit * maxSpd end
+			CAM.smoothPos = CAM.smoothPos + CAM.posVel * sdt
+		else
+			CAM.posVel = CAM.posVel * 0.5
+		end
+
+		local finalCF = CFrame.lookAt(CAM.smoothPos, focus)
+		pcall(function() c.CFrame = finalCF end)
 	end)
-end
-local function camMgr_stop()
-	if not camMgr.active then return end
-	camMgr.active = false
-	if camMgr.conn then camMgr.conn:Disconnect(); camMgr.conn = nil end
-	if camMgr.restoreJob then pcall(function() task.cancel(camMgr.restoreJob) end) end
-	camMgr.restoreJob = task.delay(0.05, function()
-		camMgr.restoreJob = nil
-		if dead then return end
-		camMgr_restore()
-	end)
-end
-local function camMgr_forceRestore()
-	if camMgr.conn then camMgr.conn:Disconnect(); camMgr.conn = nil end
-	if camMgr.restoreJob then pcall(function() task.cancel(camMgr.restoreJob) end); camMgr.restoreJob = nil end
-	camMgr.active = false
-	camMgr_restore()
 end
 
---========== 主面板 ==========
-local main = mk("Frame", {Name="Main", AnchorPoint=Vector2.new(0,0), Position=defMainPos, Size=UDim2.fromOffset(St.mainW, St.mainH), BackgroundColor3=Th.Bg, BorderSizePixel=0, Active=true, ClipsDescendants=true, ZIndex=10, Visible=true, Parent=sg})
+function CAM.stop()
+	if not CAM.active then return end
+	CAM.active = false
+	if CAM.conn then CAM.conn:Disconnect(); CAM.conn = nil end
+	if CAM.restoreJob then pcall(function() task.cancel(CAM.restoreJob) end) end
+	CAM.restoreJob = task.delay(0.05, function()
+		CAM.restoreJob = nil
+		if dead then return end
+		CAM.restore()
+	end)
+end
+
+function CAM.forceRestore()
+	if CAM.conn then CAM.conn:Disconnect(); CAM.conn = nil end
+	if CAM.restoreJob then pcall(function() task.cancel(CAM.restoreJob) end); CAM.restoreJob = nil end
+	CAM.active = false
+	CAM.restore()
+end
+
+-- 主面板
+local main = mk("Frame", {Name="Main", AnchorPoint=Vector2.new(0,0), Position=UIState.mainPos, Size=UDim2.fromOffset(St.mainW, St.mainH), BackgroundColor3=Th.Bg, BorderSizePixel=0, Active=true, ClipsDescendants=true, ZIndex=10, Visible=UIState.mainVisible, Parent=sg})
 mk("UICorner", {CornerRadius=UDim.new(0,10), Parent=main})
 mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=main})
 
 local mHdr = mk("Frame", {Name="Hdr", Size=UDim2.new(1,0,0,TITLE_H), BackgroundColor3=Th.Sur, BorderSizePixel=0, Active=true, ZIndex=11, Parent=main})
 mk("UICorner", {CornerRadius=UDim.new(0,10), Parent=mHdr})
-mk("TextLabel", {Size=UDim2.new(1,-84,1,0), Position=UDim2.fromOffset(14,0), BackgroundTransparency=1, Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left, Text="坐标管理器 v55", ZIndex=12, Parent=mHdr, Active=false})
+mk("TextLabel", {Size=UDim2.new(1,-84,1,0), Position=UDim2.fromOffset(14,0), BackgroundTransparency=1, Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left, Text="坐标管理器 v"..VERSION, ZIndex=12, Parent=mHdr, Active=false})
 local mMin = mk("TextButton", {Size=UDim2.fromOffset(24,24), Position=UDim2.new(1,-58,0.5,-12), BackgroundColor3=Th.Bg, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Th.Sub, Text="—", ZIndex=12, Parent=mHdr})
 mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=mMin})
 local mCls = mk("TextButton", {Size=UDim2.fromOffset(24,24), Position=UDim2.new(1,-30,0.5,-12), BackgroundColor3=Th.Bg, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=13, TextColor3=Th.Err, Text="X", ZIndex=12, Parent=mHdr})
@@ -849,10 +919,13 @@ end
 
 trk(mHdr.InputBegan:Connect(function(input)
 	if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
-	if dragState then return end
+	if UIX.drag then return end
 	local ix, iy = input.Position.X, input.Position.Y
 	if inRect(ix, iy, mMin) or inRect(ix, iy, mCls) then return end
-	startDrag(main, input.Position, {onZ=function() mHdr.ZIndex = nextZ() end})
+	UIX.startDrag(main, input.Position, {
+		onZ=function() mHdr.ZIndex = nextZ() end,
+		onEnd=function() UIState.mainPos = main.Position; saveUIState() end,
+	})
 end))
 
 local cScroll = mk("ScrollingFrame", {Name="Scroll", Size=UDim2.new(1,0,1,-TITLE_H), Position=UDim2.fromOffset(0,TITLE_H), BackgroundTransparency=1, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=4, ScrollBarImageColor3=Th.Str, ZIndex=11, Parent=main})
@@ -863,7 +936,7 @@ mk("UIPadding", {PaddingTop=UDim.new(0,10), PaddingBottom=UDim.new(0,10), Paddin
 local curCard = mk("Frame", {Size=UDim2.new(1,0,0,50), BackgroundColor3=Th.Sur, BorderSizePixel=0, LayoutOrder=0, Parent=cInner})
 mk("UICorner", {CornerRadius=UDim.new(0,8), Parent=curCard})
 mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=curCard})
-mk("TextLabel", {Size=UDim2.new(1,-20,0,14), Position=UDim2.fromOffset(12,6), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="当前坐标", Parent=curCard})
+mk("TextLabel", {Size=UDim2.new(1,-20,0,14), Position=UDim2.fromOffset(12,6), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="当前坐标 ("..GAME_TAG..")", Parent=curCard})
 local curLbl = mk("TextLabel", {Size=UDim2.new(1,-20,0,22), Position=UDim2.fromOffset(12,22), BackgroundTransparency=1, Font=Enum.Font.GothamBold, TextSize=15, TextColor3=Th.Acc, TextXAlignment=Enum.TextXAlignment.Left, Text="X: --   Y: --   Z: --", Parent=curCard})
 local stCard = mk("Frame", {Size=UDim2.new(1,0,0,46), BackgroundColor3=Th.Sec, BorderSizePixel=0, LayoutOrder=900, Parent=cInner})
 mk("UICorner", {CornerRadius=UDim.new(0,8), Parent=stCard})
@@ -907,6 +980,7 @@ do
 	trk(UIS.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			rsz = false; saveToFile()
+			UIState.mainPos = main.Position; saveUIState()
 		end
 	end))
 end
@@ -917,7 +991,6 @@ local function unregisterOwnerRefresh(c) refreshOwnerSize[c] = nil end
 local function triggerOwnerRefresh(c) local fn = c and refreshOwnerSize[c]; if fn then pcall(fn) end end
 registerOwnerRefresh(cInner, refreshMainSize)
 
---========== 融合判定 ==========
 local function getMergeZoneBox(panel)
 	local pp, ps = panel.AbsolutePosition, panel.AbsoluteSize
 	if not pp or not ps then return nil, nil end
@@ -950,8 +1023,8 @@ local function findOwningPanel(c)
 	if setPanelRef and c == setBodyInner then return setPanelRef end
 end
 local function applyVisibility()
-	main.Visible = not allHidden
-	if setPanelRef then setPanelRef.Visible = not allHidden end
+	main.Visible = not allHidden and UIState.mainVisible
+	if setPanelRef then setPanelRef.Visible = not allHidden and UIState.setVisible end
 	for _, bl in pairs(allBlocks) do
 		if bl.host == "detached" and bl.frame then bl.frame.Visible = not allHidden end
 	end
@@ -959,6 +1032,8 @@ end
 
 local function createBlock(cfg)
 	local self = {id=cfg.id, title=cfg.title, host=cfg.host or "main", minimized=false, isMain=(cfg.host=="main"), getMergeParent=cfg.getMergeParent, _lastClick=0, detW=nil, detH=nil, _hasAdjusted=false, _detachConn=nil}
+	local savedState = UIState.blockStates[cfg.id]
+	if savedState then self.minimized = savedState.min == true end
 	orderCounter = orderCounter + 10
 	local baseZ = (self.host=="settings") and (200+math.floor(orderCounter/10)) or (30+math.floor(orderCounter/10))
 	local frm = mk("Frame", {Name="B"..cfg.id, Size=UDim2.new(1,0,0,HDR_H), BackgroundColor3=Th.Sec, BorderSizePixel=0, LayoutOrder=orderCounter, Active=true, ClipsDescendants=true, ZIndex=baseZ, Parent=cfg.parent})
@@ -967,7 +1042,7 @@ local function createBlock(cfg)
 	local hdr = mk("Frame", {Name="H", Size=UDim2.new(1,0,0,HDR_H), BackgroundColor3=Th.Sur, BorderSizePixel=0, Active=true, ZIndex=baseZ+1, Parent=frm})
 	mk("UICorner", {CornerRadius=UDim.new(0,8), Parent=hdr})
 	mk("TextLabel", {Size=UDim2.new(1,-50,1,0), Position=UDim2.fromOffset(12,0), BackgroundTransparency=1, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left, Text=cfg.title, ZIndex=baseZ+2, Parent=hdr, Active=false})
-	local tgl = mk("TextButton", {Size=UDim2.fromOffset(24,24), Position=UDim2.new(1,-32,0.5,-12), BackgroundColor3=Th.Bg, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Th.Sub, Text="−", ZIndex=baseZ+2, Parent=hdr})
+	local tgl = mk("TextButton", {Size=UDim2.fromOffset(24,24), Position=UDim2.new(1,-32,0.5,-12), BackgroundColor3=Th.Bg, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Th.Sub, Text=self.minimized and "+" or "−", ZIndex=baseZ+2, Parent=hdr})
 	mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=tgl})
 	local body = mk("Frame", {Name="B", Size=UDim2.new(1,0,0,0), Position=UDim2.fromOffset(0,HDR_H), AutomaticSize=Enum.AutomaticSize.Y, BackgroundTransparency=1, ZIndex=baseZ+1, Parent=frm})
 	local bIL = mk("UIListLayout", {Name="IL", FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,6), Parent=body})
@@ -996,7 +1071,14 @@ local function createBlock(cfg)
 		end
 		updateHandle()
 	end
-	trk(tgl.MouseButton1Click:Connect(function() self.minimized = not self.minimized; self:applyMinimized() end))
+	trk(tgl.MouseButton1Click:Connect(function()
+		self.minimized = not self.minimized
+		self:applyMinimized()
+		local bs = UIState.blockStates[self.id] or {}
+		bs.min = self.minimized
+		UIState.blockStates[self.id] = bs
+		saveUIState()
+	end))
 	if cfg.build then cfg.build(body, self) end
 	task.defer(refreshHeight)
 	do
@@ -1049,6 +1131,10 @@ local function createBlock(cfg)
 		end)
 		self.host = "detached"; updateHandle(); applyVisibility()
 		task.defer(function() triggerOwnerRefresh(oldP) end)
+		local bs = UIState.blockStates[self.id] or {}
+		bs.detach = true
+		UIState.blockStates[self.id] = bs
+		saveUIState()
 	end
 	function self:attach(container)
 		if self.host ~= "detached" then return end
@@ -1063,28 +1149,38 @@ local function createBlock(cfg)
 		task.defer(function() updateHandle(); refreshHeight() end)
 		self:applyMinimized()
 		task.defer(function() triggerOwnerRefresh(container) end)
+		local bs = UIState.blockStates[self.id] or {}
+		bs.detach = false
+		UIState.blockStates[self.id] = bs
+		saveUIState()
 	end
 	trk(hdr.InputBegan:Connect(function(input)
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
-		if dragState then return end
+		if UIX.drag then return end
 		local ix, iy = input.Position.X, input.Position.Y
 		if inRect(ix, iy, tgl) then return end
 		local now = tick(); local isDbl = (now - self._lastClick) < (DBL_MS/1000); self._lastClick = now
 		local opts = {
 			onZ = function() hdr.ZIndex = nextZ(); body.ZIndex = nextZ() end,
 			onDrag = function()
-				if self.host ~= "detached" then hideHi(); return end
+				if self.host ~= "detached" then UIX.hideHi(); return end
 				local c = self.getMergeParent and self.getMergeParent()
 				local panel = findOwningPanel(c)
-				if not panel or not panel.Parent then hideHi(); return end
+				if not panel or not panel.Parent then UIX.hideHi(); return end
 				if isHdrInMergeZone(hdr, panel) then
 					local p, s = getMergeZoneBox(panel)
-					if p and s then showHiAt(p, s) else hideHi() end
-				else hideHi() end
+					if p and s then UIX.showHiAt(p, s) else UIX.hideHi() end
+				else UIX.hideHi() end
 			end,
 			onEnd = function()
-				hideHi()
-				if self.host ~= "detached" then return end
+				UIX.hideHi()
+				if self.host ~= "detached" then
+					local bs = UIState.blockStates[self.id] or {}
+					bs.detPos = frm.Position
+					UIState.blockStates[self.id] = bs
+					saveUIState()
+					return
+				end
 				local c = self.getMergeParent and self.getMergeParent()
 				local panel = findOwningPanel(c)
 				if not panel or not panel.Parent then return end
@@ -1094,17 +1190,19 @@ local function createBlock(cfg)
 		if isDbl and self.host ~= "detached" then
 			self._lastClick = 0
 			self:detach()
-			startDrag(frm, input.Position, opts)
+			UIX.startDrag(frm, input.Position, opts)
 		else
-			startDrag(frm, input.Position, opts)
+			UIX.startDrag(frm, input.Position, opts)
 		end
 	end))
 	allBlocks[cfg.id] = self
 	if self.isMain then mainBlocks[cfg.id] = self end
+	if self.minimized and self.host == "main" then
+		task.defer(function() pcall(function() self:applyMinimized() end) end)
+	end
 	return self
 end
 
---========== 主面板 3 区块 ==========
 local UI = {}
 
 createBlock({id="global", title="全局设置", host="main", parent=cInner,
@@ -1164,14 +1262,23 @@ createBlock({id="list", title="坐标列表", host="main", parent=cInner,
 	build=function(bd, self)
 		local tr = mk("Frame", {Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=1, Parent=bd})
 		mk("UIListLayout", {FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,6), Parent=tr})
-		local sv = mk("TextButton", {Size=UDim2.new(1/3,-4,1,0), BackgroundColor3=Th.Acc, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Color3.fromRGB(255,255,255), Text="保存坐标", LayoutOrder=1, Parent=tr})
+		local sv = mk("TextButton", {Size=UDim2.new(1/3,-4,1,0), BackgroundColor3=Th.Acc, BorderSizePixel=0, AutoButtonColor=false, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Color3.fromRGB(255,255,255), Text="保存坐标", LayoutOrder=1, Parent=tr})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=sv})
-		local so = mk("TextButton", {Size=UDim2.new(1/3,-4,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text=St.asc and "排序 ↑" or "排序 ↓", LayoutOrder=2, Parent=tr})
+		local so = mk("TextButton", {Size=UDim2.new(1/3,-4,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text=St.asc and "正序" or "倒序", LayoutOrder=2, Parent=tr})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=so}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=so})
 		local ad = mk("TextButton", {Size=UDim2.new(1/3,-4,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text="高级选择", LayoutOrder=3, Parent=tr})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=ad}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=ad})
 		UI.svBtn, UI.soBtn, UI.adBtn = sv, so, ad
-		local ap = mk("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundColor3=Th.Bg, BorderSizePixel=0, LayoutOrder=2, Visible=false, Parent=bd})
+
+		local ur = mk("Frame", {Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=2, Parent=bd})
+		mk("UIListLayout", {FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,6), Parent=ur})
+		local undo = mk("TextButton", {Size=UDim2.new(0.5,-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text="↶ 撤回", LayoutOrder=1, Parent=ur})
+		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=undo}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=undo})
+		local redo = mk("TextButton", {Size=UDim2.new(0.5,-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text="↷ 取消撤回", LayoutOrder=2, Parent=ur})
+		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=redo}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=redo})
+		UI.undoBtn, UI.redoBtn = undo, redo
+
+		local ap = mk("Frame", {Size=UDim2.new(1,0,0,0), AutomaticSize=Enum.AutomaticSize.Y, BackgroundColor3=Th.Bg, BorderSizePixel=0, LayoutOrder=3, Visible=false, Parent=bd})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=ap}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=ap})
 		mk("UIPadding", {PaddingTop=UDim.new(0,6), PaddingBottom=UDim.new(0,6), PaddingLeft=UDim.new(0,6), PaddingRight=UDim.new(0,6), Parent=ap})
 		mk("UIListLayout", {FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=ap})
@@ -1185,12 +1292,14 @@ createBlock({id="list", title="坐标列表", host="main", parent=cInner,
 		local iv = mk("TextButton", {Size=UDim2.new(0.5,-2,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="反选", LayoutOrder=2, Parent=ar})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=iv})
 		UI.saBtn, UI.ivBtn = sa, iv
-		local ls = mk("ScrollingFrame", {Size=UDim2.new(1,0,0,130), BackgroundColor3=Th.Bg, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=4, ScrollBarImageColor3=Th.Str, LayoutOrder=3, Parent=bd})
+
+		local ls = mk("ScrollingFrame", {Size=UDim2.new(1,0,0,130), BackgroundColor3=Th.Bg, BorderSizePixel=0, CanvasSize=UDim2.new(0,0,0,0), AutomaticCanvasSize=Enum.AutomaticSize.Y, ScrollBarThickness=4, ScrollBarImageColor3=Th.Str, LayoutOrder=4, Parent=bd})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=ls}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=ls})
 		mk("UIListLayout", {FillDirection=Enum.FillDirection.Vertical, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=ls})
 		mk("UIPadding", {PaddingTop=UDim.new(0,4), PaddingBottom=UDim.new(0,4), PaddingLeft=UDim.new(0,4), PaddingRight=UDim.new(0,4), Parent=ls})
 		UI.lScroll = ls
-		local lr = mk("Frame", {Size=UDim2.new(1,0,0,28), BackgroundTransparency=1, LayoutOrder=4, Parent=bd})
+
+		local lr = mk("Frame", {Size=UDim2.new(1,0,0,28), BackgroundTransparency=1, LayoutOrder=5, Parent=bd})
 		mk("UIListLayout", {FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=lr})
 		local tb = mk("TextButton", {Size=UDim2.new(0.25,-3,1,0), BackgroundColor3=Th.Acc, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Color3.fromRGB(255,255,255), Text="传送", LayoutOrder=1, Parent=lr})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=tb})
@@ -1201,11 +1310,15 @@ createBlock({id="list", title="坐标列表", host="main", parent=cInner,
 		local db = mk("TextButton", {Size=UDim2.new(0.25,-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Err, Text="删除", LayoutOrder=4, Parent=lr})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=db}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=db})
 		UI.lTp, UI.lLp, UI.lCp, UI.lDl = tb, lb, cb, db
+
+		local holdBar = mk("Frame", {Size=UDim2.new(1,0,0,3), Position=UDim2.fromOffset(0,0), BackgroundColor3=Th.Ok, BackgroundTransparency=0.7, BorderSizePixel=0, ZIndex=5, Visible=false, Parent=sv})
+		mk("UICorner", {CornerRadius=UDim.new(0,2), Parent=holdBar})
+		UI.svHoldBar = holdBar
 	end})
 
 print("[" .. SCRIPT_ID .. "] 主面板已创建")
 
---========== 业务逻辑 ==========
+-- 业务逻辑辅助
 local statLast = { msg = "", color = nil, t = 0 }
 local function setStat(m, c)
 	if dead then return end
@@ -1224,7 +1337,6 @@ local function getPos()
 end
 local function rp(part) if not part then return nil end local p = HOOK.realPos(part); return p or part.Position end
 local function realCF(part) if not part then return nil end local cf = HOOK.realCF(part); return cf or part.CFrame end
-
 local function parseAx(raw, cur)
 	local t = tostring(raw or ""):gsub("^%s+",""):gsub("%s+$","")
 	if t == "" then return cur, nil end
@@ -1282,8 +1394,51 @@ local function resolveHash(ax)
 	return true
 end
 
---========== 持续 noclip ===========
-local noclipMgr = {conn=nil, recorded={}}
+local UNDO = {}
+function UNDO.snap()
+	local t = {}
+	for _, v in ipairs(St.saved) do
+		table.insert(t, {id=v.id, x=v.x, y=v.y, z=v.z, note=v.note or ""})
+	end
+	return t
+end
+function UNDO.push()
+	local snap = UNDO.snap()
+	table.insert(St.undoStack, snap)
+	if #St.undoStack > UNDO_MAX then table.remove(St.undoStack, 1) end
+	St.redoStack = {}
+end
+function UNDO.apply(snap)
+	if type(snap) ~= "table" then return end
+	St.saved = {}
+	for _, v in ipairs(snap) do
+		table.insert(St.saved, {id=v.id, x=v.x, y=v.y, z=v.z, note=v.note or ""})
+	end
+	St.sel = {}
+end
+function UNDO.undo()
+	if #St.undoStack == 0 then setStat("无可撤回", Th.Warn); return false end
+	local cur = UNDO.snap()
+	table.insert(St.redoStack, cur)
+	if #St.redoStack > UNDO_MAX then table.remove(St.redoStack, 1) end
+	local snap = table.remove(St.undoStack)
+	UNDO.apply(snap)
+	saveToFile()
+	return true
+end
+function UNDO.redo()
+	if #St.redoStack == 0 then setStat("无可取消撤回", Th.Warn); return false end
+	local cur = UNDO.snap()
+	table.insert(St.undoStack, cur)
+	if #St.undoStack > UNDO_MAX then table.remove(St.undoStack, 1) end
+	local snap = table.remove(St.redoStack)
+	UNDO.apply(snap)
+	saveToFile()
+	return true
+end
+
+-- noclip v57.2（持续强制 + 属性变更修复）
+local noclipMgr = {conn=nil, recorded={}, propConns={}}
 local function recordPart(p, hard)
 	if noclipMgr.recorded[p] then
 		pcall(function() p.CanCollide = false end)
@@ -1296,28 +1451,47 @@ local function recordPart(p, hard)
 		p.CanCollide = false
 		if hard then p.CanTouch = false end
 	end)
+	local conn = p:GetPropertyChangedSignal("CanCollide"):Connect(function()
+		if dead then return end
+		if St.noclip ~= "off" and p.CanCollide then
+			pcall(function() p.CanCollide = false end)
+		end
+	end)
+	noclipMgr.propConns[p] = conn
 end
 local function noclipApplyToChar(ch)
 	if not ch or St.noclip == "off" then return end
 	local hard = (St.noclip == "all")
 	if St.noclip == "persistent" or St.noclip == "all" then
 		for _, p in ipairs(ch:GetDescendants()) do
-			if p:IsA("BasePart") then recordPart(p, hard) end
+			if p:IsA("BasePart") then
+				recordPart(p, hard)
+				if p.CanCollide then pcall(function() p.CanCollide = false end) end
+				if hard and p.CanTouch then pcall(function() p.CanTouch = false end) end
+			end
 		end
 	elseif St.noclip == "basic" then
 		local r = ch:FindFirstChild("HumanoidRootPart")
-		if r then recordPart(r, false) end
+		if r then
+			recordPart(r, false)
+			if r.CanCollide then pcall(function() r.CanCollide = false end) end
+		end
 	end
 end
 function noclipMgr.start()
 	if noclipMgr.conn then return end
 	noclipMgr.conn = RS.Heartbeat:Connect(function()
-		if dead or not task_ then return end
+		if dead then return end
+		if St.noclip == "off" then return end
 		noclipApplyToChar(LP.Character)
 	end)
 end
 function noclipMgr.stop()
 	if noclipMgr.conn then noclipMgr.conn:Disconnect(); noclipMgr.conn = nil end
+	for p, conn in pairs(noclipMgr.propConns) do
+		pcall(function() conn:Disconnect() end)
+	end
+	table.clear(noclipMgr.propConns)
 	for p, d in pairs(noclipMgr.recorded) do
 		if p and p.Parent then
 			pcall(function() p.CanCollide = d.cc; p.CanTouch = d.ct end)
@@ -1325,20 +1499,18 @@ function noclipMgr.stop()
 	end
 	table.clear(noclipMgr.recorded)
 end
-
 local task_
 local uLoop
 local function cancelTask()
 	if task_ and task_.stop then pcall(task_.stop) end
 	task_ = nil
-	noclipMgr.stop()
-	camMgr_forceRestore()
+	INTERRUPT.flag = false
+	CAM.forceRestore()
 	tpBusyMark(1.5)
 	if uLoop then uLoop() end
 end
 local function isLp() return task_ and task_.loop == true end
 
---========== 状态构造 / 恢复 ==========
 local function buildState(tgt, loop, src, ch, r, hum, fin, rst)
 	local S = {
 		tgt=tgt, loop=loop, src=src, ch=ch, r=r, hum=hum, fin=fin, rst=rst,
@@ -1395,8 +1567,44 @@ local function tickProgress(S, dt, tag)
 	setStat(string.format("%s 剩余 %.1f → (%.1f, %.1f, %.1f)", tag or "传送中", d, S.tgt.X, S.tgt.Y, S.tgt.Z), Th.Acc)
 end
 
---========== step: 物理 ===========
-local function stepWalk(S, dt)
+local STEP = {}
+local ALIGN = {ap=nil, att=nil, target=nil}
+local function cleanAlign()
+	if ALIGN.ap then pcall(function() ALIGN.ap:Destroy() end); ALIGN.ap = nil end
+	if ALIGN.att then pcall(function() ALIGN.att:Destroy() end); ALIGN.att = nil end
+	ALIGN.target = nil
+end
+STEP.cleanAlign = cleanAlign
+
+local _netInited = false
+local function _netInit()
+	if _netInited then return end
+	_netInited = true
+	if not HOOK.supported() then return end
+	HOOK.install()
+	local patterns = {"anticheat","anti_cheat","ac_","heartbeat","ping","checkposition","positioncheck","velocitycheck","speedcheck","antiteleport","antifly","antinoclip","accheck"}
+	task.spawn(function()
+		local roots = {game:GetService("ReplicatedStorage"), game:GetService("ReplicatedFirst"), LP:FindFirstChildOfClass("PlayerScripts"), LP:FindFirstChildOfClass("PlayerGui")}
+		for _, root in ipairs(roots) do
+			if root then
+				for _, d in ipairs(root:GetDescendants()) do
+					if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+						local lname = d.Name:lower()
+						for _, p in ipairs(patterns) do
+							if lname:find(p, 1, true) then
+								HOOK.blockRemote(d, true)
+								if ANTI and ANTI.blockRemote then ANTI.blockRemote(d) end
+								break
+							end
+						end
+					end
+				end
+			end
+		end
+	end)
+end
+
+STEP.walk = function(S, dt)
 	tpBusyMark(0.5)
 	local r, tgt = S.r, S.tgt
 	if not r or not r.Parent then return end
@@ -1417,9 +1625,7 @@ local function stepWalk(S, dt)
 		if math.abs(vertDist) < 5 then S.bv:Destroy(); S.bv = nil
 		else S.bv.Velocity = Vector3.new(0, math.sign(vertDist) * math.min(math.abs(vertDist)*3, 300), 0) end
 	end
-	if S._fastMode and hum.WalkSpeed < 300 then
-		HOOK.setHum(hum, "WalkSpeed", 200)
-	end
+	if S._fastMode and hum.WalkSpeed < 300 then HOOK.setHum(hum, "WalkSpeed", 200) end
 	if horizDist > 3 then pcall(function() hum:Move(horizDiff.Unit, false) end) else pcall(function() hum:Move(HOOK.V3ZERO, false) end) end
 	S._lastCheckTime = (S._lastCheckTime or 0) + dt
 	if S._lastCheckTime >= 0.5 then
@@ -1443,8 +1649,7 @@ local function stepWalk(S, dt)
 	return false
 end
 
---========== step: CFrame 系列 ===========
-local function stepCFrame(S, dt, mode)
+local function _stepCFrame(S, dt, mode)
 	tpBusyMark(0.6)
 	local r, tgt = S.r, S.tgt
 	if not r or not r.Parent then return end
@@ -1567,8 +1772,14 @@ local function stepCFrame(S, dt, mode)
 	return false
 end
 
---========== step: 动画 ===========
-local function stepAnim(S, dt)
+STEP.cframe = _stepCFrame
+STEP.hybrid = function(s, dt) return _stepCFrame(s, dt, "hybrid") end
+STEP.stealth = function(s, dt) return _stepCFrame(s, dt, "stealth") end
+STEP.jitter = function(s, dt) return _stepCFrame(s, dt, "jitter") end
+STEP.pulse = function(s, dt) return _stepCFrame(s, dt, "pulse") end
+STEP.zigzag = function(s, dt) return _stepCFrame(s, dt, "zigzag") end
+
+STEP.anim = function(S, dt)
 	tpBusyMark(0.6)
 	local r, tgt = S.r, S.tgt
 	if not r or not r.Parent then return end
@@ -1585,11 +1796,10 @@ local function stepAnim(S, dt)
 		if dirH.Magnitude > 0.01 then pcall(function() hum.MoveDirection = dirH.Unit end) end
 		if hum.WalkSpeed > 100 or hum.WalkSpeed < 5 then HOOK.setHum(hum, "WalkSpeed", 16) end
 	end
-	return stepCFrame(S, dt, "hybrid")
+	return _stepCFrame(S, dt, "hybrid")
 end
 
---========== step: 力推 ===========
-local function stepPhys(S, dt)
+STEP.phys = function(S, dt)
 	tpBusyMark(0.6)
 	local r, tgt = S.r, S.tgt
 	if not r or not r.Parent then return end
@@ -1643,8 +1853,7 @@ local function stepPhys(S, dt)
 	return false
 end
 
---========== step: 幽灵 ===========
-local function stepGhost(S, dt)
+STEP.ghost = function(S, dt)
 	if not S._ghostInit then
 		S._ghostInit = true
 		if HOOK.supported() then
@@ -1656,44 +1865,15 @@ local function stepGhost(S, dt)
 		end
 		if St.noclip == "off" then St.noclip = "persistent" end
 	end
-	return stepPhys(S, dt)
+	return STEP.phys(S, dt)
 end
 
---========== step: 网络 ===========
-local _netInited = false
-local function _netInit()
-	if _netInited then return end
-	_netInited = true
-	if not HOOK.supported() then return end
-	HOOK.install()
-	local patterns = {"anticheat", "anti_cheat", "ac_", "heartbeat", "ping", "checkposition", "positioncheck", "velocitycheck", "speedcheck", "antiteleport", "antifly", "antinoclip", "accheck"}
-	task.spawn(function()
-		local roots = {game:GetService("ReplicatedStorage"), game:GetService("ReplicatedFirst"), LP:FindFirstChildOfClass("PlayerScripts"), LP:FindFirstChildOfClass("PlayerGui")}
-		for _, root in ipairs(roots) do
-			if root then
-				for _, d in ipairs(root:GetDescendants()) do
-					if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
-						local lname = d.Name:lower()
-						for _, p in ipairs(patterns) do
-							if lname:find(p, 1, true) then
-								HOOK.blockRemote(d, true)
-								if ANTI and ANTI.blockRemote then ANTI.blockRemote(d) end
-								break
-							end
-						end
-					end
-				end
-			end
-		end
-	end)
-end
-local function stepNet(S, dt)
+STEP.net = function(S, dt)
 	_netInit()
-	return stepCFrame(S, dt, "hybrid")
+	return _stepCFrame(S, dt, "hybrid")
 end
 
---========== step: 延迟 ===========
-local function stepLag(S, dt)
+STEP.lag = function(S, dt)
 	tpBusyMark(0.6)
 	if S.lagFreeze and S.lagFreeze > 0 then
 		S.lagFreeze = S.lagFreeze - dt
@@ -1705,11 +1885,10 @@ local function stepLag(S, dt)
 		S.lagFreeze = 0.03
 		return false
 	end
-	return stepCFrame(S, dt, "hybrid")
+	return _stepCFrame(S, dt, "hybrid")
 end
 
---========== step: 速度欺骗 ===========
-local function stepSpeed(S, dt)
+STEP.speed = function(S, dt)
 	tpBusyMark(0.6)
 	local r, tgt = S.r, S.tgt
 	if not r or not r.Parent then return end
@@ -1747,14 +1926,13 @@ local function stepSpeed(S, dt)
 	return false
 end
 
---========== step: 跳跃链 ===========
-local function stepJump(S, dt)
+STEP.jump = function(S, dt)
 	tpBusyMark(0.6)
 	local r, tgt = S.r, S.tgt
 	if not r or not r.Parent then return end
 	tickProgress(S, dt, "跳跃")
 	local hum = S.hum
-	if not hum or not hum.Parent then return stepSpeed(S, dt) end
+	if not hum or not hum.Parent then return STEP.speed(S, dt) end
 	local pos = rp(r)
 	local diff = tgt - pos
 	local dist = diff.Magnitude
@@ -1787,14 +1965,7 @@ local function stepJump(S, dt)
 	return false
 end
 
---========== step: 对齐 ===========
-local ALIGN = {ap=nil, att=nil, target=nil}
-local function cleanAlign()
-	if ALIGN.ap then pcall(function() ALIGN.ap:Destroy() end); ALIGN.ap = nil end
-	if ALIGN.att then pcall(function() ALIGN.att:Destroy() end); ALIGN.att = nil end
-	ALIGN.target = nil
-end
-local function stepAlign(S, dt)
+STEP.align = function(S, dt)
 	tpBusyMark(0.6)
 	local r, tgt = S.r, S.tgt
 	if not r or not r.Parent then cleanAlign(); return end
@@ -1839,8 +2010,7 @@ local function stepAlign(S, dt)
 	return false
 end
 
---========== step: 全套 ===========
-local function stepFull(S, dt)
+STEP.full = function(S, dt)
 	if not S._fullInit then
 		S._fullInit = true
 		if HOOK.supported() then
@@ -1851,11 +2021,10 @@ local function stepFull(S, dt)
 		OWNER.start()
 		if St.noclip == "off" then St.noclip = "persistent" end
 	end
-	return stepSpeed(S, dt)
+	return STEP.speed(S, dt)
 end
 
---========== step: 瞬时 ===========
-local function stepInstant(S, dt)
+STEP.instant = function(S, dt)
 	tpBusyMark(2.5)
 	local r, tgt = S.r, S.tgt
 	if not r or not r.Parent then return end
@@ -1866,38 +2035,56 @@ local function stepInstant(S, dt)
 	return true
 end
 
---========== doTp ===========
 local function doTp(opts)
 	local tgt, loop, src = opts.target, opts.loop == true, opts.source
-	if loop and isLp() then notify("坐标管理器", "已有循环传送", 3, Th.Warn); return false end
-	if not loop and isLp() then notify("坐标管理器", "循环传送运行中", 3, Th.Warn); return false end
-	if task_ and not task_.loop then cancelTask() end
+
+	-- ★ 中断旧的非循环传送并继续新传送
+	if task_ and not task_.loop then
+		setStat("切换到新目标…", Th.Warn)
+		UIX.notify("坐标管理器", "已中断旧传送，切换到新目标", 2, Th.Warn)
+		cancelTask()
+	end
+	if loop and isLp() then UIX.notify("坐标管理器", "已有循环传送", 3, Th.Warn); return false end
+	if not loop and isLp() then UIX.notify("坐标管理器", "循环传送运行中", 3, Th.Warn); return false end
 	tpBusyMark(3.0)
+
+	INTERRUPT.flag = false
 	local done, cn = false, nil
 	local ch = LP.Character
 	local r = ch and ch:FindFirstChild("HumanoidRootPart")
 	local hum = ch and ch:FindFirstChildOfClass("Humanoid")
 	if not r then setStat("角色未加载", Th.Err); return false end
 	setStat(string.format("传送启动 → (%.1f, %.1f, %.1f)", tgt.X, tgt.Y, tgt.Z), Th.Acc)
-	noclipMgr.start()
 	if St.hook then HOOK.install(); HOOK.protect(r, hum) end
-	if St.camStable then camMgr_start() end
+	if St.camStable then CAM.start() end
+
+	local LIFT = { phase = 0, baseTgt = tgt, liftY = 0 }
+	if St.path == "lift" and St.bypass ~= "walk" then
+		LIFT.phase = 1
+		LIFT.liftY = 0
+	end
+
 	local fallbackConn = nil
 	local S_ref = nil
 	local function fin(m, c)
 		if done then return end
+		if LIFT.phase > 0 and LIFT.phase < 3 then return end
 		done = true
 		if cn then cn:Disconnect() end
 		if fallbackConn then fallbackConn:Disconnect(); fallbackConn = nil end
 		if S_ref then restoreState(S_ref, r, hum) end
 		cleanAlign()
-		noclipMgr.stop()
-		if St.camStable then camMgr_stop() end
+		if St.camStable then CAM.stop() end
 		if St.bypass ~= "full" and St.bypass ~= "owner" then OWNER.stop() end
 		if St.hook and r then HOOK.unprotect(r, hum) end
 		if task_ and task_.cn == cn then task_ = nil end
 		tpBusyMark(2.0)
-		if m then setStat(m, c or Th.Ok) end
+		if m then
+			setStat(m, c or Th.Ok)
+			if c == Th.Warn or (m:find("中断") or m:find("⚠")) then
+				UIX.notify("坐标管理器", m, 2.5, c or Th.Warn)
+			end
+		end
 		if uLoop then uLoop() end
 	end
 	local serverAware = (St.bypass == "phys" or St.bypass == "ghost"
@@ -1905,12 +2092,8 @@ local function doTp(opts)
 		or St.bypass == "jump" or St.bypass == "align"
 		or St.bypass == "full" or St.bypass == "walk"
 		or St.bypass == "anim" or St.bypass == "net")
-	if St.path == "lift" and St.bypass ~= "walk" then
-		local real = realCF(r); local rot = real - real.Position
-		local ly = math.max(real.Position.Y, tgt.Y) + 30
-		HOOK.setCF(r, CFrame.new(real.Position.X, ly, real.Position.Z) * rot)
-	end
-	if St.mode == "teleport" and not serverAware then
+
+	if St.mode == "teleport" and not serverAware and LIFT.phase == 0 then
 		local real = realCF(r); local rot = real - real.Position
 		HOOK.setCF(r, CFrame.new(tgt) * rot)
 		fin(string.format("已传送 X:%.2f Y:%.2f Z:%.2f", tgt.X, tgt.Y, tgt.Z))
@@ -1921,23 +2104,23 @@ local function doTp(opts)
 	S_ref = S
 	S._fastMode = (St.mode == "teleport" and serverAware)
 	local stepFn
-	if St.bypass == "walk" then stepFn = stepWalk
-	elseif St.bypass == "hybrid" then stepFn = function(s, dt) return stepCFrame(s, dt, "hybrid") end
-	elseif St.bypass == "stealth" then stepFn = function(s, dt) return stepCFrame(s, dt, "stealth") end
-	elseif St.bypass == "jitter" then stepFn = function(s, dt) return stepCFrame(s, dt, "jitter") end
-	elseif St.bypass == "pulse" then stepFn = function(s, dt) return stepCFrame(s, dt, "pulse") end
-	elseif St.bypass == "zigzag" then stepFn = function(s, dt) return stepCFrame(s, dt, "zigzag") end
-	elseif St.bypass == "anim" then stepFn = stepAnim
-	elseif St.bypass == "phys" then stepFn = stepPhys
-	elseif St.bypass == "ghost" then stepFn = stepGhost
-	elseif St.bypass == "net" then stepFn = stepNet
-	elseif St.bypass == "lag" then stepFn = stepLag
-	elseif St.bypass == "owner" then OWNER.start(); stepFn = stepSpeed
-	elseif St.bypass == "speed" then stepFn = stepSpeed
-	elseif St.bypass == "jump" then stepFn = stepJump
-	elseif St.bypass == "align" then stepFn = stepAlign
-	elseif St.bypass == "full" then stepFn = stepFull
-	else stepFn = stepInstant end
+	if St.bypass == "walk" then stepFn = STEP.walk
+	elseif St.bypass == "hybrid" then stepFn = STEP.hybrid
+	elseif St.bypass == "stealth" then stepFn = STEP.stealth
+	elseif St.bypass == "jitter" then stepFn = STEP.jitter
+	elseif St.bypass == "pulse" then stepFn = STEP.pulse
+	elseif St.bypass == "zigzag" then stepFn = STEP.zigzag
+	elseif St.bypass == "anim" then stepFn = STEP.anim
+	elseif St.bypass == "phys" then stepFn = STEP.phys
+	elseif St.bypass == "ghost" then stepFn = STEP.ghost
+	elseif St.bypass == "net" then stepFn = STEP.net
+	elseif St.bypass == "lag" then stepFn = STEP.lag
+	elseif St.bypass == "owner" then OWNER.start(); stepFn = STEP.speed
+	elseif St.bypass == "speed" then stepFn = STEP.speed
+	elseif St.bypass == "jump" then stepFn = STEP.jump
+	elseif St.bypass == "align" then stepFn = STEP.align
+	elseif St.bypass == "full" then stepFn = STEP.full
+	else stepFn = STEP.instant end
 	local _fbStart = os.clock()
 	local _fbLastPos = rp(r) or r.Position
 	fallbackConn = RS.Heartbeat:Connect(function()
@@ -1952,6 +2135,7 @@ local function doTp(opts)
 			cleanAlign()
 			local real = realCF(r); local rot = real - real.Position
 			HOOK.setCF(r, CFrame.new(tgt) * rot)
+			LIFT.phase = 3
 			fin(string.format("⚠ 服务端阻塞，强制传送 X:%.2f Y:%.2f Z:%.2f", tgt.X, tgt.Y, tgt.Z), Th.Warn)
 		else
 			_fbStart = os.clock()
@@ -1960,11 +2144,64 @@ local function doTp(opts)
 	end)
 	cn = RS.Heartbeat:Connect(function(dt)
 		if dead then fin() return end
+
+		if INTERRUPT.flag then
+			INTERRUPT.flag = false
+			fin("已中断传送", Th.Warn)
+			return
+		end
+
 		tpBusyMark(0.8)
 		if St.hook then HOOK.updateFake(r, dt, 16); if hum and HOOK.fakeWS[hum] then HOOK.fakeWS[hum] = 16 end end
 		if St.bypass == "walk" and hum and hum.Parent then
 			local tWS = math.min(St.speed, 300)
 			if hum.WalkSpeed < tWS then HOOK.setHum(hum, "WalkSpeed", tWS) end
+		end
+
+		-- ★ 抬升逻辑 v57.2：保持高度 + 考虑目的地 Y
+		if LIFT.phase > 0 then
+			local cur = rp(r) or r.Position
+			local realTgt = LIFT.baseTgt
+			local liftH = tonumber(St.liftHeight) or 30
+			if LIFT.phase == 1 then
+				if LIFT.liftY == 0 then
+					LIFT.liftY = math.max(cur.Y, realTgt.Y) + liftH
+				end
+				S.tgt = Vector3.new(cur.X, LIFT.liftY, cur.Z)
+				if math.abs(cur.Y - LIFT.liftY) < 3 then
+					LIFT.phase = 2
+					setStat(string.format("抬升完成 → 水平 (%.1f)", LIFT.liftY), Th.Acc)
+				end
+			elseif LIFT.phase == 2 then
+				S.tgt = Vector3.new(realTgt.X, LIFT.liftY, realTgt.Z)
+				-- 保持高度：如果下坠超过 2 studs，直接拽回
+				if math.abs(cur.Y - LIFT.liftY) > 2 then
+					local cf = realCF(r)
+					local rot = cf - cf.Position
+					HOOK.setCF(r, CFrame.new(Vector3.new(cur.X, LIFT.liftY, cur.Z)) * rot)
+					HOOK.setVel(r, HOOK.V3ZERO)
+				end
+				local dxz = Vector3.new(cur.X - realTgt.X, 0, cur.Z - realTgt.Z).Magnitude
+				if dxz < 3 then
+					LIFT.phase = 3
+					if math.abs(cur.Y - realTgt.Y) > 2 then
+						setStat(string.format("水平到位 → 下降 (%.1f → %.1f)", LIFT.liftY, realTgt.Y), Th.Acc)
+					else
+						setStat("水平到位", Th.Acc)
+					end
+				end
+			elseif LIFT.phase == 3 then
+				S.tgt = realTgt
+				-- 强制下降（防止 stepFn 水平分量占主导）
+				if math.abs(cur.Y - realTgt.Y) > 3 then
+					local cf = realCF(r)
+					local rot = cf - cf.Position
+					local descendSpeed = math.min(St.speed, 80)
+					local newY = cur.Y - descendSpeed * dt
+					if newY < realTgt.Y then newY = realTgt.Y end
+					HOOK.setCF(r, CFrame.new(Vector3.new(cur.X, newY, cur.Z)) * rot)
+				end
+			end
 		end
 		local ok, err = pcall(stepFn, S, dt)
 		if not ok and not dead then warn("[" .. SCRIPT_ID .. "] step: " .. tostring(err)) end
@@ -1974,8 +2211,7 @@ local function doTp(opts)
 		if fallbackConn then fallbackConn:Disconnect() end
 		if S_ref then restoreState(S_ref, r, hum) end
 		cleanAlign()
-		noclipMgr.stop()
-		if St.camStable then camMgr_stop() end
+		if St.camStable then CAM.stop() end
 		if St.bypass ~= "full" and St.bypass ~= "owner" then OWNER.stop() end
 		if St.hook and r then HOOK.unprotect(r, hum) end
 		tpBusyMark(2.0)
@@ -1983,6 +2219,14 @@ local function doTp(opts)
 	if loop then setStat(string.format("[%s] 循环中 → X:%.1f Y:%.1f Z:%.1f", src == "list" and "列表" or "手动", tgt.X, tgt.Y, tgt.Z), Th.Acc) end
 	if uLoop then uLoop() end
 	return true
+end
+
+local function interruptTp()
+	if task_ and not task_.loop then
+		INTERRUPT.flag = true
+		return true
+	end
+	return false
 end
 
 trk(LP.CharacterAdded:Connect(function(newChar)
@@ -2017,12 +2261,11 @@ uLoop = function()
 	end
 end
 
---========== 诊断 ===========
 local function diagnose()
 	local ch = LP.Character
-	if not ch then notify("诊断", "角色未加载", 4, Th.Err); return end
+	if not ch then UIX.notify("诊断", "角色未加载", 4, Th.Err); return end
 	local hrp = ch:FindFirstChild("HumanoidRootPart")
-	if not hrp then notify("诊断", "无 HRP", 4, Th.Err); return end
+	if not hrp then UIX.notify("诊断", "无 HRP", 4, Th.Err); return end
 	local before = HOOK.realPos(hrp) or hrp.Position
 	local owner = nil
 	pcall(function() owner = hrp:GetNetworkOwner() end)
@@ -2043,11 +2286,11 @@ local function diagnose()
 	else
 		msg = string.format("❌ 完全服务端权威\n所有权: %s\n客户端无法传送 (位移 %.2f)", ownerStr, moved)
 	end
-	notify("诊断结果", msg, 6, (moved > 4) and Th.Ok or (moved > 0.5) and Th.Warn or Th.Err)
+	UIX.notify("诊断结果", msg, 6, (moved > 4) and Th.Ok or (moved > 0.5) and Th.Warn or Th.Err)
 	HOOK.setCF(hrp, CFrame.new(before) * rot)
 end
 
---========== 列表渲染 ==========
+-- 列表渲染（新坐标永远在末尾）
 local rows = {}
 local function updRows()
 	for id, rw in pairs(rows) do
@@ -2070,12 +2313,14 @@ local function renderList()
 	for _, c in ipairs(UI.lScroll:GetChildren()) do if c:GetAttribute("isRow") then c:Destroy() end end
 	rows = {}
 	St.sel = St.sel or {}
+	-- ★ 按数组顺序渲染（= 添加顺序），新坐标永远在末尾
 	local items = {}
-	for _, v in ipairs(St.saved) do table.insert(items, v) end
-	table.sort(items, function(a, b)
-		local ai, bi = tonumber(a.id) or 0, tonumber(b.id) or 0
-		if St.asc then return ai < bi else return ai > bi end
-	end)
+	for i, v in ipairs(St.saved) do table.insert(items, v) end
+	if not St.asc then
+		local rev = {}
+		for i = #items, 1, -1 do table.insert(rev, items[i]) end
+		items = rev
+	end
 	for i, it in ipairs(items) do
 		local x, y, z = tonumber(it.x) or 0, tonumber(it.y) or 0, tonumber(it.z) or 0
 		local id = tonumber(it.id) or i
@@ -2083,7 +2328,7 @@ local function renderList()
 		r:SetAttribute("isRow", true)
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=r})
 		mk("UIStroke", {Color=Th.Str, Thickness=1, Transparency=0.5, Parent=r})
-		local cb = mk("TextButton", {Size=UDim2.new(0.55,-4,1,0), Position=UDim2.fromOffset(4,0), BackgroundTransparency=1, AutoButtonColor=false, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd, Text=string.format("%d| %.1f, %.1f, %.1f", id, x, y, z), Parent=r})
+		local cb = mk("TextButton", {Size=UDim2.new(0.55,-4,1,0), Position=UDim2.fromOffset(4,0), BackgroundTransparency=1, AutoButtonColor=false, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left, TextTruncate=Enum.TextTruncate.AtEnd, Text=string.format("%d| %.1f, %.1f, %.1f", i, x, y, z), Parent=r})
 		mk("UIPadding", {PaddingLeft=UDim.new(0,6), Parent=cb})
 		local nb = mk("TextBox", {Size=UDim2.new(0.45,-8,1,-6), Position=UDim2.new(0.55,2,0,3), BackgroundColor3=Th.Bg, BorderSizePixel=0, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, PlaceholderText="备注…", PlaceholderColor3=Color3.fromRGB(80,80,96), Text=it.note or "", ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Left, Parent=r})
 		mk("UICorner", {CornerRadius=UDim.new(0,4), Parent=nb})
@@ -2094,15 +2339,12 @@ local function renderList()
 				if St.sel[id] then St.sel[id] = nil else St.sel[id] = true end
 			else
 				St.sel = {[id]=true}
-				if UI.ins then
-					UI.ins.x.Text = string.format("%.2f", x)
-					UI.ins.y.Text = string.format("%.2f", y)
-					UI.ins.z.Text = string.format("%.2f", z)
-				end
 			end
 			updRows()
 		end)
-		nb:GetPropertyChangedSignal("Text"):Connect(function() it.note = nb.Text end)
+		nb:GetPropertyChangedSignal("Text"):Connect(function()
+			if it.note ~= nb.Text then it.note = nb.Text end
+		end)
 	end
 	updRows()
 end
@@ -2141,47 +2383,140 @@ trk(mMin.MouseButton1Click:Connect(function() St.min = not St.min; applyMainMin(
 trk(UI.smBtn.MouseButton1Click:Connect(function() St.mode = "smooth"; applyMode(); setStat("已切换到平滑模式", Th.Ok); saveToFile() end))
 trk(UI.tpBtn.MouseButton1Click:Connect(function() St.mode = "teleport"; applyMode(); setStat("已切换到瞬移模式", Th.Ok); saveToFile() end))
 trk(UI.spdBox.FocusLost:Connect(function() St.speed = clSpd(UI.spdBox.Text); UI.spdBox.Text = tostring(St.speed); setStat("速度已设为 " .. St.speed .. " studs/s", Th.Ok); saveToFile() end))
-trk(UI.gOn.MouseButton1Click:Connect(function() St.nograv = true; GRAV.start(); applyGrav(); saveToFile(); setStat("无重力已开启", Th.Ok); notify("坐标管理器", "无重力已开启", 2, Th.Ok) end))
-trk(UI.gOff.MouseButton1Click:Connect(function() St.nograv = false; GRAV.stop(); applyGrav(); saveToFile(); setStat("无重力已关闭", Th.Sub); notify("坐标管理器", "无重力已关闭", 2, Th.Sub) end))
+trk(UI.gOn.MouseButton1Click:Connect(function() St.nograv = true; GRAV.start(); applyGrav(); saveToFile(); setStat("无重力已开启", Th.Ok); UIX.notify("坐标管理器", "无重力已开启", 2, Th.Ok) end))
+trk(UI.gOff.MouseButton1Click:Connect(function() St.nograv = false; GRAV.stop(); applyGrav(); saveToFile(); setStat("无重力已关闭", Th.Sub); UIX.notify("坐标管理器", "无重力已关闭", 2, Th.Sub) end))
 
 trk(UI.mTp.MouseButton1Click:Connect(function()
-	if isLp() then notify("坐标管理器", "循环传送运行中", 3, Th.Warn); return end
+	if task_ and not task_.loop then
+		INTERRUPT.flag = true
+		setStat("⚠ 正在中断传送…", Th.Warn)
+		UIX.notify("坐标管理器", "正在中断传送…", 1.5, Th.Warn)
+		return
+	end
+	if isLp() then UIX.notify("坐标管理器", "循环传送运行中", 3, Th.Warn); return end
 	local c = getPos(); if not c then setStat("无坐标", Th.Err); return end
 	local t, e = getTgt(c); if not t then setStat(e, Th.Err); return end
 	doTp({target=t, loop=false, source="manual"})
 end))
 trk(UI.mLp.MouseButton1Click:Connect(function()
 	if task_ and task_.loop and task_.source == "manual" then cancelTask(); setStat("已停止", Th.Sub); return end
-	if isLp() then notify("坐标管理器", "已有循环传送", 3, Th.Warn); return end
+	if isLp() then UIX.notify("坐标管理器", "已有循环传送", 3, Th.Warn); return end
 	local c = getPos(); if not c then setStat("无坐标", Th.Err); return end
 	local t, e = getTgt(c); if not t then setStat(e, Th.Err); return end
 	doTp({target=t, loop=true, source="manual"})
 end))
 for _, ax in ipairs(AXES) do
 	trk(UI.ins[ax].FocusLost:Connect(function(ep)
-		local wasHash = resolveHash(ax)
-		if ep and not wasHash and not isLp() then
-			local c = getPos()
-			if c then
-				local t, e = getTgt(c)
-				if t then doTp({target=t, loop=false, source="manual"})
-				elseif e then setStat(e, Th.Err) end
+		-- ★ 只解析表达式，不再自动触发传送
+		resolveHash(ax)
+	end))
+end
+
+-- 长按保存（带反馈）
+do
+	local holdStart = nil
+	local holdJob = nil
+	local holdBar = UI.svHoldBar
+	local lastNotifiedStage = 0
+	local function clearHold()
+		holdStart = nil
+		lastNotifiedStage = 0
+		if holdJob then pcall(function() task.cancel(holdJob) end); holdJob = nil end
+		if holdBar then holdBar.Visible = false; holdBar.Size = UDim2.new(0,0,0,3) end
+	end
+	local function doSaveReplace()
+		local p = getPos(); if not p then setStat("无坐标", Th.Err); return end
+		local sel = getSel()
+		if #sel > 0 then
+			UNDO.push()
+			for _, it in ipairs(sel) do
+				it.x = p.X; it.y = p.Y; it.z = p.Z
+			end
+			saveToFile()
+			setStat(string.format("已覆盖 %d 个坐标 → (%.1f, %.1f, %.1f)", #sel, p.X, p.Y, p.Z), Th.Ok)
+			UIX.notify("坐标管理器", string.format("已覆盖 %d 个坐标", #sel), 2.5, Th.Ok)
+		else
+			UNDO.push()
+			table.insert(St.saved, {id=St.nid, x=p.X, y=p.Y, z=p.Z, note=""})
+			St.nid = St.nid + 1
+			saveToFile()
+			setStat(string.format("已保存新坐标 (%.1f, %.1f, %.1f)", p.X, p.Y, p.Z), Th.Ok)
+			UIX.notify("坐标管理器", "已保存新坐标（末尾）", 2, Th.Ok)
+		end
+		renderList()
+	end
+	trk(UI.svBtn.MouseButton1Down:Connect(function()
+		clearHold()
+		holdStart = os.clock()
+		lastNotifiedStage = 0
+		if holdBar then holdBar.Visible = true; holdBar.Size = UDim2.new(0,0,0,3); holdBar.BackgroundColor3 = Th.Acc end
+		local sel = getSel()
+		if #sel > 0 then
+			UIX.notify("坐标管理器", string.format("松手=保存新坐标\n按住2秒=覆盖选中 %d 个", #sel), 3, Th.Acc)
+		else
+			UIX.notify("坐标管理器", "松手=保存新坐标\n（先选中条目后按住=覆盖）", 3, Th.Acc)
+		end
+		holdJob = task.spawn(function()
+			while holdStart and not dead do
+				local el = os.clock() - holdStart
+				local ratio = math.min(el / (HOLD_REPLACE_MS/1000), 1)
+				if holdBar then
+					holdBar.Size = UDim2.new(ratio, 0, 0, 3)
+					holdBar.BackgroundColor3 = (ratio >= 1) and Th.Ok or Th.Acc
+				end
+				local stage = math.floor(ratio * 4)
+				if stage ~= lastNotifiedStage then
+					lastNotifiedStage = stage
+					if stage == 1 then setStat("长按中… 松手保存", Th.Acc)
+					elseif stage == 2 then setStat("继续按住… 覆盖选中", Th.Acc)
+					elseif stage == 3 then setStat("即将覆盖…", Th.Warn) end
+				end
+				if ratio >= 1 then
+					clearHold()
+					doSaveReplace()
+					return
+				end
+				task.wait(0.03)
+			end
+		end)
+	end))
+	trk(UI.svBtn.MouseButton1Up:Connect(function()
+		if holdStart then
+			local el = os.clock() - holdStart
+			clearHold()
+			if el < (HOLD_REPLACE_MS/1000) then
+				local p = getPos(); if not p then setStat("无坐标", Th.Err); return end
+				UNDO.push()
+				table.insert(St.saved, {id=St.nid, x=p.X, y=p.Y, z=p.Z, note=""})
+				St.nid = St.nid + 1
+				saveToFile()
+				renderList()
+				setStat(string.format("已保存 %.1f, %.1f, %.1f", p.X, p.Y, p.Z), Th.Ok)
+				UIX.notify("坐标管理器", "已保存到列表末尾", 2, Th.Ok)
 			end
 		end
 	end))
+	trk(UI.svBtn.MouseLeave:Connect(function() clearHold() end))
 end
-trk(UI.svBtn.MouseButton1Click:Connect(function()
-	local p = getPos(); if not p then setStat("无坐标", Th.Err); return end
-	table.insert(St.saved, {id=St.nid, x=p.X, y=p.Y, z=p.Z, note=""})
-	St.nid = St.nid + 1
-	renderList(); saveToFile()
-	setStat(string.format("已保存 %.1f, %.1f, %.1f", p.X, p.Y, p.Z), Th.Ok)
+
+trk(UI.undoBtn.MouseButton1Click:Connect(function()
+	if UNDO.undo() then
+		renderList()
+		setStat(string.format("已撤回（剩余 %d 步）", #St.undoStack), Th.Ok)
+	end
 end))
+trk(UI.redoBtn.MouseButton1Click:Connect(function()
+	if UNDO.redo() then
+		renderList()
+		setStat(string.format("已取消撤回（剩余 %d 步）", #St.redoStack), Th.Ok)
+	end
+end))
+
 trk(UI.soBtn.MouseButton1Click:Connect(function()
 	St.asc = not St.asc
-	UI.soBtn.Text = St.asc and "排序 ↑" or "排序 ↓"
+	UI.soBtn.Text = St.asc and "正序" or "倒序"
 	renderList()
-	setStat(St.asc and "已按升序排列" or "已按降序排列", Th.Sub)
+	setStat(St.asc and "列表：正序（新坐标在末尾）" or "列表：倒序（新坐标在开头）", Th.Sub)
 end))
 trk(UI.adBtn.MouseButton1Click:Connect(function()
 	St.advOpen = not St.advOpen
@@ -2205,15 +2540,21 @@ trk(UI.ivBtn.MouseButton1Click:Connect(function()
 	setStat("已反选", Th.Sub)
 end))
 trk(UI.lTp.MouseButton1Click:Connect(function()
-	if St.multi then notify("坐标管理器", "多选模式无法传送", 3, Th.Warn); return end
-	if isLp() then notify("坐标管理器", "循环传送运行中", 3, Th.Warn); return end
+	if St.multi then UIX.notify("坐标管理器", "多选模式无法传送", 3, Th.Warn); return end
+	if task_ and not task_.loop then
+		INTERRUPT.flag = true
+		setStat("⚠ 正在中断传送…", Th.Warn)
+		UIX.notify("坐标管理器", "正在中断传送…", 1.5, Th.Warn)
+		return
+	end
+	if isLp() then UIX.notify("坐标管理器", "循环传送运行中", 3, Th.Warn); return end
 	local it = fstSel(); if not it then setStat("请先选中", Th.Warn); return end
 	doTp({target=Vector3.new(it.x, it.y, it.z), loop=false, source="list"})
 end))
 trk(UI.lLp.MouseButton1Click:Connect(function()
 	if task_ and task_.loop and task_.source == "list" then cancelTask(); setStat("已停止", Th.Sub); return end
-	if St.multi then notify("坐标管理器", "多选模式无法传送", 3, Th.Warn); return end
-	if isLp() then notify("坐标管理器", "已有循环传送", 3, Th.Warn); return end
+	if St.multi then UIX.notify("坐标管理器", "多选模式无法传送", 3, Th.Warn); return end
+	if isLp() then UIX.notify("坐标管理器", "已有循环传送", 3, Th.Warn); return end
 	local it = fstSel(); if not it then setStat("请先选中", Th.Warn); return end
 	doTp({target=Vector3.new(it.x, it.y, it.z), loop=true, source="list"})
 end))
@@ -2223,20 +2564,21 @@ trk(UI.lCp.MouseButton1Click:Connect(function()
 	local ln = {}
 	for _, it in ipairs(sel) do
 		local n = (type(it.note)=="string" and it.note ~= "" and it.note) or ""
-		if n ~= "" then table.insert(ln, string.format("%d| %.2f, %.2f, %.2f  -- %s", it.id, it.x, it.y, it.z, n))
-		else table.insert(ln, string.format("%d| %.2f, %.2f, %.2f", it.id, it.x, it.y, it.z)) end
+		if n ~= "" then table.insert(ln, string.format("%.2f, %.2f, %.2f  -- %s", it.x, it.y, it.z, n))
+		else table.insert(ln, string.format("%.2f, %.2f, %.2f", it.x, it.y, it.z)) end
 	end
 	if toClip(table.concat(ln, "\n")) then
 		setStat(string.format("已复制 %d 条到剪贴板", #sel), Th.Ok)
-		notify("坐标管理器", string.format("已复制 %d 条", #sel), 2.5, Th.Ok)
+		UIX.notify("坐标管理器", string.format("已复制 %d 条", #sel), 2.5, Th.Ok)
 	else
 		setStat("剪贴板不可用", Th.Err)
-		notify("坐标管理器", "剪贴板不可用", 3, Th.Err)
+		UIX.notify("坐标管理器", "剪贴板不可用", 3, Th.Err)
 	end
 end))
 trk(UI.lDl.MouseButton1Click:Connect(function()
 	local sel = getSel()
 	if #sel == 0 then setStat("未选中", Th.Warn); return end
+	UNDO.push()
 	local rm = {}
 	for _, it in ipairs(sel) do rm[it.id] = true end
 	local kept = {}
@@ -2245,7 +2587,7 @@ trk(UI.lDl.MouseButton1Click:Connect(function()
 	setStat(string.format("已删除 %d 条", #sel), Th.Ok)
 end))
 
---========== 设置面板 ===========
+-- 设置面板
 local sPanel = nil
 local sRefs = {}
 
@@ -2260,32 +2602,47 @@ local function closeSet()
 		sPanel:Destroy()
 		sPanel = nil; setBodyInner = nil; sRefs = {}; setPanelRef = nil
 	end
+	UIState.setVisible = false
+	saveUIState()
 end
 
-local function decode(t)
-	local ok, d = pcall(function() return Http:JSONDecode(t) end)
-	if ok and type(d) == "table" then return d end
-end
 local function otherSnap()
-	return {mode=St.mode, speed=St.speed, sortAsc=St.asc, noclipMode=St.noclip, pathMode=St.path, precision=St.prec, bypass=St.bypass, stealthMaxStep=St.stealthMaxStep, hook=St.hook, godmode=St.godmode, anticframe=St.anticframe, nograv=St.nograv, camStable=St.camStable, maxServerSpeed=St.maxServerSpeed, raycastBlind=St.raycastBlind, writeProtect=St.writeProtect}
+	return {
+		mode=St.mode, speed=St.speed, sortAsc=St.asc, noclipMode=St.noclip,
+		pathMode=St.path, precision=St.prec, bypass=St.bypass,
+		stealthMaxStep=St.stealthMaxStep, liftHeight=St.liftHeight,
+		hook=St.hook, godmode=St.godmode, anticframe=St.anticframe,
+		nograv=St.nograv, camStable=St.camStable,
+		maxServerSpeed=St.maxServerSpeed,
+		raycastBlind=St.raycastBlind, writeProtect=St.writeProtect,
+	}
 end
 local function exportCfg(kind)
 	local list = {}
-	for _, it in ipairs(St.saved) do table.insert(list, {id=it.id, x=it.x, y=it.y, z=it.z, note=it.note or ""}) end
+	for _, it in ipairs(St.saved) do
+		table.insert(list, {id=it.id, x=it.x, y=it.y, z=it.z, note=it.note or ""})
+	end
 	local cfg
-	if kind == "full" then cfg = {type="full", version=VERSION, list=list, nextId=St.nid, other=otherSnap()}
-	elseif kind == "list" then cfg = {type="list", version=VERSION, list=list, nextId=St.nid}
-	else cfg = {type="other", version=VERSION, other=otherSnap()} end
+	if kind == "full" then
+		cfg = {type="full", version=VERSION, gameId=GAME_ID, list=list, nextId=St.nid, other=otherSnap()}
+	elseif kind == "list" then
+		cfg = {type="list", version=VERSION, gameId=GAME_ID, list=list, nextId=St.nid}
+	else
+		cfg = {type="other", version=VERSION, gameId=GAME_ID, other=otherSnap()}
+	end
 	local ok, en = pcall(function() return Http:JSONEncode(cfg) end)
-	if not ok or not en then setStat("导出失败", Th.Err); notify("坐标管理器", "导出失败", 3, Th.Err); return end
+	if not ok or not en then
+		setStat("导出失败", Th.Err); UIX.notify("坐标管理器", "导出失败", 3, Th.Err); return
+	end
 	if toClip(en) then
 		setStat(string.format("已导出%s", kind == "full" and "全部" or (kind == "list" and "列表" or "其他")), Th.Ok)
-		notify("坐标管理器", "已复制到剪贴板", 2.5, Th.Ok)
+		UIX.notify("坐标管理器", "已复制到剪贴板", 2.5, Th.Ok)
 	else
 		setStat("剪贴板不可用", Th.Err)
-		notify("坐标管理器", "剪贴板不可用", 3, Th.Err)
+		UIX.notify("坐标管理器", "剪贴板不可用", 3, Th.Err)
 	end
 end
+
 local impUI = {parsed=nil, listMode="add", scopeAll=true, scopeList=true, scopeOther=true}
 local function applyImp()
 	local p = impUI.parsed
@@ -2313,8 +2670,12 @@ local function applyImp()
 			end
 		end
 		if #im > 0 then
+			UNDO.push()
 			if impUI.listMode == "overwrite" then St.saved = {}; St.nid = 1 end
-			for _, it in ipairs(im) do it.id = St.nid; St.nid = St.nid + 1; table.insert(St.saved, it) end
+			for _, it in ipairs(im) do
+				it.id = St.nid; St.nid = St.nid + 1
+				table.insert(St.saved, it)
+			end
 			clrSel(); renderList()
 			table.insert(parts, string.format("列表 %d 条", #im))
 		end
@@ -2323,12 +2684,13 @@ local function applyImp()
 		local o = p.other
 		if o.mode == "smooth" or o.mode == "teleport" then St.mode = o.mode end
 		if tonumber(o.speed) then St.speed = clSpd(o.speed); UI.spdBox.Text = tostring(St.speed) end
-		if type(o.sortAsc) == "boolean" then St.asc = o.sortAsc; UI.soBtn.Text = St.asc and "排序 ↑" or "排序 ↓" end
+		if type(o.sortAsc) == "boolean" then St.asc = o.sortAsc; UI.soBtn.Text = St.asc and "正序" or "倒序" end
 		if type(o.noclipMode) == "string" then for _, m in ipairs(NOCLIP) do if m.id == o.noclipMode then St.noclip = o.noclipMode end end end
 		if type(o.pathMode) == "string" then for _, m in ipairs(PATHS) do if m.id == o.pathMode then St.path = o.pathMode end end end
 		if tonumber(o.precision) then St.prec = clPrec(o.precision) end
 		if type(o.bypass) == "string" then for _, m in ipairs(BYPASS) do if m.id == o.bypass then St.bypass = o.bypass end end end
 		if tonumber(o.stealthMaxStep) then St.stealthMaxStep = clStep(o.stealthMaxStep) end
+		if tonumber(o.liftHeight) then St.liftHeight = clLift(o.liftHeight) end
 		if type(o.hook) == "boolean" then St.hook = o.hook end
 		if type(o.godmode) == "boolean" then St.godmode = o.godmode end
 		if type(o.anticframe) == "boolean" then St.anticframe = o.anticframe end
@@ -2362,6 +2724,7 @@ local function refreshSet()
 	if r.precB then r.precB.Text = tostring(St.prec) end
 	if r.stepB then r.stepB.Text = tostring(St.stealthMaxStep) end
 	if r.srvB then r.srvB.Text = tostring(St.maxServerSpeed) end
+	if r.lftB then r.lftB.Text = tostring(St.liftHeight or 30) end
 	if r.addB and r.ovrB then
 		if impUI.listMode == "add" then
 			r.addB.BackgroundColor3 = Th.Acc; r.addB.TextColor3 = Color3.fromRGB(255,255,255)
@@ -2404,13 +2767,13 @@ local function openSet()
 		end)
 	end
 	local pw, ph = St.setW, St.setH
-	local p = mk("Frame", {Name="SetP", AnchorPoint=Vector2.new(0,0), Position=defSetPos, Size=UDim2.fromOffset(pw, ph), BackgroundColor3=Th.Bg, BorderSizePixel=0, Active=true, ClipsDescendants=true, ZIndex=20, Visible=true, Parent=sg})
+	local p = mk("Frame", {Name="SetP", AnchorPoint=Vector2.new(0,0), Position=UIState.setPos, Size=UDim2.fromOffset(pw, ph), BackgroundColor3=Th.Bg, BorderSizePixel=0, Active=true, ClipsDescendants=true, ZIndex=20, Visible=true, Parent=sg})
 	sPanel = p; setPanelRef = p
 	mk("UICorner", {CornerRadius=UDim.new(0,10), Parent=p}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=p})
 
 	local hdr = mk("Frame", {Name="H", Size=UDim2.new(1,0,0,32), BackgroundColor3=Th.Sur, BorderSizePixel=0, Active=true, ZIndex=21, Parent=p})
 	mk("UICorner", {CornerRadius=UDim.new(0,10), Parent=hdr})
-	mk("TextLabel", {Size=UDim2.new(1,-84,1,0), Position=UDim2.fromOffset(14,0), BackgroundTransparency=1, Font=Enum.Font.GothamBold, TextSize=13, TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left, Text="设置", ZIndex=22, Parent=hdr, Active=false})
+	mk("TextLabel", {Size=UDim2.new(1,-84,1,0), Position=UDim2.fromOffset(14,0), BackgroundTransparency=1, Font=Enum.Font.GothamBold, TextSize=13, TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left, Text="设置 ("..GAME_TAG..")", ZIndex=22, Parent=hdr, Active=false})
 	local minB = mk("TextButton", {Size=UDim2.fromOffset(22,22), Position=UDim2.new(1,-58,0.5,-11), BackgroundColor3=Th.Bg, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Th.Sub, Text="—", ZIndex=22, Parent=hdr})
 	mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=minB})
 	local clB = mk("TextButton", {Size=UDim2.fromOffset(22,22), Position=UDim2.new(1,-30,0.5,-11), BackgroundColor3=Th.Bg, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=13, TextColor3=Th.Err, Text="X", ZIndex=22, Parent=hdr})
@@ -2418,10 +2781,13 @@ local function openSet()
 	trk(clB.MouseButton1Click:Connect(closeSet))
 	trk(hdr.InputBegan:Connect(function(input)
 		if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
-		if dragState then return end
+		if UIX.drag then return end
 		local ix, iy = input.Position.X, input.Position.Y
 		if inRect(ix, iy, minB) or inRect(ix, iy, clB) then return end
-		startDrag(p, input.Position, {onZ=function() hdr.ZIndex = nextZ() end})
+		UIX.startDrag(p, input.Position, {
+			onZ=function() hdr.ZIndex = nextZ() end,
+			onEnd=function() UIState.setPos = p.Position; saveUIState() end,
+		})
 	end))
 
 	local sRH = mk("Frame", {Name="RH", AnchorPoint=Vector2.new(1,1), Position=UDim2.new(1,-4,1,-4), Size=UDim2.fromOffset(HDL,HDL), BackgroundColor3=Th.Hdl, BackgroundTransparency=0.15, BorderSizePixel=0, Active=true, ZIndex=nextZ(), Parent=p})
@@ -2465,7 +2831,10 @@ local function openSet()
 		end))
 		trk(UIS.InputEnded:Connect(function(input)
 			if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-				rsz = false; saveToFile()
+				rsz = false
+				saveToFile()
+				UIState.setPos = p.Position
+				saveUIState()
 			end
 		end))
 	end
@@ -2483,12 +2852,13 @@ local function openSet()
 	local function setMergeTarget() return bInner end
 
 	createBlock({id="set_diag", title="诊断", host="settings", parent=bInner, getMergeParent=setMergeTarget, build=function(b, self)
-		mk("TextLabel", {Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="检测本游戏是客户端/服务端权威", LayoutOrder=1, Parent=b})
-		local btn = mk("TextButton", {Size=UDim2.new(1,0,0,28), BackgroundColor3=Th.Acc, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Color3.fromRGB(255,255,255), Text="🔍 开始诊断", LayoutOrder=2, Parent=b})
+		mk("TextLabel", {Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="当前游戏 ID："..tostring(GAME_ID).."  存档："..GAME_TAG, LayoutOrder=1, Parent=b})
+		mk("TextLabel", {Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="检测本游戏是客户端/服务端权威", LayoutOrder=2, Parent=b})
+		local btn = mk("TextButton", {Size=UDim2.new(1,0,0,28), BackgroundColor3=Th.Acc, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Color3.fromRGB(255,255,255), Text="🔍 开始诊断", LayoutOrder=3, Parent=b})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=btn})
 		trk(btn.MouseButton1Click:Connect(function()
 			setStat("正在诊断…", Th.Sub)
-			notify("坐标管理器", "诊断中…", 1, Th.Sub)
+			UIX.notify("坐标管理器", "诊断中…", 1, Th.Sub)
 			task.spawn(diagnose)
 		end))
 	end})
@@ -2503,6 +2873,10 @@ local function openSet()
 			bs[m.id] = btn
 			trk(btn.MouseButton1Click:Connect(function()
 				St.noclip = m.id; refreshSet(); saveToFile()
+				if St.noclip ~= "off" then
+					noclipMgr.start()
+					pcall(function() noclipApplyToChar(LP.Character) end)
+				end
 				setStat("穿墙模式：" .. m.label, Th.Ok)
 			end))
 		end
@@ -2529,27 +2903,23 @@ local function openSet()
 		mk("TextLabel", {Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="精度：次/studs，1-500", LayoutOrder=1, Parent=b})
 		local bx = mk("TextBox", {Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Sur, BorderSizePixel=0, Font=Enum.Font.GothamBold, TextSize=13, TextColor3=Th.Txt, Text=tostring(St.prec), ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center, LayoutOrder=2, Parent=b})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=bx}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=bx})
-		trk(bx.FocusLost:Connect(function()
-			St.prec = clPrec(bx.Text); bx.Text = tostring(St.prec); saveToFile()
-			setStat("精度已设为 " .. St.prec, Th.Ok)
-		end))
+		trk(bx.FocusLost:Connect(function() St.prec = clPrec(bx.Text); bx.Text = tostring(St.prec); saveToFile(); setStat("精度已设为 " .. St.prec, Th.Ok) end))
 		sRefs.precB = bx
 		mk("TextLabel", {Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="隐蔽模式单帧最大位移：1-5000", LayoutOrder=3, Parent=b})
 		local stx = mk("TextBox", {Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Sur, BorderSizePixel=0, Font=Enum.Font.GothamBold, TextSize=13, TextColor3=Th.Txt, Text=tostring(St.stealthMaxStep), ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center, LayoutOrder=4, Parent=b})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=stx}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=stx})
-		trk(stx.FocusLost:Connect(function()
-			St.stealthMaxStep = clStep(stx.Text); stx.Text = tostring(St.stealthMaxStep); saveToFile()
-			setStat("隐蔽单帧上限已设为 " .. St.stealthMaxStep, Th.Ok)
-		end))
+		trk(stx.FocusLost:Connect(function() St.stealthMaxStep = clStep(stx.Text); stx.Text = tostring(St.stealthMaxStep); saveToFile(); setStat("隐蔽单帧上限已设为 " .. St.stealthMaxStep, Th.Ok) end))
 		sRefs.stepB = stx
 		mk("TextLabel", {Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="服务端最大速度 (studs/s)：30-2000", LayoutOrder=5, Parent=b})
 		local srv = mk("TextBox", {Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Sur, BorderSizePixel=0, Font=Enum.Font.GothamBold, TextSize=13, TextColor3=Th.Txt, Text=tostring(St.maxServerSpeed), ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center, LayoutOrder=6, Parent=b})
 		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=srv}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=srv})
-		trk(srv.FocusLost:Connect(function()
-			St.maxServerSpeed = clSrv(srv.Text); srv.Text = tostring(St.maxServerSpeed); saveToFile()
-			setStat("服务端上限已设为 " .. St.maxServerSpeed, Th.Ok)
-		end))
+		trk(srv.FocusLost:Connect(function() St.maxServerSpeed = clSrv(srv.Text); srv.Text = tostring(St.maxServerSpeed); saveToFile(); setStat("服务端上限已设为 " .. St.maxServerSpeed, Th.Ok) end))
 		sRefs.srvB = srv
+		mk("TextLabel", {Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="抬高路径高度 (studs)：1-500", LayoutOrder=7, Parent=b})
+		local lft = mk("TextBox", {Size=UDim2.new(1,0,0,26), BackgroundColor3=Th.Sur, BorderSizePixel=0, Font=Enum.Font.GothamBold, TextSize=13, TextColor3=Th.Txt, Text=tostring(St.liftHeight or 30), ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center, LayoutOrder=8, Parent=b})
+		mk("UICorner", {CornerRadius=UDim.new(0,6), Parent=lft}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=lft})
+		trk(lft.FocusLost:Connect(function() St.liftHeight = clLift(lft.Text); lft.Text = tostring(St.liftHeight); saveToFile(); setStat("抬高高度已设为 " .. St.liftHeight .. " studs", Th.Ok) end))
+		sRefs.lftB = lft
 	end})
 
 	createBlock({id="set_bypass", title="反检测方案", host="settings", parent=bInner, getMergeParent=setMergeTarget, build=function(b, self)
@@ -2577,7 +2947,7 @@ local function openSet()
 				St.bypass = m.id
 				refreshSet(); saveToFile()
 				setStat("反检测：" .. m.label, Th.Ok)
-				notify("坐标管理器", "反检测：" .. m.label, 2, Th.Ok)
+				UIX.notify("坐标管理器", "反检测：" .. m.label, 2, Th.Ok)
 			end))
 		end
 		sRefs.bypB = bs
@@ -2589,7 +2959,7 @@ local function openSet()
 		local sup = HOOK.supported()
 		mk("TextLabel", {Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=sup and Th.Ok or Th.Err, TextXAlignment=Enum.TextXAlignment.Left, Text=sup and "执行器支持 HOOK ✓" or "执行器不支持 HOOK ✗", LayoutOrder=1, Parent=b})
 
-		local function addToggle(text, order, getVal, setVal)
+		local function addToggle(text, order, setVal)
 			mk("TextLabel", {Size=UDim2.new(1,0,0,12), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text=text, LayoutOrder=order, Parent=b})
 			local row = mk("Frame", {Size=UDim2.new(1,0,0,24), BackgroundTransparency=1, LayoutOrder=order+1, Parent=b})
 			mk("UIListLayout", {FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=row})
@@ -2602,34 +2972,34 @@ local function openSet()
 			return on, off
 		end
 
-		local hOn, hOff = addToggle("属性伪装", 2, nil, function(v)
-			if v and not sup then notify("坐标管理器", "执行器不支持 HOOK", 3, Th.Err); return end
+		local hOn, hOff = addToggle("属性伪装", 2, function(v)
+			if v and not sup then UIX.notify("坐标管理器", "执行器不支持 HOOK", 3, Th.Err); return end
 			St.hook = v
 			if v then HOOK.install() end
 			setStat(v and "属性伪装已开启" or "属性伪装已关闭", v and Th.Ok or Th.Sub)
 		end)
 		sRefs.hookOnB, sRefs.hookOffB = hOn, hOff
 
-		local gOn, gOff = addToggle("Godmode（血量归零自动恢复）", 4, nil, function(v)
+		local gOn, gOff = addToggle("Godmode（血量归零自动恢复）", 4, function(v)
 			St.godmode = v
 			setStat(v and "Godmode 已开启" or "Godmode 已关闭", v and Th.Ok or Th.Sub)
 		end)
 		sRefs.gmOnB, sRefs.gmOffB = gOn, gOff
 
-		local aOn, aOff = addToggle("AntiCFrame（阻止服务器强制位移）", 6, nil, function(v)
+		local aOn, aOff = addToggle("AntiCFrame（阻止服务器强制位移）", 6, function(v)
 			St.anticframe = v
 			setStat(v and "AntiCFrame 已开启" or "AntiCFrame 已关闭", v and Th.Ok or Th.Sub)
 		end)
 		sRefs.acOnB, sRefs.acOffB = aOn, aOff
 
-		local cOn, cOff = addToggle("相机固定（传送时相机不动）", 8, nil, function(v)
+		local cOn, cOff = addToggle("相机固定（传送时相机不动）", 8, function(v)
 			St.camStable = v
 			setStat(v and "相机固定已开启" or "相机固定已关闭", v and Th.Ok or Th.Sub)
 		end)
 		sRefs.csOnB, sRefs.csOffB = cOn, cOff
 
-		local rOn, rOff = addToggle("射线屏蔽", 10, nil, function(v)
-			if v and not sup then notify("坐标管理器", "执行器不支持 HOOK", 3, Th.Err); return end
+		local rOn, rOff = addToggle("射线屏蔽", 10, function(v)
+			if v and not sup then UIX.notify("坐标管理器", "执行器不支持 HOOK", 3, Th.Err); return end
 			St.raycastBlind = v
 			if v then HOOK.install() end
 			HOOK.raycastBlind = v
@@ -2637,8 +3007,8 @@ local function openSet()
 		end)
 		sRefs.rbOnB, sRefs.rbOffB = rOn, rOff
 
-		local wOn, wOff = addToggle("写入保护", 12, nil, function(v)
-			if v and not sup then notify("坐标管理器", "执行器不支持 HOOK", 3, Th.Err); return end
+		local wOn, wOff = addToggle("写入保护", 12, function(v)
+			if v and not sup then UIX.notify("坐标管理器", "执行器不支持 HOOK", 3, Th.Err); return end
 			St.writeProtect = v
 			if v then HOOK.install() end
 			HOOK.writeProtect = v
@@ -2646,20 +3016,20 @@ local function openSet()
 		end)
 		sRefs.wpOnB, sRefs.wpOffB = wOn, wOff
 
-		local oOn, oOff = addToggle("网络所有权（每 0.35s 抢一次）", 14, nil, function(v)
+		local oOn, oOff = addToggle("网络所有权（每 0.35s 抢一次）", 14, function(v)
 			if v then
 				OWNER.start()
 				setStat("网络所有权争夺中…", Th.Acc)
 				task.delay(1, function()
 					if OWNER.confirmed then
 						setStat("网络所有权已抢到", Th.Ok)
-						notify("坐标管理器", "网络所有权已抢到 ✓", 2, Th.Ok)
+						UIX.notify("坐标管理器", "网络所有权已抢到 ✓", 2, Th.Ok)
 					elseif OWNER.lastResult == "auto-success" then
 						setStat("网络所有权已切回自动", Th.Ok)
-						notify("坐标管理器", "已切回自动（客户端权威）", 3, Th.Ok)
+						UIX.notify("坐标管理器", "已切回自动（客户端权威）", 3, Th.Ok)
 					else
 						setStat("服务端锁定所有权", Th.Warn)
-						notify("坐标管理器", "服务端锁定所有权 ✗\n需用【速度】模式", 4, Th.Warn)
+						UIX.notify("坐标管理器", "服务端锁定所有权 ✗\n需用【速度】模式", 4, Th.Warn)
 					end
 				end)
 			else
@@ -2698,7 +3068,11 @@ local function openSet()
 				elseif impUI.parsed.other then t = "other"
 				else dls.Text = "格式无效"; dls.TextColor3 = Th.Err; return false end
 			end
-			dls.Text = "类型：" .. t; dls.TextColor3 = Th.Ok; return true
+			local gid = impUI.parsed.gameId
+			local gidHint = (gid and tonumber(gid) and tonumber(gid) ~= GAME_ID) and " (其他游戏)" or ""
+			dls.Text = "类型：" .. t .. gidHint
+			dls.TextColor3 = Th.Ok
+			return true
 		end
 		trk(cb:GetPropertyChangedSignal("Text"):Connect(function() task.defer(val) end))
 		trk(cb.FocusLost:Connect(val))
@@ -2740,7 +3114,7 @@ local function openSet()
 			if ok then
 				dls.Text = msg; dls.TextColor3 = Th.Ok
 				setStat(msg, Th.Ok)
-				notify("坐标管理器", msg, 3, Th.Ok)
+				UIX.notify("坐标管理器", msg, 3, Th.Ok)
 				saveToFile()
 			else
 				dls.Text = msg; dls.TextColor3 = Th.Warn
@@ -2750,6 +3124,7 @@ local function openSet()
 	end})
 
 	refreshSet()
+	UIState.setVisible = true
 	applyVisibility()
 	task.defer(function() refreshSetSize() end)
 	trk(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function() task.defer(refreshSetSize) end))
@@ -2759,11 +3134,11 @@ trk(setBtn.MouseButton1Click:Connect(function()
 	setStat(sPanel and "设置面板已打开" or "设置面板已关闭", Th.Sub)
 end))
 
---========== 复位 ==========
+-- 复位
 local rGui = mk("ScreenGui", {Name="RBX_Ctrl_".._guiSfx, ResetOnSpawn=false, IgnoreGuiInset=true, ZIndexBehavior=Enum.ZIndexBehavior.Sibling, DisplayOrder=999998})
 rGui.Parent = guiP()
 if ANTI and ANTI.mark then ANTI.mark(rGui) end
-protectGui(rGui)
+UIX.protectGui(rGui)
 local rBtn = mk("TextButton", {Name="Reset", AnchorPoint=Vector2.new(0,1), Position=UDim2.new(0,16,1,-16), Size=UDim2.fromOffset(96,40), BackgroundColor3=Th.Sur, BackgroundTransparency=0.1, BorderSizePixel=0, AutoButtonColor=false, Font=Enum.Font.GothamBold, TextSize=13, TextColor3=Th.Txt, Text="复位 (长按3秒)", Parent=rGui})
 mk("UICorner", {CornerRadius=UDim.new(0,8), Parent=rBtn}); mk("UIStroke", {Color=Th.Str, Thickness=1, Parent=rBtn})
 local rPg = mk("Frame", {Size=UDim2.new(0,0,1,0), BackgroundColor3=Th.Err, BackgroundTransparency=0.55, BorderSizePixel=0, ZIndex=0, Parent=rBtn})
@@ -2785,16 +3160,24 @@ local function doReset()
 	allHidden = false
 	St.min = false; St.advOpen = false; St.sel = {}; St.multi = false
 	St.mainW = 360; St.mainH = 300; St.setW = 360; St.setH = 480
+	UIState.mainPos = defMainPos
+	UIState.setPos = defSetPos
+	UIState.mainVisible = true
+	UIState.setVisible = false
+	UIState.blockStates = {}
 	main.Position = defMainPos
 	main.Size = UDim2.fromOffset(St.mainW, St.mainH)
-	for _, bl in pairs(mainBlocks) do bl.minimized = false; bl:applyMinimized() end
+	for _, bl in pairs(mainBlocks) do
+		bl.minimized = false
+		bl:applyMinimized()
+	end
 	applyMainMin()
 	UI.advP.Visible = false
 	UI.mulBtn.Text = "多选模式：关"; UI.mulBtn.BackgroundColor3 = Th.Sur
-	updRows(); saveToFile(); applyVisibility()
+	updRows(); saveToFile(); saveUIState(); applyVisibility()
 	task.defer(function() triggerOwnerRefresh(cInner) end)
 	setStat("已复位", Th.Ok)
-	notify("坐标管理器", "已复位", 2.5, Th.Ok)
+	UIX.notify("坐标管理器", "已复位", 2.5, Th.Ok)
 end
 trk(RS.Heartbeat:Connect(function(dt)
 	if not rHold then return end
@@ -2815,19 +3198,20 @@ trk(UIS.InputBegan:Connect(function(input, gpe)
 	if input.KeyCode == Enum.KeyCode.RightAlt then
 		allHidden = not allHidden
 		applyVisibility()
-		notify("坐标管理器", allHidden and "已隐藏所有面板 (RightAlt 恢复)" or "已显示所有面板", 2, allHidden and Th.Warn or Th.Ok)
+		UIX.notify("坐标管理器", allHidden and "已隐藏所有面板 (RightAlt 恢复)" or "已显示所有面板", 2, allHidden and Th.Warn or Th.Ok)
 	end
 end))
 
---========== 销毁 / 启动 ==========
 local Api
 local function destroy()
 	if dead then return end
 	dead = true
+	pcall(saveUIState)
+	pcall(saveToFile)
 	cancelTask(); closeSet(); GRAV.stop(); HOOK.uninstall(); noclipMgr.stop(); cleanAlign(); OWNER.stop()
-	if camMgr.conn then pcall(function() camMgr.conn:Disconnect() end); camMgr.conn = nil end
-	if camMgr.restoreJob then pcall(function() task.cancel(camMgr.restoreJob) end); camMgr.restoreJob = nil end
-	camMgr.active = false
+	if CAM.conn then pcall(function() CAM.conn:Disconnect() end); CAM.conn = nil end
+	if CAM.restoreJob then pcall(function() task.cancel(CAM.restoreJob) end); CAM.restoreJob = nil end
+	CAM.active = false
 	for _, c in ipairs(Conns) do pcall(function() c:Disconnect() end) end
 	table.clear(Conns)
 	if sg then pcall(function() sg:Destroy() end) end
@@ -2849,32 +3233,54 @@ local okInit, errInit = pcall(function()
 		HOOK.writeProtect = St.writeProtect
 	end
 	if St.nograv then GRAV.start() end
+	if St.noclip ~= "off" then
+		noclipMgr.start()
+		pcall(function() noclipApplyToChar(LP.Character) end)
+	end
 end)
 if not okInit then warn("[" .. SCRIPT_ID .. "] 启动出错: " .. tostring(errInit)) end
 
-Api = {version=VERSION, state=St, destroy=destroy, gui=sg, hook=HOOK, gravity=GRAV, noclip=noclipMgr, owner=OWNER, camera=camMgr, diagnose=diagnose, busy=TP_BUSY}
+Api = {version=VERSION, state=St, destroy=destroy, gui=sg, hook=HOOK, gravity=GRAV, noclip=noclipMgr, owner=OWNER, camera=CAM, diagnose=diagnose, busy=TP_BUSY, gameId=GAME_ID, interrupt=interruptTp}
 rawset(gE, _apiKey, Api)
 rawset(gE, SCRIPT_ID, Api)
-pcall(function() print("[" .. SCRIPT_ID .. "] Api 已注册") end)
+pcall(function() print("[" .. SCRIPT_ID .. "] Api 已注册 (GameId="..tostring(GAME_ID)..")") end)
 
 task.defer(function() task.defer(function() pcall(refreshMainSize) end) end)
 
-notify("坐标管理器", string.format("v%d 已加载 · RightAlt 隐藏", VERSION), 3.5, Th.Ok)
-if St.hook and HOOK.supported() then task.delay(1, function() notify("坐标管理器", "HOOK 属性伪装已启用", 3, Th.Ok) end) end
-if not hasFile then task.delay(3.6, function() notify("坐标管理器", "文件存档 API 不可用", 3, Th.Warn) end) end
-if not hasClip then task.delay(6.8, function() notify("坐标管理器", "剪贴板 API 未检测到", 4, Th.Warn) end) end
-
-setStat("就绪", Th.Sub)
-trk(RS.Heartbeat:Connect(function()
-	if dead then return end
-	local p = getPos()
-	if p then curLbl.Text = string.format("X: %.2f   Y: %.2f   Z: %.2f", p.X, p.Y, p.Z)
-	else curLbl.Text = "X: --   Y: --   Z: --" end
-end))
+task.defer(function()
+	pcall(function()
+		main.Position = UIState.mainPos
+		main.Visible = UIState.mainVisible
+		for id, bl in pairs(allBlocks) do
+			local bs = UIState.blockStates[id]
+			if bs and bs.min and bl.host == "main" then
+				pcall(function() bl:applyMinimized() end)
+			end
+		end
+	end)
+end)
 
 local saveTimer = 0
 trk(RS.Heartbeat:Connect(function(dt)
 	if dead then return end
 	saveTimer = saveTimer + dt
 	if saveTimer >= SAVE_INTERVAL then saveTimer = 0; saveToFile() end
+	local p = getPos()
+	if p then
+		curLbl.Text = string.format("X: %.2f   Y: %.2f   Z: %.2f", p.X, p.Y, p.Z)
+	else
+		curLbl.Text = "X: --   Y: --   Z: --"
+	end
 end))
+
+UIX.notify("坐标管理器", string.format("v%d 已加载 · GameId=%s", VERSION, tostring(GAME_ID)), 3.5, Th.Ok)
+if St.hook and HOOK.supported() then
+	task.delay(1, function() UIX.notify("坐标管理器", "HOOK 属性伪装已启用", 3, Th.Ok) end)
+end
+if not hasFile then
+	task.delay(3.6, function() UIX.notify("坐标管理器", "文件存档 API 不可用", 3, Th.Warn) end)
+end
+if not hasClip then
+	task.delay(6.8, function() UIX.notify("坐标管理器", "剪贴板 API 未检测到", 4, Th.Warn) end)
+end
+setStat("就绪 · "..GAME_TAG, Th.Sub)
