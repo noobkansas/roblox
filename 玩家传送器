@@ -1,4 +1,5 @@
---[[ 玩家传送管理器 v13 · 支持 ^ 本地坐标前缀 ]]--
+--[[ 玩家传送管理器 v15 · 逗号兼容 + 高频切换 ]]--
+
 --[[玩家传送管理器 · 功能说明
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -140,8 +141,8 @@ RightAlt：隐藏/显示所有面板
 - 玩家离线自动从三个列表移除
 - 传送任务遇到死亡/无效玩家自动跳过]]
 local SCRIPT_ID   = "PlayerTpMgr"
-local VERSION     = 13
-local CFG_VERSION = 13
+local VERSION     = 15
+local CFG_VERSION = 15
 
 local HDL, HDR_H, TITLE_H, ROW_H = 14, 30, 38, 28
 local SAVE_FILE = "PlayerTpMgr.json"
@@ -178,8 +179,8 @@ local St = {
     stealthMaxStep = 18,
     tpMode = "single",
     interval = 1.5, stickyRate = 60,
-    offset = { x = "0", y = "5", z = "0" },   -- v13: 字符串，可带 ^ 前缀
-    localOffset = false,                       -- 全局默认：无 ^ 时是否本地
+    offset = { x = "0", y = "5", z = "0" },
+    localOffset = false,
     lockPos = true,
     tpTargets = {}, camList = {},
     selAll = {}, selTp = {}, selCam = {},
@@ -201,6 +202,18 @@ local BYPASS_DESC = {
 }
 
 local hasFile = type(writefile)=="function" and type(readfile)=="function" and type(isfile)=="function"
+
+-- v15: 数字解析（支持中英文逗号 / 空格 / 全角）
+local function toNumber(v)
+    if type(v) == "number" then return v end
+    if type(v) ~= "string" then return nil end
+    local s = v
+    s = s:gsub("，", "."):gsub(",", "."):gsub("。", ".")
+    s = s:gsub("％", ""):gsub("%%", "")
+    s = s:gsub("^%s+", ""):gsub("%s+$", "")
+    s = s:gsub("　", "")
+    return tonumber(s)
+end
 
 local function saveCfg()
     if not hasFile then return end
@@ -244,7 +257,6 @@ if type(St.blocks) ~= "table" then St.blocks = {} end
 if type(St.tpTargets) ~= "table" then St.tpTargets = {} end
 if type(St.camList) ~= "table" then St.camList = {} end
 if type(St.offset) ~= "table" then St.offset = {x="0",y="5",z="0"} end
--- v13: 数字旧格式转字符串
 if type(St.offset.x) == "number" then St.offset.x = tostring(St.offset.x) end
 if type(St.offset.y) == "number" then St.offset.y = tostring(St.offset.y) end
 if type(St.offset.z) == "number" then St.offset.z = tostring(St.offset.z) end
@@ -292,19 +304,17 @@ local function guiP()
 end
 
 local function cl(v, lo, hi) if v < lo then return lo end if v > hi then return hi end return v end
-local function clSpd(v) return cl(math.floor((tonumber(v) or 30)+0.5), 1, 200000) end
-local function clPrec(v) return cl(math.floor((tonumber(v) or 10)+0.5), 1, 500) end
-local function clStep(v) return cl(math.floor((tonumber(v) or 18)+0.5), 1, 500) end
-local function clInterval(v) return cl(tonumber(v) or 1.5, 0.01, 60) end
-local function clRate(v) return cl(math.floor((tonumber(v) or 60)+0.5), 1, 240) end
+local function clSpd(v) return cl(math.floor((toNumber(v) or 30)+0.5), 1, 200000) end
+local function clPrec(v) return cl(math.floor((toNumber(v) or 10)+0.5), 1, 500) end
+local function clStep(v) return cl(math.floor((toNumber(v) or 18)+0.5), 1, 500) end
+local function clInterval(v) return cl(toNumber(v) or 1.5, 0.005, 60) end
+local function clRate(v) return cl(math.floor((toNumber(v) or 60)+0.5), 1, 240) end
 local function inRect(px, py, obj)
     local p, s = obj.AbsolutePosition, obj.AbsoluteSize
     if not p or not s then return false end
     return px >= p.X and px <= p.X + s.X and py >= p.Y and py <= p.Y + s.Y
 end
 
--- ==================== v13: 偏移解析（支持 ^ 前缀） ====================
--- 返回: Vector3(数值), boolean(是否任意轴带 ^)
 local function parseOffset()
     local function parseAxis(str, def)
         str = tostring(str or ""):gsub("^%s+", ""):gsub("%s+$", "")
@@ -313,7 +323,7 @@ local function parseOffset()
             isLocal = true
             str = str:sub(2):gsub("^%s+", "")
         end
-        local n = tonumber(str)
+        local n = toNumber(str)
         if not n then n = def end
         return n, isLocal
     end
@@ -446,21 +456,21 @@ mk("TextLabel", {
     TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left,
     Text="玩家传送 / 摄像机", ZIndex=102, Parent=mHdr, Active=false,
 })
-local mMin = mk("TextButton", {
+local mCls = mk("TextButton", {
     Size=UDim2.fromOffset(26,26), Position=UDim2.new(1,-64,0.5,-13),
+    BackgroundColor3=Th.Err, BorderSizePixel=0, AutoButtonColor=true,
+    Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Color3.fromRGB(255,255,255), Text="X",
+    ZIndex=102, Parent=mHdr,
+})
+mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=mCls })
+local mMin = mk("TextButton", {
+    Size=UDim2.fromOffset(26,26), Position=UDim2.new(1,-34,0.5,-13),
     BackgroundColor3=Th.Bg, BorderSizePixel=0, AutoButtonColor=true,
     Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Th.Sub, Text="—",
     ZIndex=102, Parent=mHdr,
 })
 mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=mMin })
 mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=mMin })
-local mCls = mk("TextButton", {
-    Size=UDim2.fromOffset(26,26), Position=UDim2.new(1,-34,0.5,-13),
-    BackgroundColor3=Th.Err, BorderSizePixel=0, AutoButtonColor=true,
-    Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Color3.fromRGB(255,255,255), Text="X",
-    ZIndex=102, Parent=mHdr,
-})
-mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=mCls })
 
 local cScroll = mk("ScrollingFrame", {
     Name="Scroll", Size=UDim2.new(1,0,1,-TITLE_H), Position=UDim2.fromOffset(0,TITLE_H),
@@ -562,26 +572,26 @@ local function createBlock(cfg)
     })
     mk("UICorner", { CornerRadius=UDim.new(0,8), Parent=hdr })
     mk("TextLabel", {
-        Size=UDim2.new(1,-96,1,0), Position=UDim2.fromOffset(12,0),
+        Size=UDim2.new(1,-100,1,0), Position=UDim2.fromOffset(12,0),
         BackgroundTransparency=1, Font=Enum.Font.GothamBold, TextSize=12,
         TextColor3=Th.Txt, TextXAlignment=Enum.TextXAlignment.Left,
         Text=cfg.title, ZIndex=2, Parent=hdr, Active=false,
     })
-    local minBtn = mk("TextButton", {
+    local detBtn = mk("TextButton", {
         Size=UDim2.fromOffset(26,26), Position=UDim2.new(1,-64,0.5,-13),
+        BackgroundColor3=Th.BluBtn, BorderSizePixel=0, AutoButtonColor=true,
+        Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Color3.fromRGB(255,255,255), Text="⇱",
+        ZIndex=2, Parent=hdr,
+    })
+    mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=detBtn })
+    local minBtn = mk("TextButton", {
+        Size=UDim2.fromOffset(26,26), Position=UDim2.new(1,-34,0.5,-13),
         BackgroundColor3=Th.Bg, BorderSizePixel=0, AutoButtonColor=true,
         Font=Enum.Font.GothamBold, TextSize=16, TextColor3=Th.Txt, Text="—",
         ZIndex=2, Parent=hdr,
     })
     mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=minBtn })
     mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=minBtn })
-    local detBtn = mk("TextButton", {
-        Size=UDim2.fromOffset(26,26), Position=UDim2.new(1,-34,0.5,-13),
-        BackgroundColor3=Th.BluBtn, BorderSizePixel=0, AutoButtonColor=true,
-        Font=Enum.Font.GothamBold, TextSize=14, TextColor3=Color3.fromRGB(255,255,255), Text="⇱",
-        ZIndex=2, Parent=hdr,
-    })
-    mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=detBtn })
 
     local body = mk("Frame", {
         Name="B", Size=UDim2.new(1,0,0,0), Position=UDim2.fromOffset(0,HDR_H),
@@ -753,7 +763,6 @@ local function removeFromList(list, uid)
     for i = #list, 1, -1 do if list[i] == uid then table.remove(list, i) end end
 end
 
--- v13: 使用 parseOffset（含 ^ 检测）
 local function computeDestAndFace(targetRoot)
     local offsetVec, anyLocal = parseOffset()
     local useLocal = anyLocal or St.localOffset
@@ -828,10 +837,53 @@ local function applyNoclipPersistent()
     if r then trackPersistent(r) end
 end
 
+local function forceNoclipAll()
+    local ch = LP.Character
+    if not ch then return {} end
+    local saved = {}
+    for _, p in ipairs(ch:GetDescendants()) do
+        if p:IsA("BasePart") and p.CanCollide then
+            saved[p] = true
+            p.CanCollide = false
+        end
+    end
+    return saved
+end
+local function restoreForcedNoclip(saved)
+    if not saved then return end
+    for p, _ in pairs(saved) do
+        if p and p.Parent then
+            pcall(function() p.CanCollide = true end)
+        end
+    end
+end
+
+-- v15: 无重力
+local function applyNoGravity(hrp)
+    if not hrp then return nil end
+    local existing = hrp:FindFirstChild("PlayerTpMgr_NoGrav")
+    if existing then return existing end
+    local bf = Instance.new("BodyForce")
+    bf.Name = "PlayerTpMgr_NoGrav"
+    bf.Force = Vector3.new(0, workspace.Gravity * hrp:GetMass(), 0)
+    bf.Parent = hrp
+    return bf
+end
+local function removeNoGravity(hrp)
+    if not hrp then return end
+    local bf = hrp:FindFirstChild("PlayerTpMgr_NoGrav")
+    if bf then pcall(function() bf:Destroy() end) end
+end
+local function refreshNoGravity(hrp, bf)
+    if not hrp or not bf or not bf.Parent then return end
+    bf.Force = Vector3.new(0, workspace.Gravity * hrp:GetMass(), 0)
+end
+
 -- ==================== 传送引擎 ====================
 local function buildS(r)
     local ch = LP.Character
     local hum = ch and ch:FindFirstChildOfClass("Humanoid")
+    local bf = applyNoGravity(r)
     return {
         ch=ch, r=r, hum=hum,
         origWalkSpeed = hum and hum.WalkSpeed or 16,
@@ -842,9 +894,11 @@ local function buildS(r)
         lastDirH=nil, faceBlend=0,
         curvePhase = math.random() * math.pi * 2,
         rayTimer=0, startPos=r.Position, bv=nil,
+        noGrav = bf,
     }
 end
 
+-- v15: 硬传送（无重力刷新延迟到调用方）
 local function hardSet(r, S, dest, faceCF)
     if faceCF then r.CFrame = faceCF
     else
@@ -1048,6 +1102,8 @@ end
 local function cleanupS(S)
     if not S then return end
     if S.bv then pcall(function() S.bv:Destroy() end); S.bv = nil end
+    if S.noGrav then pcall(function() S.noGrav:Destroy() end); S.noGrav = nil end
+    if S.r then removeNoGravity(S.r) end
     if S.hum and S.hum.Parent then
         pcall(function()
             S.hum.WalkSpeed = S.origWalkSpeed
@@ -1064,6 +1120,7 @@ local function doTpFixed(plr)
     if not r then return false end
     local tR = getPlayerRoot(plr)
     if not tR then return false end
+    local savedCol = forceNoclipAll()
     local nocSv
     if St.noclip == "persistent" then applyNoclipPersistent()
     else nocSv = applyNoclipTransient() end
@@ -1081,6 +1138,7 @@ local function doTpFixed(plr)
         local hum = LP.Character and LP.Character:FindFirstChildOfClass("Humanoid")
         if hum then hum:Move(Vector3.zero, false) end
         restoreNoclipTransient(nocSv)
+        restoreForcedNoclip(savedCol)
         if St.noclip == "persistent" then applyNoclipPersistent() end
         return true
     end
@@ -1092,11 +1150,9 @@ local function doTpFixed(plr)
     local conn
     conn = RS.Heartbeat:Connect(function(dt)
         if dead or done then return end
-        if not r or not r.Parent then done = true; conn:Disconnect(); cleanupS(S); return end
+        if not r or not r.Parent then done = true; conn:Disconnect(); cleanupS(S); restoreForcedNoclip(savedCol); return end
         local newTR = getPlayerRoot(plr)
-        if not newTR then done = true; conn:Disconnect(); cleanupS(S)
-            restoreNoclipTransient(nocSv); return
-        end
+        if not newTR then done = true; conn:Disconnect(); cleanupS(S); restoreForcedNoclip(savedCol); return end
         local curDest, curFace = computeDestAndFace(newTR)
         if St.bypass == "walk" and S.hum and S.hum.Parent then
             local ws = math.min(St.speed, 300)
@@ -1104,8 +1160,9 @@ local function doTpFixed(plr)
         end
         if engineStep(S, curDest, dt, curFace) then
             done = true; conn:Disconnect(); cleanupS(S)
-            if St.noclip == "persistent" then applyNoclipPersistent()
-            else restoreNoclipTransient(nocSv) end
+            restoreNoclipTransient(nocSv)
+            restoreForcedNoclip(savedCol)
+            if St.noclip == "persistent" then applyNoclipPersistent() end
         end
     end)
     return true
@@ -1113,16 +1170,30 @@ end
 
 -- ==================== 传送任务 ====================
 local tpTask = nil
+local realtimeLbl = nil
 
 local function stopTpTask(silent)
     if tpTask then
         tpTask.running = false
         if tpTask.S then cleanupS(tpTask.S) end
         if tpTask.nocSv then restoreNoclipTransient(tpTask.nocSv) end
+        if tpTask.savedCol then restoreForcedNoclip(tpTask.savedCol) end
         if tpTask.conn then pcall(function() tpTask.conn:Disconnect() end) end
         tpTask = nil
+        if realtimeLbl then realtimeLbl.Text = "状态：空闲" end
         if not silent then notify("传送", "已停止", 1.5, Th.Sub) end
     end
+end
+
+-- v15: 瞬时切换到某目标（不做平滑，只硬 set）
+local function instantSwitchTo(uid, r, S)
+    local plr = Players:GetPlayerByUserId(uid)
+    if not plr or not isPlayerAlive(plr) then return false end
+    local tR = getPlayerRoot(plr)
+    if not tR then return false end
+    local dest, faceCF = computeDestAndFace(tR)
+    hardSet(r, S, dest, faceCF)
+    return true
 end
 
 local function startTpTask(uids)
@@ -1132,36 +1203,30 @@ local function startTpTask(uids)
     if not uids or #uids == 0 then
         notify("传送", "传送列表选中为空", 2, Th.Warn); return
     end
+    local savedCol = forceNoclipAll()
     local nocSv
     if St.noclip == "persistent" then applyNoclipPersistent()
     else nocSv = applyNoclipTransient() end
     tpTask = {
         running=true, mode=St.tpMode, uids=uids,
         idx=1, phase="moving", elapsed=0, stickyAcc=0,
-        S=nil, nocSv=nocSv, conn=nil,
+        switchCount=0, runTime=0, lastRateShow=0, lastSwitchCount=0,
+        S=nil, nocSv=nocSv, savedCol=savedCol, conn=nil,
     }
     local modeLabel = ({single="单次", sticky="粘滞", loop="循环"})[St.tpMode] or St.tpMode
-    notify("传送", string.format("[%s] 开始 · %d 目标 · 间隔%.2fs", modeLabel, #uids, St.interval), 2, Th.Ok)
+    notify("传送", string.format("[%s] 开始 · %d 目标 · 间隔%.3fs", modeLabel, #uids, St.interval), 2, Th.Ok)
+
+    -- v15: 高频模式阈值 0.05 秒
+    local highFreq = St.interval < 0.05
+
     tpTask.conn = RS.Heartbeat:Connect(function(dt)
         if dead or not tpTask or not tpTask.running then return end
         if #tpTask.uids == 0 then stopTpTask(true); notify("传送", "任务列表为空", 2, Th.Warn); return end
-        if tpTask.idx > #tpTask.uids then
-            if tpTask.mode == "loop" then
-                tpTask.idx = 1; tpTask.phase = "moving"; tpTask.elapsed = 0; tpTask.stickyAcc = 0
-            else
-                stopTpTask(true); notify("传送", "已完成", 2, Th.Ok); return
-            end
-        end
-        local uid = tpTask.uids[tpTask.idx]
-        local plr = Players:GetPlayerByUserId(uid)
-        if not plr or not isPlayerAlive(plr) then
-            tpTask.idx = tpTask.idx + 1
-            tpTask.phase = "moving"; tpTask.elapsed = 0; tpTask.stickyAcc = 0
-            if tpTask.S then cleanupS(tpTask.S); tpTask.S = nil end
-            return
-        end
+
         local r = getMyRoot()
         if not r then return end
+
+        -- 初始化 S
         if not tpTask.S or tpTask.S.r ~= r then
             if tpTask.S then cleanupS(tpTask.S) end
             tpTask.S = buildS(r)
@@ -1173,14 +1238,73 @@ local function startTpTask(uids)
             end
         end
         local S = tpTask.S
+
+        -- 时间累计
+        tpTask.elapsed = tpTask.elapsed + dt
+        tpTask.runTime = tpTask.runTime + dt
+
+        -- 检查是否要切换目标（可能一帧切多个）
+        -- 但每切一个都要瞬移到新目标
+        local maxIter = 240
+        while tpTask.elapsed >= St.interval and maxIter > 0 do
+            maxIter = maxIter - 1
+            tpTask.elapsed = tpTask.elapsed - St.interval
+            tpTask.idx = tpTask.idx + 1
+            tpTask.switchCount = tpTask.switchCount + 1
+
+            -- 边界检查 + 目标有效性检查
+            local guard = 0
+            local ok = true
+            while guard < #tpTask.uids + 1 do
+                guard = guard + 1
+                if tpTask.idx > #tpTask.uids then
+                    if tpTask.mode == "loop" then
+                        tpTask.idx = 1
+                    else
+                        stopTpTask(true); notify("传送", "已完成", 2, Th.Ok)
+                        ok = false
+                        break
+                    end
+                end
+                local uid = tpTask.uids[tpTask.idx]
+                local plr = Players:GetPlayerByUserId(uid)
+                if plr and isPlayerAlive(plr) then
+                    -- 有效目标，瞬移过去
+                    instantSwitchTo(uid, r, S)
+                    break
+                else
+                    -- 无效目标，继续下一个
+                    tpTask.idx = tpTask.idx + 1
+                end
+            end
+            if not ok then return end
+        end
+
+        if not tpTask or not tpTask.running then return end
+
+        -- 当前目标（如果没切换，则继续追当前目标）
+        if tpTask.idx > #tpTask.uids then
+            if tpTask.mode == "loop" then tpTask.idx = 1
+            else stopTpTask(true); notify("传送", "已完成", 2, Th.Ok); return end
+        end
+        local uid = tpTask.uids[tpTask.idx]
+        local plr = Players:GetPlayerByUserId(uid)
+        if not plr or not isPlayerAlive(plr) then
+            tpTask.idx = tpTask.idx + 1
+            tpTask.phase = "moving"
+            return
+        end
+
         local tR = getPlayerRoot(plr)
         if not tR then
-            tpTask.idx = tpTask.idx + 1; tpTask.phase = "moving"; tpTask.elapsed = 0; tpTask.stickyAcc = 0
+            tpTask.idx = tpTask.idx + 1
+            tpTask.phase = "moving"
             return
         end
         local dest, faceCF = computeDestAndFace(tR)
-        if tpTask.phase == "waiting" then
-            tpTask.elapsed = tpTask.elapsed + dt
+
+        -- 高频模式：不做平滑，只每帧钉住
+        if highFreq then
             if St.lockPos then
                 tpTask.stickyAcc = tpTask.stickyAcc + dt
                 local period = 1 / math.max(1, St.stickyRate)
@@ -1188,19 +1312,47 @@ local function startTpTask(uids)
                     tpTask.stickyAcc = tpTask.stickyAcc - period
                     hardSet(r, S, dest, faceCF)
                 end
+            else
+                -- 至少每帧调一次
+                if not tpTask.phase or tpTask.phase == "moving" then
+                    hardSet(r, S, dest, faceCF)
+                end
             end
-            if tpTask.elapsed >= St.interval then
-                tpTask.idx = tpTask.idx + 1
-                tpTask.phase = "moving"; tpTask.elapsed = 0; tpTask.stickyAcc = 0
+        else
+            -- 低频模式：走平滑引擎 + 钉住
+            if tpTask.phase == "moving" then
+                if St.bypass == "walk" and S.hum and S.hum.Parent then
+                    local ws = math.min(St.speed, 300)
+                    if S.hum.WalkSpeed < ws then S.hum.WalkSpeed = ws end
+                end
+                if engineStep(S, dest, dt, faceCF) then
+                    tpTask.phase = "waiting"
+                end
+            else
+                if St.lockPos then
+                    tpTask.stickyAcc = tpTask.stickyAcc + dt
+                    local period = 1 / math.max(1, St.stickyRate)
+                    while tpTask.stickyAcc >= period do
+                        tpTask.stickyAcc = tpTask.stickyAcc - period
+                        hardSet(r, S, dest, faceCF)
+                    end
+                end
             end
-            return
         end
-        if St.bypass == "walk" and S.hum and S.hum.Parent then
-            local ws = math.min(St.speed, 300)
-            if S.hum.WalkSpeed < ws then S.hum.WalkSpeed = ws end
+
+        -- 每帧刷新无重力（省性能：只在有 S.noGrav 时刷新）
+        if S.noGrav and S.noGrav.Parent then
+            refreshNoGravity(r, S.noGrav)
         end
-        if engineStep(S, dest, dt, faceCF) then
-            tpTask.phase = "waiting"; tpTask.elapsed = 0; tpTask.stickyAcc = 0
+
+        -- UI 实时显示（每 0.5 秒更新一次）
+        if realtimeLbl and (tpTask.runTime - tpTask.lastRateShow) >= 0.5 then
+            tpTask.lastRateShow = tpTask.runTime
+            local dCount = tpTask.switchCount - tpTask.lastSwitchCount
+            tpTask.lastSwitchCount = tpTask.switchCount
+            local rate = dCount * 2  -- 0.5 秒 × 2 = 每秒
+            realtimeLbl.Text = string.format("运行 %.1fs · 目标 #%d/%d · 切换 %d 次 · %.0f 次/s",
+                tpTask.runTime, tpTask.idx, #tpTask.uids, tpTask.switchCount, rate)
         end
     end)
 end
@@ -1490,7 +1642,7 @@ renderAllListFn = function()
             doTpFixed(plr); notify("传送", "→ "..plr.Name, 1.2, Th.Ok)
         end))
         trk(r.btnTpList.MouseButton1Click:Connect(function()
-            local ok = pcall(function()
+            pcall(function()
                 if inList(St.tpTargets, uid) then
                     removeFromList(St.tpTargets, uid); St.selTp[uid] = nil
                 else addToList(St.tpTargets, uid) end
@@ -1498,10 +1650,9 @@ renderAllListFn = function()
                 if renderTpListFn then renderTpListFn() end
                 upd()
             end)
-            if not ok then warn("[PlayerTpMgr] T 按钮失败") end
         end))
         trk(r.btnCamList.MouseButton1Click:Connect(function()
-            local ok = pcall(function()
+            pcall(function()
                 if inList(St.camList, uid) then
                     removeFromList(St.camList, uid); St.selCam[uid] = nil
                     if St.camCurrent == uid then setCamTarget(nil) end
@@ -1510,7 +1661,6 @@ renderAllListFn = function()
                 if renderCamListFn then renderCamListFn() end
                 upd()
             end)
-            if not ok then warn("[PlayerTpMgr] C 按钮失败") end
         end))
         allRows[uid] = r
     end
@@ -1613,8 +1763,8 @@ createBlock({
         local mBtns = {}
         local hintLbl = mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="", LayoutOrder=2, Parent=bd })
         local modeHint = {
-            single="单次：走到目标 → 钉住（间隔时间） → 下一个",
-            sticky="粘滞：走到目标 → 钉住（间隔时间） → 下一个",
+            single="单次：每个目标停留「列表间隔」秒 → 下一个",
+            sticky="粘滞：每个目标停留「列表间隔」秒 → 下一个",
             loop="循环：单次 + 走完回到第一个，重复",
         }
         local function paintModes()
@@ -1632,16 +1782,21 @@ createBlock({
             trk(b.MouseButton1Click:Connect(function() St.tpMode = m[1]; paintModes(); saveCfg() end))
         end
         paintModes()
+
+        -- 列表间隔
         local ivRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=3, Parent=bd })
         mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=ivRow })
         mk("TextLabel", { Size=UDim2.fromOffset(70,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="列表间隔", LayoutOrder=0, Parent=ivRow })
-        local ivBox = mk("TextBox", { Size=UDim2.new(1,-140,1,0), BackgroundColor3=Th.Bg, BorderSizePixel=0, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text=string.format("%.2f", St.interval), ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center, LayoutOrder=1, Parent=ivRow })
+        local ivBox = mk("TextBox", { Size=UDim2.new(1,-140,1,0), BackgroundColor3=Th.Bg, BorderSizePixel=0, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Th.Txt, Text=tostring(St.interval), ClearTextOnFocus=false, TextXAlignment=Enum.TextXAlignment.Center, LayoutOrder=1, Parent=ivRow })
         mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=ivBox })
         mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=ivBox })
-        mk("TextLabel", { Size=UDim2.fromOffset(70,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="秒/目标", LayoutOrder=2, Parent=ivRow })
+        mk("TextLabel", { Size=UDim2.fromOffset(70,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="秒 (≥0.005)", LayoutOrder=2, Parent=ivRow })
         trk(ivBox.FocusLost:Connect(function()
-            St.interval = clInterval(ivBox.Text); ivBox.Text = string.format("%.2f", St.interval); saveCfg()
+            St.interval = clInterval(ivBox.Text)
+            ivBox.Text = tostring(St.interval)
+            saveCfg()
         end))
+
         local srRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=4, Parent=bd })
         mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=srRow })
         mk("TextLabel", { Size=UDim2.fromOffset(70,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="同步频率", LayoutOrder=0, Parent=srRow })
@@ -1653,16 +1808,21 @@ createBlock({
             St.stickyRate = clRate(srBox.Text); srBox.Text = tostring(St.stickyRate); saveCfg()
         end))
 
-        -- 偏移（v13: 支持 ^ 前缀）
-        local offLabel = mk("TextLabel", {
+        -- 实时状态
+        realtimeLbl = mk("TextLabel", {
+            Size=UDim2.new(1,0,0,16), BackgroundTransparency=1, Font=Enum.Font.GothamBold,
+            TextSize=10, TextColor3=Th.Acc, TextXAlignment=Enum.TextXAlignment.Left,
+            Text="状态：空闲", LayoutOrder=5, Parent=bd,
+        })
+
+        mk("TextLabel", {
             Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham,
             TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left,
-            Text="偏移（在值前加 ^ 表示本地：^5 / ^-5）", LayoutOrder=5, Parent=bd,
+            Text="偏移（在值前加 ^ 表示本地：^5 / ^-5）", LayoutOrder=6, Parent=bd,
         })
-        local offRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=6, Parent=bd })
+        local offRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=7, Parent=bd })
         mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=offRow })
         mk("TextLabel", { Size=UDim2.fromOffset(38,1), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=11, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="偏移", LayoutOrder=0, Parent=offRow })
-        local offBoxes = {}
         for i, ax in ipairs({"x","y","z"}) do
             local bx = mk("TextBox", {
                 Size=UDim2.new(1/3,-14,1,0), BackgroundColor3=Th.Bg, BorderSizePixel=0,
@@ -1674,18 +1834,14 @@ createBlock({
             })
             mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=bx })
             mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=bx })
-            offBoxes[ax] = bx
             trk(bx.FocusLost:Connect(function()
-                -- v13: 保留字符串（含 ^ 前缀），仅做去空格
                 local raw = tostring(bx.Text or ""):gsub("^%s+", ""):gsub("%s+$", "")
                 if raw == "" then raw = "0" end
-                St.offset[ax] = raw
-                bx.Text = raw
-                saveCfg()
+                St.offset[ax] = raw; bx.Text = raw; saveCfg()
             end))
         end
 
-        local switchRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=7, Parent=bd })
+        local switchRow = mk("Frame", { Size=UDim2.new(1,0,0,26), BackgroundTransparency=1, LayoutOrder=8, Parent=bd })
         mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,4), Parent=switchRow })
         local locB = mk("TextButton", { Size=UDim2.new(0.5,-2,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text="", LayoutOrder=1, Parent=switchRow })
         mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=locB })
@@ -1705,13 +1861,14 @@ createBlock({
         end
         paintLock()
         trk(lockB.MouseButton1Click:Connect(function() St.lockPos = not St.lockPos; paintLock(); saveCfg() end))
+
         mk("TextLabel", {
             Size=UDim2.new(1,0,0,40), BackgroundTransparency=1, Font=Enum.Font.Gotham,
             TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left,
-            TextWrapped=true, LayoutOrder=8, Parent=bd,
-            Text="^5 = 本地前 5 · ^-5 = 本地后 5 · x=右, y=上, z=前\n任一轴带 ^ → 全部按本地坐标处理（覆盖全局开关）\n本地模式朝向 = 目标朝向（背对背）",
+            TextWrapped=true, LayoutOrder=9, Parent=bd,
+            Text="^5 = 本地前 5 · ^-5 = 本地后 5 · x=右, y=上, z=前\n任一轴带 ^ → 全部按本地坐标处理\n传送期间自动：无重力 + 穿墙 + 每帧清零速度",
         })
-        local actRow = mk("Frame", { Size=UDim2.new(1,0,0,30), BackgroundTransparency=1, LayoutOrder=9, Parent=bd })
+        local actRow = mk("Frame", { Size=UDim2.new(1,0,0,30), BackgroundTransparency=1, LayoutOrder=10, Parent=bd })
         mk("UIListLayout", { FillDirection=Enum.FillDirection.Horizontal, SortOrder=Enum.SortOrder.LayoutOrder, Padding=UDim.new(0,6), Parent=actRow })
         local startB = mk("TextButton", { Size=UDim2.new(0.5,-3,1,0), BackgroundColor3=Th.Acc, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=12, TextColor3=Color3.fromRGB(255,255,255), Text="传送选中", LayoutOrder=1, Parent=actRow })
         mk("UICorner", { CornerRadius=UDim.new(0,6), Parent=startB })
@@ -1753,16 +1910,12 @@ createBlock({
             local b = mk("TextButton", { Size=UDim2.new(1/3,-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text=txt, LayoutOrder=order, Parent=parent })
             mk("UICorner", { CornerRadius=UDim.new(0,5), Parent=b })
             mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
-            trk(b.MouseButton1Click:Connect(function()
-                pcall(function() fn(); refreshTpSel() end)
-            end))
+            trk(b.MouseButton1Click:Connect(function() pcall(function() fn(); refreshTpSel() end) end))
             return b
         end
         local rowA = btnRow(1)
         mkBtn(rowA, "全选", 1, function() for _, uid in ipairs(St.tpTargets) do St.selTp[uid] = true end end)
-        mkBtn(rowA, "反选", 2, function()
-            for _, uid in ipairs(St.tpTargets) do if St.selTp[uid] then St.selTp[uid] = nil else St.selTp[uid] = true end end
-        end)
+        mkBtn(rowA, "反选", 2, function() for _, uid in ipairs(St.tpTargets) do if St.selTp[uid] then St.selTp[uid] = nil else St.selTp[uid] = true end end end)
         mkBtn(rowA, "清空", 3, function() for k in pairs(St.selTp) do St.selTp[k] = nil end end)
         local rowB = btnRow(2)
         mkBtn(rowB, "选有效", 1, function()
@@ -1782,27 +1935,19 @@ createBlock({
         mkBtn(rowB, "取消选择", 3, function() for k in pairs(St.selTp) do St.selTp[k] = nil end end)
         local rowC = btnRow(3)
         mkBtn(rowC, "移出选中", 1, function()
-            local n = 0
             for _, uid in ipairs(collectSelUids(St.tpTargets, St.selTp)) do
-                removeFromList(St.tpTargets, uid); St.selTp[uid] = nil; n = n + 1
+                removeFromList(St.tpTargets, uid); St.selTp[uid] = nil
             end
-            if n > 0 then
-                saveCfg()
-                if renderTpListFn then renderTpListFn() end
-                for _, r in pairs(allRows) do if r._upd then r._upd() end end
-            end
+            saveCfg(); if renderTpListFn then renderTpListFn() end
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
         end)
         mkBtn(rowC, "移出无效", 2, function()
-            local n = 0
             for _, uid in ipairs(St.tpTargets) do
                 local plr = Players:GetPlayerByUserId(uid)
-                if not plr or not isPlayerAlive(plr) then removeFromList(St.tpTargets, uid); St.selTp[uid] = nil; n = n + 1 end
+                if not plr or not isPlayerAlive(plr) then removeFromList(St.tpTargets, uid); St.selTp[uid] = nil end
             end
-            if n > 0 then
-                saveCfg()
-                if renderTpListFn then renderTpListFn() end
-                for _, r in pairs(allRows) do if r._upd then r._upd() end end
-            end
+            saveCfg(); if renderTpListFn then renderTpListFn() end
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
         end)
         mk("TextButton", { Size=UDim2.new(1/3,-3,1,0), BackgroundTransparency=1, Text="", LayoutOrder=3, Parent=rowC })
         infoTpLbl = mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="", LayoutOrder=4, Parent=advP })
@@ -1827,8 +1972,7 @@ createBlock({
         mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=clrB })
         trk(clrB.MouseButton1Click:Connect(function()
             St.tpTargets = {}; St.selTp = {}; stopTpTask(true)
-            saveCfg()
-            if renderTpListFn then renderTpListFn() end
+            saveCfg(); if renderTpListFn then renderTpListFn() end
             for _, r in pairs(allRows) do if r._upd then r._upd() end end
         end))
     end,
@@ -1910,16 +2054,12 @@ createBlock({
             local b = mk("TextButton", { Size=UDim2.new(1/3,-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text=txt, LayoutOrder=order, Parent=parent })
             mk("UICorner", { CornerRadius=UDim.new(0,5), Parent=b })
             mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
-            trk(b.MouseButton1Click:Connect(function()
-                pcall(function() fn(); refreshCamSel() end)
-            end))
+            trk(b.MouseButton1Click:Connect(function() pcall(function() fn(); refreshCamSel() end) end))
             return b
         end
         local rowA = btnRow(1)
         mkBtn(rowA, "全选", 1, function() for _, uid in ipairs(St.camList) do St.selCam[uid] = true end end)
-        mkBtn(rowA, "反选", 2, function()
-            for _, uid in ipairs(St.camList) do if St.selCam[uid] then St.selCam[uid] = nil else St.selCam[uid] = true end end
-        end)
+        mkBtn(rowA, "反选", 2, function() for _, uid in ipairs(St.camList) do if St.selCam[uid] then St.selCam[uid] = nil else St.selCam[uid] = true end end end)
         mkBtn(rowA, "清空", 3, function() for k in pairs(St.selCam) do St.selCam[k] = nil end end)
         local rowB = btnRow(2)
         mkBtn(rowB, "选有效", 1, function()
@@ -1939,31 +2079,23 @@ createBlock({
         mkBtn(rowB, "取消选择", 3, function() for k in pairs(St.selCam) do St.selCam[k] = nil end end)
         local rowC = btnRow(3)
         mkBtn(rowC, "移出选中", 1, function()
-            local n = 0
             for _, uid in ipairs(collectSelUids(St.camList, St.selCam)) do
-                removeFromList(St.camList, uid); St.selCam[uid] = nil; n = n + 1
+                removeFromList(St.camList, uid); St.selCam[uid] = nil
                 if St.camCurrent == uid then setCamTarget(nil) end
             end
-            if n > 0 then
-                saveCfg()
-                if renderCamListFn then renderCamListFn() end
-                for _, r in pairs(allRows) do if r._upd then r._upd() end end
-            end
+            saveCfg(); if renderCamListFn then renderCamListFn() end
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
         end)
         mkBtn(rowC, "移出无效", 2, function()
-            local n = 0
             for _, uid in ipairs(St.camList) do
                 local plr = Players:GetPlayerByUserId(uid)
                 if not plr or not isPlayerAlive(plr) then
-                    removeFromList(St.camList, uid); St.selCam[uid] = nil; n = n + 1
+                    removeFromList(St.camList, uid); St.selCam[uid] = nil
                     if St.camCurrent == uid then setCamTarget(nil) end
                 end
             end
-            if n > 0 then
-                saveCfg()
-                if renderCamListFn then renderCamListFn() end
-                for _, r in pairs(allRows) do if r._upd then r._upd() end end
-            end
+            saveCfg(); if renderCamListFn then renderCamListFn() end
+            for _, r in pairs(allRows) do if r._upd then r._upd() end end
         end)
         mk("TextButton", { Size=UDim2.new(1/3,-3,1,0), BackgroundTransparency=1, Text="", LayoutOrder=3, Parent=rowC })
         infoCamLbl = mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="", LayoutOrder=4, Parent=advP })
@@ -1988,8 +2120,7 @@ createBlock({
         mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=clrB })
         trk(clrB.MouseButton1Click:Connect(function()
             St.camList = {}; St.selCam = {}; setCamTarget(nil)
-            saveCfg()
-            if renderCamListFn then renderCamListFn() end
+            saveCfg(); if renderCamListFn then renderCamListFn() end
             for _, r in pairs(allRows) do if r._upd then r._upd() end end
         end))
     end,
@@ -2021,9 +2152,7 @@ createBlock({
             local b = mk("TextButton", { Size=UDim2.new(w or (1/3),-3,1,0), BackgroundColor3=Th.Sur, BorderSizePixel=0, AutoButtonColor=true, Font=Enum.Font.GothamBold, TextSize=11, TextColor3=Th.Txt, Text=txt, LayoutOrder=order, Parent=parent })
             mk("UICorner", { CornerRadius=UDim.new(0,5), Parent=b })
             mk("UIStroke", { Color=Th.Str, Thickness=1, Parent=b })
-            trk(b.MouseButton1Click:Connect(function()
-                pcall(function() fn(); refreshAllSel() end)
-            end))
+            trk(b.MouseButton1Click:Connect(function() pcall(function() fn(); refreshAllSel() end) end))
             return b
         end
         local rowA = btnRow(1)
@@ -2053,28 +2182,24 @@ createBlock({
         mkBtn(rowB, "取消选择", 3, function() for k in pairs(St.selAll) do St.selAll[k] = nil end end)
         local rowC = btnRow(3)
         mkBtn(rowC, "选中→传送", 1, function()
-            local n = 0
             for _, plr in ipairs(Players:GetPlayers()) do
                 if plr ~= LP and St.selAll[plr.UserId] and not inList(St.tpTargets, plr.UserId) then
-                    addToList(St.tpTargets, plr.UserId); n = n + 1
+                    addToList(St.tpTargets, plr.UserId)
                 end
             end
             saveCfg()
             if renderTpListFn then renderTpListFn() end
             for _, r in pairs(allRows) do if r._upd then r._upd() end end
-            notify("传送列表", string.format("加入 %d 个", n), 1.5, Th.Ok)
         end, 0.5)
         mkBtn(rowC, "选中→摄像机", 2, function()
-            local n = 0
             for _, plr in ipairs(Players:GetPlayers()) do
                 if plr ~= LP and St.selAll[plr.UserId] and not inList(St.camList, plr.UserId) then
-                    addToList(St.camList, plr.UserId); n = n + 1
+                    addToList(St.camList, plr.UserId)
                 end
             end
             saveCfg()
             if renderCamListFn then renderCamListFn() end
             for _, r in pairs(allRows) do if r._upd then r._upd() end end
-            notify("摄像机列表", string.format("加入 %d 个", n), 1.5, Th.Ok)
         end, 0.5)
         infoAllLbl = mk("TextLabel", { Size=UDim2.new(1,0,0,14), BackgroundTransparency=1, Font=Enum.Font.Gotham, TextSize=10, TextColor3=Th.Sub, TextXAlignment=Enum.TextXAlignment.Left, Text="", LayoutOrder=4, Parent=advP })
         local advOpen = false
