@@ -1,45 +1,37 @@
 --!nonstrict
 --[[
-	EggMaster V19
+	EggMaster V19.1
 	放置位置：autoexec 或 StarterPlayerScripts
 
-	V19 修复：
-	  · 拖拽位置持久化（customPanelX/Y）
-	  · 紧急模式按稀有度阈值接入
-	  · flashEntries 定期 GC
-	  · 增量监听蛋缓存（不再全量扫描）
-	  · 篮子查找三重容错
-	  · UI 位置切换重置拖拽状态
-	  · 悬浮文字开关
-	  · 紧急稀有度阈值可调
-
-EggMaster V19 —— 简明说明
+	V19.1 修复：
+	  · 拖拽漂移：改用 UserInputService:GetMouseLocation() 屏幕坐标
+	  · 拖动开始即归零 AnchorPoint，全程无误差
+	  · 屏幕边界限制
+	  · 保存绝对坐标到配置，重启位置不变
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 【功能】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 一、自动偷蛋
-  自动检测 RenderedEggs 里所有公共蛋，按价值从高到低偷。
-  偷蛋用三路齐发：InputHoldBegin + fireproximityprompt + 模拟 E 键。
-  每次偷蛋前先 BasketDrop 放下手上的蛋。
+自动检测 RenderedEggs 里所有公共蛋，按价值从高到低偷。
+偷蛋用三路齐发：InputHoldBegin + fireproximityprompt + 模拟 E 键。
+每次偷蛋前先 BasketDrop 放下手上的蛋。
 
 二、双模式
-  偷蛋模式：偷到蛋 → 传送回自己篮子 → BasketDrop 放下。
-  送蛋模式：偷到蛋 → 传送到目标玩家篮子 → BasketDrop 放下。
+偷蛋模式：偷到蛋 → 传送回自己篮子 → BasketDrop 放下。
+送蛋模式：偷到蛋 → 传送到目标玩家篮子 → BasketDrop 放下。
 
 三、光柱 + 悬浮文字
-  勾选的蛋上方生成光柱，颜色随稀有度（普通/稀有/史诗/传奇/神话/神/超越）。
-  稀有及以上还显示悬浮文字：蛋名 + 稀有度 + 估值。
-  光柱和文字都穿透渲染，隔墙可见。
-  悬浮文字可单独开关。
+勾选的蛋上方生成光柱，颜色随稀有度（7 档）。
+稀有及以上显示悬浮文字：蛋名 + 稀有度 + 估值。
+光柱和文字都穿透渲染，隔墙可见。悬浮文字可单独开关。
 
 四、安全区
-  家附近半径内的蛋自动跳过。
-  形状支持圆形 / 方形，半径手调。
+家附近半径内的蛋自动跳过，支持圆形/方形切换。
 
 五、树木处理
-  隐藏 / 删除 树、灌木、叶子等干扰物。
+隐藏 / 删除 树、灌木、叶子等干扰物。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 【特点】
@@ -50,9 +42,9 @@ EggMaster V19 —— 简明说明
 · 光柱/文字穿透渲染，隔墙可见
 · UI 挂在 gethui，游戏清不掉
 · 配置持久化到文件，重启不丢
-· 拖拽后的面板位置也持久化
+· 拖拽后的面板位置也持久化（★ V19.1 修复漂移）
 · 增量监听蛋缓存，性能更好
-· flashEntries 定期 GC，无内存泄漏
+· flashEntries 每 10 秒 GC，无内存泄漏
 · 紧急模式按稀有度阈值触发
 · 篮子查找三重容错，兼容游戏更新
 
@@ -60,75 +52,80 @@ EggMaster V19 —— 简明说明
 【UI】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-面板包含 8 个可折叠卡片：
+8 个可折叠卡片：
 
-  ▼ 状态              - 光柱/蛋数量、当前状态
-  ▼ 模式              - 偷蛋/送蛋切换 + 玩家列表
-  ▼ 启动              - 开始/停止自动偷蛋
-  ▼ 光柱筛选          - 7种稀有度勾选 + 光柱开关 + 悬浮文字开关
-  ▼ 偷蛋筛选          - 7种稀有度勾选
-  ▼ 安全区            - 圆形/方形 + 半径
-  ▼ 速度 / 紧急模式   - 传送速度 + 紧急模式 + 紧急稀有度阈值
-  ▼ 树木处理          - 关/隐藏/删除
+▼ 状态 - 光柱/蛋数量、当前状态
+▼ 模式 - 偷蛋/送蛋切换 + 玩家列表
+▼ 启动 - 开始/停止自动偷蛋
+▼ 光柱筛选 - 7种稀有度勾选 + 光柱开关 + 悬浮文字开关
+▼ 偷蛋筛选 - 7种稀有度勾选
+▼ 安全区 - 圆形/方形 + 半径
+▼ 速度 / 紧急模式 - 传送速度 + 紧急模式 + 紧急稀有度阈值
+▼ 树木处理 - 关/隐藏/删除
 
 顶部按钮：
-  ⌗  切换面板位置（居中 / 四角 / 自定义拖拽）
-  −  最小化整个面板
+⌗ 切换面板位置（居中 / 四角 / 自定义拖拽）
+− 最小化整个面板
 
-拖动标题栏可自由移动，位置自动保存。
+拖动标题栏可自由移动，位置自动保存。★ V19.1 后不再漂移。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 【用法】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 放置位置（三选一）：
-  1. autoexec 目录 → 游戏启动自动执行
-  2. StarterPlayerScripts → LocalScript
-  3. 执行器手动执行
+
+autoexec 目录 → 游戏启动自动执行
+
+StarterPlayerScripts → LocalScript
+
+执行器手动执行
 
 使用步骤：
-  1. 执行脚本
-  2. 勾选想偷的稀有度（偷蛋筛选卡片）
-  3. 勾选想看光柱的稀有度（光柱筛选卡片）
-  4. 点"显示光柱：开"
-  5. （可选）点"悬浮文字：开/关"
-  6. 选择模式：偷蛋 / 送蛋
-     送蛋模式还要在玩家列表里选目标
-  7. 点"开始自动偷蛋"
+
+执行脚本
+
+勾选想偷的稀有度（偷蛋筛选卡片）
+
+勾选想看光柱的稀有度（光柱筛选卡片）
+
+点"显示光柱：开"
+
+（可选）点"悬浮文字：开/关"
+
+选择模式：偷蛋 / 送蛋
+送蛋模式还要在玩家列表里选目标
+
+点"开始自动偷蛋"
 
 调参建议：
-  传送速度        默认 2000，可调到 6000 更快
-  紧急模式        开启后 ≥指定稀有度的蛋用 EMERGENCY_SPEED 速度
-  紧急稀有度阈值  默认"神"，可调成"传奇"、"超越"等
-  安全区半径      默认 150，家附近不想被偷就调大
+传送速度 默认 2000，可调到 6000 更快
+紧急模式 开启后 ≥指定稀有度的蛋用 EMERGENCY_SPEED 速度
+紧急稀有度阈值 默认"神"，可调成"传奇"、"超越"等
+安全区半径 默认 150，家附近不想被偷就调大
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-【日志速查】
+【V19.1 相对 V19 的修复】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-启动后 Console 打印：
+拖拽 UI 时往上漂移的问题：
 
-  [EggMaster V19] 启动...
-  [EggMaster] EggPickup: true  BasketDrop: true
-  [EggMaster V19] 加载完成
+原因：input.Position（GUI 坐标）和 panel.AbsolutePosition（屏幕坐标）
+坐标系不同，差 36px 顶栏高度，混用会导致每次漂移。
 
-如果 EggPickup 或 BasketDrop 是 false，脚本无法工作。
+修复：
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-【V19 相比 V16 的改动】
-━━━━━━━━━━━━━━━━━━━━━━━━━━
+统一用 UserInputService:GetMouseLocation()（屏幕坐标）
 
-1. 拖拽面板位置持久化，重启后保持在原位置
-2. 紧急模式真正接入，按稀有度阈值切换速度
-3. flashEntries 每 10 秒 GC 一次，避免内存泄漏
-4. 蛋缓存改为增量监听，性能大幅提升
-5. 篮子查找三重容错（属性 / Data.Owner / plot.Name）
-6. UI 位置切换重置拖拽状态，避免坐标冲突
-7. 新增悬浮文字开关
-8. 新增紧急稀有度阈值按钮（7 选 1）
+拖动开始时就归零 AnchorPoint，读 AbsolutePosition 作为基准
+
+全程只用 Offset 计算，无 Scale/Offset 混算
+
+加入屏幕边界 clamp，避免拖出屏幕外
+
 ]]
 
-print("[EggMaster V19] 启动...")
+print("[EggMaster V19.1] 启动...")
 
 local Players              = game:GetService("Players")
 local RunService           = game:GetService("RunService")
@@ -204,8 +201,8 @@ local FLASH_GC_INTERVAL = 10.0
 local TRANSPORT_SPEED = 2000
 local EMERGENCY_SPEED = 10000
 local EMERGENCY_ENABLED = false
-local emergencyRarityMin = "God"    -- 紧急模式起始稀有度
-local showEggLabels = true          -- 悬浮文字开关
+local emergencyRarityMin = "God"
+local showEggLabels = true
 
 local treeMode = "off"
 local mode = "steal"
@@ -431,9 +428,9 @@ local function getEggInteractPoint(egg)
 end
 
 --=====================================================
--- ★ V19：增量监听蛋缓存
+-- 增量蛋缓存
 --=====================================================
-local eggModelCache = {}   -- [Model] = true
+local eggModelCache = {}
 
 local function addEggToCache(inst)
 	if eggModelCache[inst] then return end
@@ -446,7 +443,6 @@ local function removeEggFromCache(inst)
 	eggModelCache[inst] = nil
 end
 
--- 初始化缓存
 do
 	local root = workspace:FindFirstChild("RenderedEggs")
 	if root then
@@ -470,7 +466,6 @@ do
 	end
 end
 
--- 新加入 RenderedEggs 时（比如整个 RenderedEggs 被替换）
 workspace.DescendantAdded:Connect(function(d)
 	if d.Name == "RenderedEggs" then
 		task.wait(0.1)
@@ -492,7 +487,6 @@ workspace.DescendantAdded:Connect(function(d)
 	end
 end)
 
--- 从缓存收集蛋（O(n) 但 n = 当前有效蛋数量）
 local function collectEggs()
 	local list = {}
 	local toRemove = {}
@@ -500,7 +494,6 @@ local function collectEggs()
 		if not model.Parent then
 			toRemove[#toRemove + 1] = model
 		else
-			-- 检查嵌套（避免同一个蛋被重复加入）
 			local nested = false
 			local p = model.Parent
 			while p and p.Name ~= "RenderedEggs" do
@@ -535,22 +528,19 @@ local function collectEggs()
 end
 
 --=====================================================
--- 篮子查找（三重容错）
+-- 篮子查找
 --=====================================================
 local function findPlayerPlot(plr)
 	local plots = workspace:FindFirstChild("Plots")
 	if not plots then return nil end
 	for _, plot in ipairs(plots:GetChildren()) do
-		-- 方式 1：OwnerUserId 属性
 		local owner = plot:GetAttribute("OwnerUserId")
 		if owner and owner == plr.UserId then return plot end
-		-- 方式 2：Data.Owner.Value
 		local data = plot:FindFirstChild("Data")
 		if data then
 			local ownerName = data:FindFirstChild("Owner")
 			if ownerName and ownerName.Value == plr.Name then return plot end
 		end
-		-- 方式 3：plot.Name 含玩家名
 		if plot.Name:find(plr.Name, 1, true) then return plot end
 	end
 	return nil
@@ -673,7 +663,6 @@ local function createPillar(egg)
 	hl.Adornee = pillar
 	hl.Parent = pillar
 
-	-- ★ V19：悬浮文字开关 + 非普通才显示
 	if showEggLabels and egg.rarity ~= "Common" then
 		local bb = Instance.new("BillboardGui")
 		bb.Name = "PillarLabel"
@@ -764,7 +753,6 @@ task.spawn(function()
 	end
 end)
 
--- 闪烁循环
 task.spawn(function()
 	while true do
 		local t = tick()
@@ -800,7 +788,6 @@ task.spawn(function()
 	end
 end)
 
--- ★ V19：定期 GC flashEntries
 task.spawn(function()
 	while true do
 		task.wait(FLASH_GC_INTERVAL)
@@ -901,7 +888,7 @@ local function restoreAllTrees()
 end
 
 --=====================================================
--- 自动农场
+-- 自动农场核心
 --=====================================================
 local autoActive = false
 local autoStatus = "空闲"
@@ -946,7 +933,6 @@ RunService.Heartbeat:Connect(function(dt)
 
 	local cur = hrp.Position
 
-	-- ★ V19：只有真正卡住才回滚
 	if lastSetPos then
 		local disc = (cur - lastSetPos).Magnitude
 		if disc > 50 then
@@ -1083,7 +1069,6 @@ local function goHome()
 	task.wait(0.5)
 end
 
--- ★ V19：紧急模式接入
 local function speedForEgg(egg)
 	if EMERGENCY_ENABLED then
 		local eggIdx = table.find(RARITY_ORDER, egg.rarity)
@@ -1141,7 +1126,6 @@ local function startAuto()
 
 					local point = getEggInteractPoint(egg)
 					if point then
-						-- ★ V19：按稀有度选择速度
 						local spd = speedForEgg(egg)
 						travelTo(point, spd, 4)
 						task.wait(0.2)
@@ -1183,7 +1167,7 @@ local PANEL_W = 340
 local PANEL_H = 520
 
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "EggMasterUI_V19"
+screenGui.Name = "EggMasterUI_V19_1"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = true
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -1245,7 +1229,7 @@ title.BackgroundTransparency = 1
 title.Position = UDim2.new(0, 12, 0, 0)
 title.Size = UDim2.new(1, -120, 1, 0)
 title.Font = Enum.Font.GothamBold
-title.Text = "EggMaster V19"
+title.Text = "EggMaster V19.1"
 title.TextColor3 = Color3.fromRGB(240, 242, 248)
 title.TextSize = 15
 title.TextXAlignment = Enum.TextXAlignment.Left
@@ -1318,7 +1302,6 @@ for i, opt in ipairs(posOptions) do
 		panelPos = opt.key
 		customPanelX = nil
 		customPanelY = nil
-		-- ★ V19：重置拖拽状态
 		isDragging = false
 		applyPanelPos()
 		posMenu.Visible = false
@@ -1623,7 +1606,6 @@ pillarToggleBtn.LayoutOrder = 1
 pillarToggleBtn.Parent = pillarBody
 Instance.new("UICorner", pillarToggleBtn).CornerRadius = UDim.new(0, 5)
 
--- ★ V19：悬浮文字开关
 local labelToggleBtn = Instance.new("TextButton")
 labelToggleBtn.Size = UDim2.new(1, 0, 0, 26)
 labelToggleBtn.BorderSizePixel = 0
@@ -1648,7 +1630,6 @@ updateLabelToggle()
 labelToggleBtn.MouseButton1Click:Connect(function()
 	showEggLabels = not showEggLabels
 	updateLabelToggle()
-	-- 重建所有光柱以应用开关
 	if pillarActive then
 		clearPillars()
 		syncPillars()
@@ -1833,7 +1814,7 @@ zoneSizeBox.FocusLost:Connect(function()
 	zoneSizeBox.Text = tostring(zoneSize)
 end)
 
--- 速度 + 紧急模式
+-- 速度 / 紧急模式
 local speedCard, speedBody = makeCard("速度 / 紧急模式")
 
 local speedRow = Instance.new("Frame")
@@ -1925,7 +1906,6 @@ emergBtn.MouseButton1Click:Connect(function()
 	saveAll()
 end)
 
--- ★ V19：紧急稀有度阈值
 local emergThreshLbl = Instance.new("TextLabel")
 emergThreshLbl.BackgroundTransparency = 1
 emergThreshLbl.Size = UDim2.new(1, 0, 0, 14)
@@ -2053,48 +2033,59 @@ end
 updateTreeBtn()
 
 --=====================================================
--- 拖动 + 持久化
+-- ★ V19.1 拖动 + 持久化（修复漂移）
 --=====================================================
 isDragging = false
 do
-	local dragStart, startPos
-	local function begin(input)
+	local dragStartMouse, startAbsX, startAbsY
+
+	local function begin()
 		isDragging = true
-		dragStart = Vector2.new(input.Position.X, input.Position.Y)
-		startPos = panel.Position
+		local absPos = panel.AbsolutePosition
+		panel.AnchorPoint = Vector2.new(0, 0)
+		panel.Position = UDim2.fromOffset(absPos.X, absPos.Y)
+		dragStartMouse = UserInputService:GetMouseLocation()
+		startAbsX = absPos.X
+		startAbsY = absPos.Y
 	end
-	local function update(input)
+
+	local function update()
 		if not isDragging then return end
-		local cur = Vector2.new(input.Position.X, input.Position.Y)
-		local delta = cur - dragStart
-		panel.Position = UDim2.new(
-			startPos.X.Scale, startPos.X.Offset + delta.X,
-			startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		local cur = UserInputService:GetMouseLocation()
+		local dx = cur.X - dragStartMouse.X
+		local dy = cur.Y - dragStartMouse.Y
+
+		local nx = startAbsX + dx
+		local ny = startAbsY + dy
+		nx = math.clamp(nx, 0, viewport.X - PANEL_W)
+		ny = math.clamp(ny, 0, viewport.Y - 40)
+
+		panel.Position = UDim2.fromOffset(nx, ny)
 	end
+
 	local function finish()
 		if not isDragging then return end
 		isDragging = false
-		-- ★ V19：保存拖拽后的绝对位置
-		local absPos = panel.AbsolutePosition
-		customPanelX = math.floor(absPos.X)
-		customPanelY = math.floor(absPos.Y)
+		customPanelX = math.floor(panel.Position.X.Offset)
+		customPanelY = math.floor(panel.Position.Y.Offset)
 		panelPos = "custom"
-		panel.AnchorPoint = Vector2.new(0, 0)
-		panel.Position = UDim2.fromOffset(customPanelX, customPanelY)
 		saveAll()
 	end
+
 	titleBar.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1
 		or input.UserInputType == Enum.UserInputType.Touch then
-			begin(input)
+			begin()
 		end
 	end)
+
 	UserInputService.InputChanged:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseMovement
 		or input.UserInputType == Enum.UserInputType.Touch then
-			update(input)
+			update()
 		end
 	end)
+
 	UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1
 		or input.UserInputType == Enum.UserInputType.Touch then
@@ -2128,4 +2119,4 @@ task.spawn(function()
 	end
 end)
 
-print("[EggMaster V19] 加载完成")
+print("[EggMaster V19.1] 加载完成")
