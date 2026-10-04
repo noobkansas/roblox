@@ -3,14 +3,14 @@
 	EggMaster V18
 	放置位置：autoexec 或 StarterPlayerScripts
 
-	V16 修复：
+	V18 修复：
 	  · 修复 Line 836 语法错误（单行 return 拆分）
 	  · 悬浮文字：MaxDistance 改 5000（100000 会被引擎裁掉）
 	  · 光柱 + 文字穿墙（Highlight AlwaysOnTop + Billboard AlwaysOnTop）
 	  · 假蛋过滤三重保险
 	  · UI 卡片折叠 + 位置切换 + 双模式
 ]]
---[[EggMaster V16 —— 简明说明
+--[[EggMaster V18 —— 简明说明
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 【功能】
@@ -95,15 +95,6 @@
   紧急模式        开启后 ≥1B 的蛋用 EMERGENCY_SPEED 速度
   安全区半径      默认 150，家附近不想被偷就调大
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-【日志速查】
-━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-启动后 Console 会打印：
-
-  [EggMaster V16] 启动...
-  [EggMaster] EggPickup: true  BasketDrop: true   ← 两个 Remote 是否找到
-  [EggMaster V16] 加载完成
 
 如果 EggPickup 或 BasketDrop 是 false，脚本无法工作，
 检查游戏版本或 Remote 路径。]]
