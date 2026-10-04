@@ -1,16 +1,19 @@
 --!nonstrict
 --[[
-	EggMaster V18
+	EggMaster V19
 	放置位置：autoexec 或 StarterPlayerScripts
 
-	V18 修复：
-	  · 修复 Line 836 语法错误（单行 return 拆分）
-	  · 悬浮文字：MaxDistance 改 5000（100000 会被引擎裁掉）
-	  · 光柱 + 文字穿墙（Highlight AlwaysOnTop + Billboard AlwaysOnTop）
-	  · 假蛋过滤三重保险
-	  · UI 卡片折叠 + 位置切换 + 双模式
-]]
---[[EggMaster V18 —— 简明说明
+	V19 修复：
+	  · 拖拽位置持久化（customPanelX/Y）
+	  · 紧急模式按稀有度阈值接入
+	  · flashEntries 定期 GC
+	  · 增量监听蛋缓存（不再全量扫描）
+	  · 篮子查找三重容错
+	  · UI 位置切换重置拖拽状态
+	  · 悬浮文字开关
+	  · 紧急稀有度阈值可调
+
+EggMaster V19 —— 简明说明
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 【功能】
@@ -19,20 +22,21 @@
 一、自动偷蛋
   自动检测 RenderedEggs 里所有公共蛋，按价值从高到低偷。
   偷蛋用三路齐发：InputHoldBegin + fireproximityprompt + 模拟 E 键。
-  每次偷蛋前先 BasketDrop 放下手上的蛋，避免"手上有蛋无法偷"。
+  每次偷蛋前先 BasketDrop 放下手上的蛋。
 
 二、双模式
   偷蛋模式：偷到蛋 → 传送回自己篮子 → BasketDrop 放下。
   送蛋模式：偷到蛋 → 传送到目标玩家篮子 → BasketDrop 放下。
 
 三、光柱 + 悬浮文字
-  每个勾选的蛋上方生成一根光柱，颜色随稀有度。
+  勾选的蛋上方生成光柱，颜色随稀有度（普通/稀有/史诗/传奇/神话/神/超越）。
   稀有及以上还显示悬浮文字：蛋名 + 稀有度 + 估值。
   光柱和文字都穿透渲染，隔墙可见。
+  悬浮文字可单独开关。
 
 四、安全区
-  家附近设定半径内的蛋自动跳过，避免误偷自家蛋。
-  形状支持圆形 / 方形。
+  家附近半径内的蛋自动跳过。
+  形状支持圆形 / 方形，半径手调。
 
 五、树木处理
   隐藏 / 删除 树、灌木、叶子等干扰物。
@@ -41,15 +45,16 @@
 【特点】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-· 假蛋过滤三重保险：排除角色内 / 只在 RenderedEggs / Prompt 必须 Enabled
-· 传送用 Prompt.WorldPosition 精确定位，不再飞到光柱顶端
-· 偷蛋 100% 成功率（实测 8/8）
-· 光柱/文字穿透渲染，隔墙超远可见
-· 所有 UI 挂在 gethui，游戏清不掉
+· 假蛋过滤三重保险（角色内排除 / 只在 RenderedEggs / Prompt 必须 Enabled）
+· 传送用 Prompt.WorldPosition 精确定位
+· 光柱/文字穿透渲染，隔墙可见
+· UI 挂在 gethui，游戏清不掉
 · 配置持久化到文件，重启不丢
-· 悬浮文字 MaxDistance = 5000，性能友好
-· 队伍切换实时变色
-· 玩家重生自动重建
+· 拖拽后的面板位置也持久化
+· 增量监听蛋缓存，性能更好
+· flashEntries 定期 GC，无内存泄漏
+· 紧急模式按稀有度阈值触发
+· 篮子查找三重容错，兼容游戏更新
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 【UI】
@@ -57,20 +62,20 @@
 
 面板包含 8 个可折叠卡片：
 
-  ▼ 状态          - 光柱/蛋数量、当前状态
-  ▼ 模式          - 偷蛋模式 / 送蛋模式切换 + 玩家列表
-  ▼ 启动          - 开始 / 停止自动偷蛋
-  ▼ 光柱筛选      - 7 种稀有度勾选 + 显示开关
-  ▼ 偷蛋筛选      - 7 种稀有度勾选
-  ▼ 安全区        - 圆形/方形 + 半径
-  ▼ 速度          - 传送速度 + 紧急模式
-  ▼ 树木处理      - 关/隐藏/删除 三选一
+  ▼ 状态              - 光柱/蛋数量、当前状态
+  ▼ 模式              - 偷蛋/送蛋切换 + 玩家列表
+  ▼ 启动              - 开始/停止自动偷蛋
+  ▼ 光柱筛选          - 7种稀有度勾选 + 光柱开关 + 悬浮文字开关
+  ▼ 偷蛋筛选          - 7种稀有度勾选
+  ▼ 安全区            - 圆形/方形 + 半径
+  ▼ 速度 / 紧急模式   - 传送速度 + 紧急模式 + 紧急稀有度阈值
+  ▼ 树木处理          - 关/隐藏/删除
 
-顶部两个按钮：
-  ⌗  切换面板位置（居中 / 四角）
+顶部按钮：
+  ⌗  切换面板位置（居中 / 四角 / 自定义拖拽）
   −  最小化整个面板
 
-拖动标题栏可自由移动位置。
+拖动标题栏可自由移动，位置自动保存。
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 【用法】
@@ -83,27 +88,51 @@
 
 使用步骤：
   1. 执行脚本
-  2. 勾选想偷的稀有度（偷蛋筛选）
-  3. 勾选想看光柱的稀有度（光柱筛选）
+  2. 勾选想偷的稀有度（偷蛋筛选卡片）
+  3. 勾选想看光柱的稀有度（光柱筛选卡片）
   4. 点"显示光柱：开"
-  5. 选择模式（偷蛋 / 送蛋）
-     送蛋模式还要在玩家列表选一个目标
-  6. 点"开始自动偷蛋"
+  5. （可选）点"悬浮文字：开/关"
+  6. 选择模式：偷蛋 / 送蛋
+     送蛋模式还要在玩家列表里选目标
+  7. 点"开始自动偷蛋"
 
 调参建议：
-  传送速度        2000 → 6000（更快）
-  紧急模式        开启后 ≥1B 的蛋用 EMERGENCY_SPEED 速度
+  传送速度        默认 2000，可调到 6000 更快
+  紧急模式        开启后 ≥指定稀有度的蛋用 EMERGENCY_SPEED 速度
+  紧急稀有度阈值  默认"神"，可调成"传奇"、"超越"等
   安全区半径      默认 150，家附近不想被偷就调大
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+【日志速查】
+━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-如果 EggPickup 或 BasketDrop 是 false，脚本无法工作，
-检查游戏版本或 Remote 路径。]]
-print("[EggMaster V16] 启动...")
+启动后 Console 打印：
+
+  [EggMaster V19] 启动...
+  [EggMaster] EggPickup: true  BasketDrop: true
+  [EggMaster V19] 加载完成
+
+如果 EggPickup 或 BasketDrop 是 false，脚本无法工作。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+【V19 相比 V16 的改动】
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. 拖拽面板位置持久化，重启后保持在原位置
+2. 紧急模式真正接入，按稀有度阈值切换速度
+3. flashEntries 每 10 秒 GC 一次，避免内存泄漏
+4. 蛋缓存改为增量监听，性能大幅提升
+5. 篮子查找三重容错（属性 / Data.Owner / plot.Name）
+6. UI 位置切换重置拖拽状态，避免坐标冲突
+7. 新增悬浮文字开关
+8. 新增紧急稀有度阈值按钮（7 选 1）
+]]
+
+print("[EggMaster V19] 启动...")
 
 local Players              = game:GetService("Players")
 local RunService           = game:GetService("RunService")
 local UserInputService     = game:GetService("UserInputService")
-local TweenService         = game:GetService("TweenService")
 local ReplicatedStorage    = game:GetService("ReplicatedStorage")
 local VirtualInputManager  = game:GetService("VirtualInputManager")
 local HttpService          = game:GetService("HttpService")
@@ -157,31 +186,35 @@ end
 local PILLAR_NAME = "EggPillar"
 local PILLAR_GAP = 5
 local KEYWORDS = { "egg", "蛋" }
-local FAKE_KEYWORDS = { "tracker", "npc", "dummy", "player", "character",
-	"fake", "ghost", "visual", "preview", "pillar", "masterpillar" }
-local IGNORE_PART_NAMES = { ["handle"] = true, ["eggbase"] = true, ["mutationhitbox"] = true }
+local FAKE_KEYWORDS = {
+	"tracker", "npc", "dummy", "player", "character",
+	"fake", "ghost", "visual", "preview", "pillar", "masterpillar",
+}
 
 local ARRIVE_DISTANCE = 5
 local HOME_TIMEOUT = 8.0
-
 local TREE_KEYWORDS = { "tree", "树", "bush", "leaf", "branch", "log", "trunk" }
 local TREE_SKIP = { "terrain" }
-
 local PILLAR_REFRESH_INTERVAL = 0.7
-local PILLAR_MOVE_EPS = 30
+local FLASH_GC_INTERVAL = 10.0
 
+--=====================================================
+-- 运行时配置
+--=====================================================
 local TRANSPORT_SPEED = 2000
 local EMERGENCY_SPEED = 10000
 local EMERGENCY_ENABLED = false
-local AUTO_ACCEL_THRESH = 1e9
+local emergencyRarityMin = "God"    -- 紧急模式起始稀有度
+local showEggLabels = true          -- 悬浮文字开关
 
--- 运行时配置
 local treeMode = "off"
 local mode = "steal"
 local targetPlayerName = nil
 local zoneShape = "circle"
 local zoneSize = 150
 local panelPos = "center"
+local customPanelX = nil
+local customPanelY = nil
 
 local RARITY_ORDER = { "Common", "Rare", "Epic", "Legendary", "Mythic", "God", "Beyond" }
 local pillarEnabled = {}
@@ -202,8 +235,12 @@ if savedConfig then
 	if type(savedConfig.emergencyEnabled) == "boolean" then
 		EMERGENCY_ENABLED = savedConfig.emergencyEnabled
 	end
-	if type(savedConfig.autoAccelEnabled) == "boolean" then
-		AUTO_ACCEL_THRESH = savedConfig.autoAccelEnabled and 1e9 or math.huge
+	if type(savedConfig.emergencyRarityMin) == "string"
+		and table.find(RARITY_ORDER, savedConfig.emergencyRarityMin) then
+		emergencyRarityMin = savedConfig.emergencyRarityMin
+	end
+	if type(savedConfig.showEggLabels) == "boolean" then
+		showEggLabels = savedConfig.showEggLabels
 	end
 	if type(savedConfig.pillarEnabled) == "table" then
 		for _, n in ipairs(RARITY_ORDER) do
@@ -227,6 +264,8 @@ if savedConfig then
 	if type(savedConfig.zoneShape) == "string" then zoneShape = savedConfig.zoneShape end
 	if type(savedConfig.zoneSize) == "number" then zoneSize = savedConfig.zoneSize end
 	if type(savedConfig.panelPos) == "string" then panelPos = savedConfig.panelPos end
+	if type(savedConfig.customPanelX) == "number" then customPanelX = savedConfig.customPanelX end
+	if type(savedConfig.customPanelY) == "number" then customPanelY = savedConfig.customPanelY end
 end
 
 local function saveAll()
@@ -234,7 +273,8 @@ local function saveAll()
 		transportSpeed = TRANSPORT_SPEED,
 		emergencySpeed = EMERGENCY_SPEED,
 		emergencyEnabled = EMERGENCY_ENABLED,
-		autoAccelEnabled = (AUTO_ACCEL_THRESH < math.huge),
+		emergencyRarityMin = emergencyRarityMin,
+		showEggLabels = showEggLabels,
 		pillarEnabled = pillarEnabled,
 		stealEnabled = stealEnabled,
 		treeMode = treeMode,
@@ -243,6 +283,8 @@ local function saveAll()
 		zoneShape = zoneShape,
 		zoneSize = zoneSize,
 		panelPos = panelPos,
+		customPanelX = customPanelX,
+		customPanelY = customPanelY,
 	})
 end
 
@@ -317,7 +359,7 @@ end
 print("[EggMaster] EggPickup:", EggPickup ~= nil, " BasketDrop:", BasketDrop ~= nil)
 
 --=====================================================
--- 工具函数
+-- 工具
 --=====================================================
 local function nameHas(name, list)
 	local lower = string.lower(name)
@@ -344,16 +386,12 @@ local function isRealEgg(inst)
 	if not renderedRoot then return false end
 	if not inst:IsDescendantOf(renderedRoot) then return false end
 
-	local hasValidPrompt = false
 	for _, d in ipairs(inst:GetDescendants()) do
-		if d:IsA("ProximityPrompt") and d.Enabled then
-			if d.MaxActivationDistance > 0 then
-				hasValidPrompt = true
-				break
-			end
+		if d:IsA("ProximityPrompt") and d.Enabled and d.MaxActivationDistance > 0 then
+			return true
 		end
 	end
-	return hasValidPrompt
+	return false
 end
 
 local function findPrompt(model)
@@ -392,52 +430,128 @@ local function getEggInteractPoint(egg)
 	return nil
 end
 
+--=====================================================
+-- ★ V19：增量监听蛋缓存
+--=====================================================
+local eggModelCache = {}   -- [Model] = true
+
+local function addEggToCache(inst)
+	if eggModelCache[inst] then return end
+	if isRealEgg(inst) then
+		eggModelCache[inst] = true
+	end
+end
+
+local function removeEggFromCache(inst)
+	eggModelCache[inst] = nil
+end
+
+-- 初始化缓存
+do
+	local root = workspace:FindFirstChild("RenderedEggs")
+	if root then
+		for _, d in ipairs(root:GetDescendants()) do
+			if d:IsA("Model") and isRealEgg(d) then
+				eggModelCache[d] = true
+			end
+		end
+		root.DescendantAdded:Connect(function(d)
+			if d:IsA("Model") then
+				task.defer(function()
+					if d.Parent then addEggToCache(d) end
+				end)
+			end
+		end)
+		root.DescendantRemoving:Connect(function(d)
+			if d:IsA("Model") then
+				removeEggFromCache(d)
+			end
+		end)
+	end
+end
+
+-- 新加入 RenderedEggs 时（比如整个 RenderedEggs 被替换）
+workspace.DescendantAdded:Connect(function(d)
+	if d.Name == "RenderedEggs" then
+		task.wait(0.1)
+		for _, dd in ipairs(d:GetDescendants()) do
+			if dd:IsA("Model") and isRealEgg(dd) then
+				eggModelCache[dd] = true
+			end
+		end
+		d.DescendantAdded:Connect(function(x)
+			if x:IsA("Model") then
+				task.defer(function()
+					if x.Parent then addEggToCache(x) end
+				end)
+			end
+		end)
+		d.DescendantRemoving:Connect(function(x)
+			if x:IsA("Model") then removeEggFromCache(x) end
+		end)
+	end
+end)
+
+-- 从缓存收集蛋（O(n) 但 n = 当前有效蛋数量）
 local function collectEggs()
 	local list = {}
-	local root = workspace:FindFirstChild("RenderedEggs")
-	if not root then return list end
-	for _, d in ipairs(root:GetDescendants()) do
-		if isRealEgg(d) then
+	local toRemove = {}
+	for model in pairs(eggModelCache) do
+		if not model.Parent then
+			toRemove[#toRemove + 1] = model
+		else
+			-- 检查嵌套（避免同一个蛋被重复加入）
 			local nested = false
-			local p = d.Parent
-			while p and p ~= root do
-				if isRealEgg(p) then
+			local p = model.Parent
+			while p and p.Name ~= "RenderedEggs" do
+				if eggModelCache[p] then
 					nested = true
 					break
 				end
 				p = p.Parent
 			end
 			if not nested then
-				local part = findMainPart(d)
+				local part = findMainPart(model)
 				if part then
-					local prompt = findPrompt(d)
-					local value = evalEggValue(d)
-					list[#list + 1] = {
-						model = d,
-						pivot = part,
-						value = value,
-						rarity = classifyValue(value),
-						prompt = prompt,
-					}
+					local prompt = findPrompt(model)
+					if prompt then
+						local value = evalEggValue(model)
+						list[#list + 1] = {
+							model = model,
+							pivot = part,
+							value = value,
+							rarity = classifyValue(value),
+							prompt = prompt,
+						}
+					end
 				end
 			end
 		end
+	end
+	for _, m in ipairs(toRemove) do
+		eggModelCache[m] = nil
 	end
 	return list
 end
 
 --=====================================================
--- 篮子查找
+-- 篮子查找（三重容错）
 --=====================================================
 local function findPlayerPlot(plr)
 	local plots = workspace:FindFirstChild("Plots")
 	if not plots then return nil end
 	for _, plot in ipairs(plots:GetChildren()) do
+		-- 方式 1：OwnerUserId 属性
 		local owner = plot:GetAttribute("OwnerUserId")
 		if owner and owner == plr.UserId then return plot end
+		-- 方式 2：Data.Owner.Value
 		local data = plot:FindFirstChild("Data")
-		local ownerName = data and data:FindFirstChild("Owner")
-		if ownerName and ownerName.Value == plr.Name then return plot end
+		if data then
+			local ownerName = data:FindFirstChild("Owner")
+			if ownerName and ownerName.Value == plr.Name then return plot end
+		end
+		-- 方式 3：plot.Name 含玩家名
+		if plot.Name:find(plr.Name, 1, true) then return plot end
 	end
 	return nil
 end
@@ -445,7 +559,7 @@ end
 local function findBasketForPlayer(plr)
 	local plot = findPlayerPlot(plr)
 	if not plot then return nil end
-	local candidates = { "Basket", "EggBasket", "Float", "EggSlot", "BasketPoint" }
+	local candidates = { "Basket", "EggBasket", "Float", "EggSlot", "BasketPoint", "EggBag" }
 	for _, name in ipairs(candidates) do
 		local b = plot:FindFirstChild(name, true)
 		if b and b:IsA("BasePart") then return b end
@@ -486,7 +600,7 @@ local function isInSafeZone(pos)
 end
 
 --=====================================================
--- 光柱（★ V16：确保文字显示 + 穿墙）
+-- 光柱
 --=====================================================
 local pillarModel = Instance.new("Model")
 pillarModel.Name = "EggMasterPillars"
@@ -505,7 +619,6 @@ local function createPillar(egg)
 
 	local rule = RARITIES[egg.rarity]
 
-	-- 定位中心
 	local centerPos
 	if egg.prompt then
 		local ok, wp = pcall(function() return egg.prompt.WorldPosition end)
@@ -523,12 +636,10 @@ local function createPillar(egg)
 		end
 	end
 
-	-- 光柱顶部位置
 	local baseY = centerPos.Y + PILLAR_GAP
 	local centerY = baseY + rule.height * 0.5
 	local pos = Vector3.new(centerPos.X, centerY, centerPos.Z)
 
-	-- 光柱本体
 	local pillar = Instance.new("Part")
 	pillar.Name = PILLAR_NAME
 	pillar.Anchored = true
@@ -545,7 +656,6 @@ local function createPillar(egg)
 	pillar.CFrame = CFrame.new(pos)
 	pillar.Parent = pillarModel
 
-	-- 光
 	local light = Instance.new("PointLight")
 	light.Color = rule.color
 	light.Brightness = 4 + math.min(rule.height / 300, 4)
@@ -553,7 +663,6 @@ local function createPillar(egg)
 	light.Shadows = false
 	light.Parent = pillar
 
-	-- ★ 穿墙：Highlight AlwaysOnTop
 	local hl = Instance.new("Highlight")
 	hl.Name = "PillarPerspective"
 	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
@@ -564,20 +673,18 @@ local function createPillar(egg)
 	hl.Adornee = pillar
 	hl.Parent = pillar
 
-	-- ★ 悬浮文字：除 Common 外都显示
-	if egg.rarity ~= "Common" then
+	-- ★ V19：悬浮文字开关 + 非普通才显示
+	if showEggLabels and egg.rarity ~= "Common" then
 		local bb = Instance.new("BillboardGui")
 		bb.Name = "PillarLabel"
 		bb.Size = UDim2.fromOffset(220, 70)
 		bb.AlwaysOnTop = true
 		bb.LightInfluence = 0
-		bb.MaxDistance = 5000        -- ★ V16：100000 → 5000
+		bb.MaxDistance = 5000
 		bb.Adornee = pillar
-		-- ★ V16：放光柱顶端，用 StudsOffsetWorldSpace
 		bb.StudsOffsetWorldSpace = Vector3.new(0, rule.height * 0.5 + 8, 0)
 		bb.Parent = pillar
 
-		-- 蛋名（上）
 		local nameLbl = Instance.new("TextLabel")
 		nameLbl.Name = "NameLabel"
 		nameLbl.BackgroundTransparency = 1
@@ -591,7 +698,6 @@ local function createPillar(egg)
 		nameLbl.TextScaled = true
 		nameLbl.Parent = bb
 
-		-- 稀有度 + 数值（下）
 		local valLbl = Instance.new("TextLabel")
 		valLbl.Name = "ValueLabel"
 		valLbl.BackgroundTransparency = 1
@@ -636,7 +742,7 @@ end
 
 local function syncPillars()
 	for m in pairs(modelToPillar) do
-		if not m.Parent or not isRealEgg(m) then
+		if not m.Parent or not eggModelCache[m] then
 			removePillar(m)
 		end
 	end
@@ -658,7 +764,7 @@ task.spawn(function()
 	end
 end)
 
--- 闪烁 / 变色循环
+-- 闪烁循环
 task.spawn(function()
 	while true do
 		local t = tick()
@@ -694,6 +800,22 @@ task.spawn(function()
 	end
 end)
 
+-- ★ V19：定期 GC flashEntries
+task.spawn(function()
+	while true do
+		task.wait(FLASH_GC_INTERVAL)
+		local toRemove = {}
+		for pillar in pairs(flashEntries) do
+			if not pillar or not pillar.Parent then
+				toRemove[#toRemove + 1] = pillar
+			end
+		end
+		for _, p in ipairs(toRemove) do
+			flashEntries[p] = nil
+		end
+	end
+end)
+
 --=====================================================
 -- 树木
 --=====================================================
@@ -707,9 +829,7 @@ local TREE_HIDE_RULES = {
 local function isTreeInstance(inst)
 	if not nameHas(inst.Name, TREE_KEYWORDS) then return false end
 	if nameHas(inst.Name, TREE_SKIP) then return false end
-	if localPlayer.Character and inst:IsDescendantOf(localPlayer.Character) then
-		return false
-	end
+	if localPlayer.Character and inst:IsDescendantOf(localPlayer.Character) then return false end
 	return true
 end
 
@@ -781,7 +901,7 @@ local function restoreAllTrees()
 end
 
 --=====================================================
--- 自动农场核心
+-- 自动农场
 --=====================================================
 local autoActive = false
 local autoStatus = "空闲"
@@ -826,6 +946,7 @@ RunService.Heartbeat:Connect(function(dt)
 
 	local cur = hrp.Position
 
+	-- ★ V19：只有真正卡住才回滚
 	if lastSetPos then
 		local disc = (cur - lastSetPos).Magnitude
 		if disc > 50 then
@@ -893,17 +1014,14 @@ local function travelTo(targetPos, speed, timeout)
 	return "timeout"
 end
 
--- 三路齐发偷蛋
 local function tryGrab(egg)
 	if not egg.prompt or not egg.prompt.Parent then return false end
 	local prompt = egg.prompt
 
 	pcall(function() prompt:InputHoldBegin() end)
-
 	if typeof(fireproximityprompt) == "function" then
 		pcall(function() fireproximityprompt(prompt) end)
 	end
-
 	pcall(function()
 		VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
 	end)
@@ -965,6 +1083,18 @@ local function goHome()
 	task.wait(0.5)
 end
 
+-- ★ V19：紧急模式接入
+local function speedForEgg(egg)
+	if EMERGENCY_ENABLED then
+		local eggIdx = table.find(RARITY_ORDER, egg.rarity)
+		local minIdx = table.find(RARITY_ORDER, emergencyRarityMin)
+		if eggIdx and minIdx and eggIdx >= minIdx then
+			return EMERGENCY_SPEED
+		end
+	end
+	return TRANSPORT_SPEED
+end
+
 local function startAuto()
 	if autoActive then return end
 	if mode == "deliver" and not targetPlayerName then
@@ -1011,7 +1141,9 @@ local function startAuto()
 
 					local point = getEggInteractPoint(egg)
 					if point then
-						travelTo(point, EMERGENCY_SPEED, 4)
+						-- ★ V19：按稀有度选择速度
+						local spd = speedForEgg(egg)
+						travelTo(point, spd, 4)
 						task.wait(0.2)
 
 						if tryGrab(egg) then
@@ -1048,10 +1180,10 @@ end
 local cam = workspace.CurrentCamera
 local viewport = cam and cam.ViewportSize or Vector2.new(1920, 1080)
 local PANEL_W = 340
-local PANEL_H = 500
+local PANEL_H = 520
 
 local screenGui = Instance.new("ScreenGui")
-screenGui.Name = "EggMasterUI_V16"
+screenGui.Name = "EggMasterUI_V19"
 screenGui.ResetOnSpawn = false
 screenGui.IgnoreGuiInset = true
 screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -1084,21 +1216,24 @@ pStroke.Thickness = 1
 pStroke.Parent = panel
 
 local function applyPanelPos()
-	local pos = {
+	if panelPos == "custom" and customPanelX and customPanelY then
+		panel.AnchorPoint = Vector2.new(0, 0)
+		panel.Position = UDim2.fromOffset(customPanelX, customPanelY)
+		return
+	end
+	local preset = {
 		center = {0.5, 0.5, 0, 0},
 		tl = {0, 0, 12, 12},
 		tr = {1, 0, -12, 12},
 		bl = {0, 1, 12, -12},
 		br = {1, 1, -12, -12},
 	}
-	local p = pos[panelPos]
-	if not p then p = pos.center end
+	local p = preset[panelPos] or preset.center
 	panel.AnchorPoint = Vector2.new(p[1], p[2])
 	panel.Position = UDim2.new(p[1], p[3], p[2], p[4])
 end
 applyPanelPos()
 
--- 标题栏
 local titleBar = Instance.new("Frame")
 titleBar.Name = "TitleBar"
 titleBar.BackgroundTransparency = 1
@@ -1110,7 +1245,7 @@ title.BackgroundTransparency = 1
 title.Position = UDim2.new(0, 12, 0, 0)
 title.Size = UDim2.new(1, -120, 1, 0)
 title.Font = Enum.Font.GothamBold
-title.Text = "EggMaster V16"
+title.Text = "EggMaster V19"
 title.TextColor3 = Color3.fromRGB(240, 242, 248)
 title.TextSize = 15
 title.TextXAlignment = Enum.TextXAlignment.Left
@@ -1181,6 +1316,10 @@ for i, opt in ipairs(posOptions) do
 	posMenuBtns[opt.key] = btn
 	btn.MouseButton1Click:Connect(function()
 		panelPos = opt.key
+		customPanelX = nil
+		customPanelY = nil
+		-- ★ V19：重置拖拽状态
+		isDragging = false
 		applyPanelPos()
 		posMenu.Visible = false
 		for k, b in pairs(posMenuBtns) do
@@ -1201,7 +1340,7 @@ posBtn.MouseButton1Click:Connect(function()
 	posMenu.Visible = not posMenu.Visible
 end)
 
--- 内容区
+-- 内容
 local content = Instance.new("ScrollingFrame")
 content.Name = "Content"
 content.Position = UDim2.new(0, 0, 0, 40)
@@ -1278,7 +1417,12 @@ local function makeCard(titleText)
 	return card, body, header
 end
 
--- 状态卡片
+local function contrastText(c)
+	local lum = 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
+	return lum > 0.55 and Color3.fromRGB(20,20,20) or Color3.fromRGB(255,255,255)
+end
+
+-- 状态
 local statusCard, statusBody = makeCard("状态")
 local statsLbl = Instance.new("TextLabel")
 statsLbl.BackgroundTransparency = 1
@@ -1305,7 +1449,7 @@ autoStatusLbl.TextWrapped = true
 autoStatusLbl.LayoutOrder = 2
 autoStatusLbl.Parent = statusBody
 
--- 模式卡片
+-- 模式
 local modeCard, modeBody = makeCard("模式")
 
 local modeRow = Instance.new("Frame")
@@ -1376,9 +1520,7 @@ plsPad.PaddingBottom = UDim.new(0, 4)
 
 local function rebuildPlayerList()
 	for _, c in ipairs(playerListScroll:GetChildren()) do
-		if c:IsA("TextButton") then
-			c:Destroy()
-		end
+		if c:IsA("TextButton") then c:Destroy() end
 	end
 	local count = 0
 	for _, plr in ipairs(Players:GetPlayers()) do
@@ -1436,7 +1578,7 @@ deliverModeBtn.MouseButton1Click:Connect(function()
 end)
 updateModeUI()
 
--- 启动卡片
+-- 启动
 local startCard, startBody = makeCard("启动")
 local autoBtn = Instance.new("TextButton")
 autoBtn.Size = UDim2.new(1, 0, 0, 34)
@@ -1467,7 +1609,7 @@ autoBtn.MouseButton1Click:Connect(function()
 	end
 end)
 
--- 光柱筛选
+-- 光柱
 local pillarCard, pillarBody = makeCard("光柱筛选")
 local pillarToggleBtn = Instance.new("TextButton")
 pillarToggleBtn.Size = UDim2.new(1, 0, 0, 28)
@@ -1481,20 +1623,48 @@ pillarToggleBtn.LayoutOrder = 1
 pillarToggleBtn.Parent = pillarBody
 Instance.new("UICorner", pillarToggleBtn).CornerRadius = UDim.new(0, 5)
 
+-- ★ V19：悬浮文字开关
+local labelToggleBtn = Instance.new("TextButton")
+labelToggleBtn.Size = UDim2.new(1, 0, 0, 26)
+labelToggleBtn.BorderSizePixel = 0
+labelToggleBtn.Font = Enum.Font.GothamMedium
+labelToggleBtn.TextSize = 11
+labelToggleBtn.TextColor3 = Color3.new(1, 1, 1)
+labelToggleBtn.LayoutOrder = 2
+labelToggleBtn.Parent = pillarBody
+Instance.new("UICorner", labelToggleBtn).CornerRadius = UDim.new(0, 5)
+
+local function updateLabelToggle()
+	if showEggLabels then
+		labelToggleBtn.Text = "悬浮文字：开"
+		labelToggleBtn.BackgroundColor3 = Color3.fromRGB(80, 160, 100)
+	else
+		labelToggleBtn.Text = "悬浮文字：关"
+		labelToggleBtn.BackgroundColor3 = Color3.fromRGB(42, 45, 54)
+	end
+end
+updateLabelToggle()
+
+labelToggleBtn.MouseButton1Click:Connect(function()
+	showEggLabels = not showEggLabels
+	updateLabelToggle()
+	-- 重建所有光柱以应用开关
+	if pillarActive then
+		clearPillars()
+		syncPillars()
+	end
+	saveAll()
+end)
+
 local pillarHolder = Instance.new("Frame")
 pillarHolder.BackgroundTransparency = 1
 pillarHolder.Size = UDim2.new(1, 0, 0, 56)
-pillarHolder.LayoutOrder = 2
+pillarHolder.LayoutOrder = 3
 pillarHolder.Parent = pillarBody
 local pillarGrid = Instance.new("UIGridLayout", pillarHolder)
 pillarGrid.CellSize = UDim2.new(0.25, -3, 0, 24)
 pillarGrid.CellPadding = UDim2.new(0, 4, 0, 4)
 pillarGrid.SortOrder = Enum.SortOrder.LayoutOrder
-
-local function contrastText(c)
-	local lum = 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
-	return lum > 0.55 and Color3.fromRGB(20,20,20) or Color3.fromRGB(255,255,255)
-end
 
 for i, r in ipairs(RARITY_ORDER) do
 	local btn = Instance.new("TextButton")
@@ -1663,8 +1833,8 @@ zoneSizeBox.FocusLost:Connect(function()
 	zoneSizeBox.Text = tostring(zoneSize)
 end)
 
--- 速度卡片
-local speedCard, speedBody = makeCard("速度")
+-- 速度 + 紧急模式
+local speedCard, speedBody = makeCard("速度 / 紧急模式")
 
 local speedRow = Instance.new("Frame")
 speedRow.BackgroundTransparency = 1
@@ -1741,10 +1911,10 @@ end)
 
 local function updateEmergUI()
 	if EMERGENCY_ENABLED then
-		emergBtn.Text = "紧急模式：开"
+		emergBtn.Text = "紧急：开"
 		emergBtn.BackgroundColor3 = Color3.fromRGB(200, 130, 40)
 	else
-		emergBtn.Text = "紧急模式：关"
+		emergBtn.Text = "紧急：关"
 		emergBtn.BackgroundColor3 = Color3.fromRGB(42, 45, 54)
 	end
 end
@@ -1755,7 +1925,65 @@ emergBtn.MouseButton1Click:Connect(function()
 	saveAll()
 end)
 
--- 树木卡片
+-- ★ V19：紧急稀有度阈值
+local emergThreshLbl = Instance.new("TextLabel")
+emergThreshLbl.BackgroundTransparency = 1
+emergThreshLbl.Size = UDim2.new(1, 0, 0, 14)
+emergThreshLbl.Font = Enum.Font.Gotham
+emergThreshLbl.Text = "紧急速度起始稀有度："
+emergThreshLbl.TextColor3 = Color3.fromRGB(180, 185, 200)
+emergThreshLbl.TextSize = 11
+emergThreshLbl.TextXAlignment = Enum.TextXAlignment.Left
+emergThreshLbl.LayoutOrder = 3
+emergThreshLbl.Parent = speedBody
+
+local emergThreshHolder = Instance.new("Frame")
+emergThreshHolder.BackgroundTransparency = 1
+emergThreshHolder.Size = UDim2.new(1, 0, 0, 56)
+emergThreshHolder.LayoutOrder = 4
+emergThreshHolder.Parent = speedBody
+local emergThreshGrid = Instance.new("UIGridLayout", emergThreshHolder)
+emergThreshGrid.CellSize = UDim2.new(0.25, -3, 0, 24)
+emergThreshGrid.CellPadding = UDim2.new(0, 4, 0, 4)
+emergThreshGrid.SortOrder = Enum.SortOrder.LayoutOrder
+
+local emergThreshBtns = {}
+for i, r in ipairs(RARITY_ORDER) do
+	local btn = Instance.new("TextButton")
+	btn.BorderSizePixel = 0
+	btn.Font = Enum.Font.GothamMedium
+	btn.Text = RARITIES[r].label
+	btn.TextSize = 11
+	btn.Parent = emergThreshHolder
+	btn.LayoutOrder = i
+	Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 5)
+	emergThreshBtns[r] = btn
+	local function update()
+		if emergencyRarityMin == r then
+			btn.BackgroundColor3 = Color3.fromRGB(200, 130, 40)
+			btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+		else
+			btn.BackgroundColor3 = Color3.fromRGB(42, 45, 54)
+			btn.TextColor3 = Color3.fromRGB(180, 185, 200)
+		end
+	end
+	update()
+	btn.MouseButton1Click:Connect(function()
+		emergencyRarityMin = r
+		for k, b in pairs(emergThreshBtns) do
+			if k == r then
+				b.BackgroundColor3 = Color3.fromRGB(200, 130, 40)
+				b.TextColor3 = Color3.fromRGB(255, 255, 255)
+			else
+				b.BackgroundColor3 = Color3.fromRGB(42, 45, 54)
+				b.TextColor3 = Color3.fromRGB(180, 185, 200)
+			end
+		end
+		saveAll()
+	end)
+end
+
+-- 树木
 local treeCard, treeBody = makeCard("树木处理")
 
 local treeRow = Instance.new("Frame")
@@ -1776,7 +2004,10 @@ local function updateTreeBtn()
 		local color = Color3.fromRGB(42, 45, 54)
 		if treeMode == k then
 			for _, m in ipairs(TREE_MODES) do
-				if m.key == k then color = m.color break end
+				if m.key == k then
+					color = m.color
+					break
+				end
 			end
 		end
 		b.BackgroundColor3 = color
@@ -1821,16 +2052,19 @@ for i, m in ipairs(TREE_MODES) do
 end
 updateTreeBtn()
 
--- 拖动
+--=====================================================
+-- 拖动 + 持久化
+--=====================================================
+isDragging = false
 do
-	local dragging, dragStart, startPos
+	local dragStart, startPos
 	local function begin(input)
-		dragging = true
+		isDragging = true
 		dragStart = Vector2.new(input.Position.X, input.Position.Y)
 		startPos = panel.Position
 	end
 	local function update(input)
-		if not dragging then return end
+		if not isDragging then return end
 		local cur = Vector2.new(input.Position.X, input.Position.Y)
 		local delta = cur - dragStart
 		panel.Position = UDim2.new(
@@ -1838,8 +2072,16 @@ do
 			startPos.Y.Scale, startPos.Y.Offset + delta.Y)
 	end
 	local function finish()
-		dragging = false
+		if not isDragging then return end
+		isDragging = false
+		-- ★ V19：保存拖拽后的绝对位置
+		local absPos = panel.AbsolutePosition
+		customPanelX = math.floor(absPos.X)
+		customPanelY = math.floor(absPos.Y)
 		panelPos = "custom"
+		panel.AnchorPoint = Vector2.new(0, 0)
+		panel.Position = UDim2.fromOffset(customPanelX, customPanelY)
+		saveAll()
 	end
 	titleBar.InputBegan:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1
@@ -1870,7 +2112,9 @@ minBtn.MouseButton1Click:Connect(function()
 	minBtn.Text = minimized and "+" or "−"
 end)
 
+--=====================================================
 -- 统计循环
+--=====================================================
 task.spawn(function()
 	while true do
 		local pillars = 0
@@ -1884,4 +2128,4 @@ task.spawn(function()
 	end
 end)
 
-print("[EggMaster V18] 加载完成")
+print("[EggMaster V19] 加载完成")
