@@ -1893,4 +1893,4 @@ task.spawn(function()
 	end
 end)
 
-print("[EggMaster V16] 加载完成")
+print("[EggMaster V18] 加载完成")
