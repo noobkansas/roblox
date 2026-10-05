@@ -1,10 +1,13 @@
 --!nonstrict
--- 肌肉之王自动化 v20
--- 新增：并行多包训练模式（可选）
+-- 肌肉之王自动化 v21
+-- 移除：网络优化、并行发包
+-- 新增：好友白名单（杀戮 / 肌肉之王竞争均生效）
 
 local SCRIPT_ID   = "__MUSCLE_KING_AUTO__"
-local VERSION     = 2000
+local VERSION     = 2100
 local CONFIG_FILE = "muscle_king_auto_config.json"
+-- __VERSION__ = 2100
+-- __CHANGELOG__ = "新增：好友白名单（不打好友，也不打好友中的肌肉之王） / 移除：网络优化、并行发包"
 
 do
     local existing = _G[SCRIPT_ID]
@@ -88,6 +91,9 @@ local State = {
     killScanAt = 0, killTarget = nil, killLastAttack = 0,
     killSavedState = nil, toolOwnedByKill = false,
 
+    -- 好友白名单（杀戮 / kingKill 生效）
+    friendWhitelist = false,
+
     autoKingKill = false, kingKillThreshold = 20,
     kingKillTarget = nil, kingKillLastAttack = 0,
     kingKillActive = false, lastKingCheck = 0,
@@ -104,18 +110,6 @@ local State = {
     hideUIEnabled = false,
     infoWindowEnabled = false,
     formatEnabled = true,
-
-    netOptMode = 0,
-
-    -- ★ v20：并行多包
-    parallelPackets = false,   -- 开关
-    parallelThreads = 4,       -- 并行线程数（1~16）
-    parallelBurst = 32,        -- 每线程每帧最多发多少个包（1~500）
-    parallelStats = {          -- 实时统计
-        sent = 0,
-        cycles = 0,
-        lastReport = 0,
-    },
 
     petRepBonus = 0, petRepBonusCheckedAt = 0, petRepBonusDetail = {},
 
@@ -137,6 +131,68 @@ local State = {
     lastPingCheck = 0,
 }
 
+-- ============================================================
+-- 好友白名单
+-- ============================================================
+local FriendWhitelist = {
+    ids = {},           -- userId -> true
+    loaded = false,
+    count = 0,
+    lastRefresh = 0,
+    refreshing = false,
+    refreshInterval = 300,  -- 5 分钟
+}
+
+local function refreshFriendList()
+    if FriendWhitelist.refreshing then return end
+    FriendWhitelist.refreshing = true
+    task.spawn(function()
+        local newIds = {}
+        local success = false
+
+        -- 方式1：GetFriendsAsync（分页拉取全部好友）
+        local ok1 = pcall(function()
+            local pages = LocalPlayer:GetFriendsAsync()
+            while pages do
+                for _, item in ipairs(pages:GetCurrentPage()) do
+                    if item.Id then newIds[item.Id] = true end
+                end
+                if pages.IsFinished then break end
+                pages:AdvanceToNextPageAsync()
+            end
+        end)
+        if ok1 then success = true end
+
+        -- 方式2：GetFriendsOnline（补充当前在线的好友）
+        local ok2 = pcall(function()
+            local online = LocalPlayer:GetFriendsOnline(200)
+            for _, f in ipairs(online) do
+                if f.VisitorId then newIds[f.VisitorId] = true end
+            end
+        end)
+        if ok2 then success = true end
+
+        if success then
+            FriendWhitelist.ids = newIds
+            FriendWhitelist.loaded = true
+            local n = 0
+            for _ in pairs(newIds) do n = n + 1 end
+            FriendWhitelist.count = n
+            FriendWhitelist.lastRefresh = tick()
+        end
+
+        FriendWhitelist.refreshing = false
+    end)
+end
+
+local function isFriend(plr)
+    if not plr or not plr.UserId then return false end
+    return FriendWhitelist.ids[plr.UserId] == true
+end
+
+-- ============================================================
+-- 反复速度缓存（乘法模型）
+-- ============================================================
 local RepCache = {
     pet = 0, ult = 0, x2 = false,
     petTimeMul = 1, ultTimeMul = 1, passMul = 1,
@@ -210,6 +266,7 @@ local function saveConfig()
         toolDumbbell = State.toolDumbbell, toolPushups = State.toolPushups,
         toolHandstands = State.toolHandstands, toolSitups = State.toolSitups,
         killThreshold = State.killThreshold, dualEnabled = State.dualEnabled,
+        friendWhitelist = State.friendWhitelist,
         autoKingKill = State.autoKingKill, kingKillThreshold = State.kingKillThreshold,
         adaptiveEnabled = State.adaptiveEnabled, adaptiveThreshold = State.adaptiveThreshold,
         antiLagEnabled = State.antiLagEnabled,
@@ -219,10 +276,6 @@ local function saveConfig()
         hideUIEnabled = State.hideUIEnabled,
         infoWindowEnabled = State.infoWindowEnabled,
         formatEnabled = State.formatEnabled,
-        netOptMode = State.netOptMode,
-        parallelPackets = State.parallelPackets,
-        parallelThreads = State.parallelThreads,
-        parallelBurst = State.parallelBurst,
         uiHeightRatio = State.uiHeightRatio,
         infoHeightRatio = State.infoHeightRatio,
     }
@@ -265,6 +318,7 @@ local function loadConfig()
     State.toolSitups = bool("toolSitups", State.toolSitups)
     State.killThreshold = num("killThreshold", State.killThreshold, 1, 100)
     State.dualEnabled = bool("dualEnabled", State.dualEnabled)
+    State.friendWhitelist = bool("friendWhitelist", State.friendWhitelist)
     State.autoKingKill = bool("autoKingKill", State.autoKingKill)
     State.kingKillThreshold = num("kingKillThreshold", State.kingKillThreshold, 1, 1000)
     State.adaptiveEnabled = bool("adaptiveEnabled", State.adaptiveEnabled)
@@ -279,16 +333,12 @@ local function loadConfig()
     State.hideUIEnabled = bool("hideUIEnabled", State.hideUIEnabled)
     State.infoWindowEnabled = bool("infoWindowEnabled", State.infoWindowEnabled)
     State.formatEnabled = bool("formatEnabled", State.formatEnabled)
-    State.netOptMode = num("netOptMode", State.netOptMode, 0, 2)
-    State.parallelPackets = bool("parallelPackets", State.parallelPackets)
-    State.parallelThreads = num("parallelThreads", State.parallelThreads, 1, 16)
-    State.parallelBurst = num("parallelBurst", State.parallelBurst, 1, 500)
     State.uiHeightRatio = fnum("uiHeightRatio", State.uiHeightRatio, 0.2, 0.9)
     State.infoHeightRatio = fnum("infoHeightRatio", State.infoHeightRatio, 0.15, 0.7)
 end
 
 -- ============================================================
--- 反复速度（乘法模型）
+-- 反复速度检测
 -- ============================================================
 local function collectPetRepTimes()
     local sumPct = 0
@@ -369,87 +419,6 @@ local function refreshPetBonus()
     refreshRepSpeed()
     State.petRepBonus = RepCache.pet
     State.petRepBonusDetail = RepCache.detail
-end
-
--- ============================================================
--- 网络优化
--- ============================================================
-local NetOpt = {
-    enabled = false, mode = 0,
-    blocked = {}, connections = {}, lastRescan = 0,
-}
-local TELEMETRY_PATTERNS = {
-    "UserGenerated", "Analytics", "ABTests", "FastFlags",
-    "Telemetry", "ClientKit", "LibMP",
-}
-local function shouldBlock(obj)
-    local path = obj:GetFullName()
-    for _, pat in ipairs(TELEMETRY_PATTERNS) do
-        if path:find(pat, 1, true) then
-            if path:find("ReplicatedStorage", 1, true) then return true end
-        end
-    end
-    return false
-end
-local function tryHookOutgoing(ev)
-    if type(hookfunction) == "function" then
-        local ok = pcall(function()
-            local old = ev.FireServer
-            hookfunction(old, function() end)
-        end)
-        if ok then return true end
-    end
-    local ok2 = pcall(function() ev.FireServer = function() end end)
-    return ok2
-end
-local function applyNetworkOpt()
-    for _, c in ipairs(NetOpt.connections) do pcall(function() c:Disconnect() end) end
-    table.clear(NetOpt.connections)
-    table.clear(NetOpt.blocked)
-    if NetOpt.mode == 0 then
-        NetOpt.enabled = false
-        return
-    end
-    local mode = NetOpt.mode
-    local hookable = type(hookfunction) == "function"
-    for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
-        if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
-            if shouldBlock(obj) then
-                table.insert(NetOpt.blocked, obj)
-                if obj:IsA("RemoteEvent") then
-                    local ok1, conns = pcall(function()
-                        return getconnections and getconnections(obj.OnClientEvent)
-                    end)
-                    if ok1 and conns then
-                        for _, c in ipairs(conns) do
-                            pcall(function()
-                                if c.Disconnect then c.Disconnect() end
-                            end)
-                        end
-                    end
-                end
-                if mode >= 2 and hookable then
-                    pcall(function() tryHookOutgoing(obj) end)
-                end
-            end
-        end
-    end
-    NetOpt.enabled = true
-    NetOpt.lastRescan = State.time
-end
-local function disableNetworkOpt()
-    for _, c in ipairs(NetOpt.connections) do pcall(function() c:Disconnect() end) end
-    table.clear(NetOpt.connections)
-    table.clear(NetOpt.blocked)
-    NetOpt.enabled = false
-end
-local function setNetOptMode(mode)
-    NetOpt.mode = math.clamp(mode, 0, 2)
-    State.netOptMode = NetOpt.mode
-    pcall(applyNetworkOpt)
-    if mode == 0 then notify("网络优化：已关闭", 2)
-    elseif mode == 1 then notify(string.format("网络优化：轻度（%d）", #NetOpt.blocked), 3)
-    else notify(string.format("网络优化：重度（%d）", #NetOpt.blocked), 3) end
 end
 
 -- ============================================================
@@ -637,7 +606,8 @@ local function scanHidePets()
         if own then
             for _, pet in ipairs(own:GetChildren()) do
                 if pet:IsA("Model") or pet:IsA("Folder") then
-                    table.insert(PetHider.own, pet); hideModelParts(pet)
+                    table.insert(PetHider.own, pet)
+                    hideModelParts(pet)
                 end
             end
         end
@@ -649,7 +619,8 @@ local function scanHidePets()
                 if f then
                     for _, pet in ipairs(f:GetChildren()) do
                         if pet:IsA("Model") or pet:IsA("Folder") then
-                            table.insert(PetHider.all, pet); hideModelParts(pet)
+                            table.insert(PetHider.all, pet)
+                            hideModelParts(pet)
                         end
                     end
                 end
@@ -669,7 +640,10 @@ local function scanHideMachines()
     local mf = Workspace:FindFirstChild("machinesFolder")
     if mf then
         for _, m in ipairs(mf:GetChildren()) do
-            if m:IsA("Model") then table.insert(PetHider.machines, m); hideModelParts(m) end
+            if m:IsA("Model") then
+                table.insert(PetHider.machines, m)
+                hideModelParts(m)
+            end
         end
     end
     PetHider.rescanAt = State.time + 2
@@ -711,7 +685,8 @@ end
 local function enableTextureRemover()
     if TextureRemover.enabled then return end
     TextureRemover.enabled = true
-    table.clear(TextureRemover.saved); table.clear(TextureRemover.seen)
+    table.clear(TextureRemover.saved)
+    table.clear(TextureRemover.seen)
     scanTextures()
     TextureRemover.rescanAt = State.time + 4
 end
@@ -725,7 +700,8 @@ local function disableTextureRemover()
     for _, item in ipairs(TextureRemover.saved) do
         pcall(function() item.obj[item.prop] = item.value end)
     end
-    table.clear(TextureRemover.saved); table.clear(TextureRemover.seen)
+    table.clear(TextureRemover.saved)
+    table.clear(TextureRemover.seen)
 end
 
 local HiddenUIs = {}
@@ -801,7 +777,6 @@ local function destroy()
     pcall(restoreHiddenMachines)
     pcall(disableTextureRemover)
     pcall(restoreHiddenUI)
-    pcall(disableNetworkOpt)
     if State.ui.screen then pcall(function() State.ui.screen:Destroy() end) State.ui.screen = nil end
     if State.ui.infoGui then pcall(function() State.ui.infoGui:Destroy() end) State.ui.infoGui = nil end
     if _G[SCRIPT_ID] and _G[SCRIPT_ID].version == VERSION then _G[SCRIPT_ID] = nil end
@@ -1032,6 +1007,7 @@ local function activatePunch()
     if tool then pcall(function() tool:Activate() end) end
 end
 
+-- ★ 全图杀戮：好友白名单生效
 local function selectKillTarget()
     local myStrength = getMyStrength()
     local threshold = State.killThreshold or 5
@@ -1039,11 +1015,15 @@ local function selectKillTarget()
     for i = 1, #list do
         local plr = list[i]
         if plr ~= LocalPlayer then
-            local hrp = getCharacterHRP(plr)
-            if hrp then
-                local dur = getPlayerDurability(plr)
-                if dur == nil then return plr end
-                if myStrength > 0 and myStrength * threshold >= dur then return plr end
+            local blocked = false
+            if State.friendWhitelist and isFriend(plr) then blocked = true end
+            if not blocked then
+                local hrp = getCharacterHRP(plr)
+                if hrp then
+                    local dur = getPlayerDurability(plr)
+                    if dur == nil then return plr end
+                    if myStrength > 0 and myStrength * threshold >= dur then return plr end
+                end
             end
         end
     end
@@ -1053,11 +1033,16 @@ local function runKillTick(dt)
     if State.time - State.killScanAt >= 0.5 then
         State.killScanAt = State.time
         local cur = State.killTarget
-        local valid = cur and getCharacterHRP(cur)
-        if not valid then State.killTarget = selectKillTarget()
+        -- 目标变好友时也要立即换
+        if cur and State.friendWhitelist and isFriend(cur) then
+            State.killTarget = nil
+        end
+        local valid = State.killTarget and getCharacterHRP(State.killTarget)
+        if not valid then
+            State.killTarget = selectKillTarget()
         else
             local myStrength = getMyStrength()
-            local dur = getPlayerDurability(cur)
+            local dur = getPlayerDurability(State.killTarget)
             if dur and myStrength > 0 and myStrength * (State.killThreshold or 5) < dur then
                 State.killTarget = selectKillTarget()
             end
@@ -1085,32 +1070,58 @@ local function runKillTick(dt)
     end
 end
 
+-- ★ 肌肉之王竞争：好友白名单生效
 local function runKingKillTick(dt)
     if State.time - State.lastKingCheck >= 0.5 then
         State.lastKingCheck = State.time
         local king = getMuscleKing()
         if not king or king == LocalPlayer then
-            State.kingKillTarget = nil; State.kingKillActive = false; return
+            State.kingKillTarget = nil
+            State.kingKillActive = false
+            return
+        end
+        -- 好友是王，不打
+        if State.friendWhitelist and isFriend(king) then
+            State.kingKillTarget = nil
+            State.kingKillActive = false
+            return
         end
         local hrp = getCharacterHRP(king)
-        if not hrp then State.kingKillTarget = nil; State.kingKillActive = false; return end
+        if not hrp then
+            State.kingKillTarget = nil
+            State.kingKillActive = false
+            return
+        end
         local myStrength = getMyStrength()
         local targetDur = getPlayerDurability(king)
         local threshold = State.kingKillThreshold or 20
         if targetDur and myStrength > 0 and targetDur >= myStrength * threshold then
-            State.kingKillTarget = nil; State.kingKillActive = false; return
+            State.kingKillTarget = nil
+            State.kingKillActive = false
+            return
         end
         State.kingKillTarget = king
     end
     local target = State.kingKillTarget
     if not target then State.kingKillActive = false return end
+    if State.friendWhitelist and isFriend(target) then
+        State.kingKillTarget = nil
+        State.kingKillActive = false
+        return
+    end
     local targetHRP = getCharacterHRP(target)
-    if not targetHRP then State.kingKillTarget = nil; State.kingKillActive = false; return end
+    if not targetHRP then
+        State.kingKillTarget = nil
+        State.kingKillActive = false
+        return
+    end
     State.kingKillActive = true
     applyKillMovement(targetHRP)
     if State.time - State.kingKillLastAttack >= 0.05 then
         State.kingKillLastAttack = State.time
-        if not isEquipped(TOOL_KEYWORDS.punch) then tryEquip(TOOL_KEYWORDS.punch) end
+        if not isEquipped(TOOL_KEYWORDS.punch) then
+            tryEquip(TOOL_KEYWORDS.punch)
+        end
         activatePunch()
     end
 end
@@ -1227,7 +1238,7 @@ local function updateUIScale()
         State.ui.mainScale.Scale = scale
     end
     if State.ui.infoScale then
-        local scale = (vp.Y * (State.infoHeightRatio or 0.28)) / 380
+        local scale = (vp.Y * (State.infoHeightRatio or 0.28)) / 400
         scale = math.clamp(scale, 0.5, 3)
         if isMobile then scale = scale * 1.15 end
         State.ui.infoScale.Scale = scale
@@ -1356,7 +1367,7 @@ local function buildInfoWindow()
     Info.rows.perHour    = createRow("每小时预计", 11)
     Info.rows.perDay     = createRow("每天预计", 12)
     Info.rows.pingRow    = createRow("网络延迟", 13)
-    Info.rows.pktRow     = createRow("发包速率", 14)
+    Info.rows.friendRow  = createRow("好友白名单", 14)
 
     local dragging, dragStart, startPos = false, nil, nil
     track(titleBar.InputBegan:Connect(function(input)
@@ -1417,6 +1428,9 @@ local function buildInfoWindow()
             local function addRow(plr)
                 ord = ord + 1
                 local nm = plr == LocalPlayer and (plr.Name .. " (自己)") or plr.Name
+                if State.friendWhitelist and plr ~= LocalPlayer and isFriend(plr) then
+                    nm = nm .. " [友]"
+                end
                 local btn = create("TextButton", {
                     Size = UD2n(1, 0, 0, 24),
                     BackgroundColor3 = Theme.SurfaceAlt,
@@ -1500,21 +1514,18 @@ local function refreshInfoWindow()
             elseif pingVal < 200 then Info.rows.pingRow.TextColor3 = Theme.Warning
             else Info.rows.pingRow.TextColor3 = Theme.Danger end
         end
-        -- ★ v20：发包速率显示
-        if State.parallelPackets then
-            local elapsed = State.time - State.parallelStats.lastReport
-            if elapsed >= 1 then
-                local rate = State.parallelStats.sent / elapsed
-                State.parallelStats.lastReport = State.time
-                State.parallelStats.sent = 0
-                State.parallelStats._lastRate = rate
+        -- 好友白名单状态
+        if State.friendWhitelist then
+            if FriendWhitelist.loaded then
+                Info.rows.friendRow.Text = string.format("已加载 %d 人", FriendWhitelist.count)
+                Info.rows.friendRow.TextColor3 = Theme.Success
+            else
+                Info.rows.friendRow.Text = "加载中..."
+                Info.rows.friendRow.TextColor3 = Theme.Warning
             end
-            local lastRate = State.parallelStats._lastRate or 0
-            Info.rows.pktRow.Text = string.format("%d 包/秒 × %d 线", math.floor(lastRate), State.parallelThreads)
-            Info.rows.pktRow.TextColor3 = Theme.Success
         else
-            Info.rows.pktRow.Text = "关闭"
-            Info.rows.pktRow.TextColor3 = Theme.TextDim
+            Info.rows.friendRow.Text = "关闭"
+            Info.rows.friendRow.TextColor3 = Theme.TextDim
         end
     else
         Info.rows.strengthDelta.Text = "-"
@@ -1525,7 +1536,7 @@ local function refreshInfoWindow()
         Info.rows.perHour.Text = "-"
         Info.rows.perDay.Text = "-"
         Info.rows.pingRow.Text = "-"
-        Info.rows.pktRow.Text = "-"
+        Info.rows.friendRow.Text = "-"
     end
 end
 
@@ -1619,7 +1630,7 @@ local TaskPriority = {
     AFK = 200, KING_KILL = 160, KILL = 150, DUAL = 140, REBIRTH = 120,
     TELEPORT = 100, CAMERA = 90, INFO = 85, TOOL = 80, TRAIN = 60,
     RESET = 55, ANTILAG = 40, CULL = 35, HIDER = 30, TEX = 25,
-    NETOPT = 22, SWEEP = 20, SAVE = 10,
+    FRIEND_REFRESH = 22, SWEEP = 20, SAVE = 10,
 }
 
 local TaskChain = {}
@@ -1789,7 +1800,6 @@ registerTask({ id = "tool", priority = TaskPriority.TOOL,
     end,
 })
 
--- ★★★ v20：训练任务 —— 支持并行多包
 registerTask({ id = "train", priority = TaskPriority.TRAIN,
     enabled = function()
         return (State.autoTrain or State.fastTrain) and not State.kingKillActive
@@ -1799,48 +1809,19 @@ registerTask({ id = "train", priority = TaskPriority.TRAIN,
         if State.fastTrain then rate = State.fastRate
         elseif State.autoTrain then rate = 10 end
         if rate <= 0 then return end
-
         State.trainAccum = State.trainAccum + rate * dt
         local count = math.floor(State.trainAccum)
-        if count <= 0 then return end
-        State.trainAccum = State.trainAccum - count
-        if count > 3000 then count = 3000 end
-
-        local ev = getMuscleEvent()
-        if not ev then return end
-
-        -- 并行模式
-        if State.parallelPackets and State.parallelThreads > 1 then
-            local threads = math.min(State.parallelThreads, count)
-            local per = math.floor(count / threads)
-            local rem = count - per * threads
-            if threads <= 1 then
+        if count > 0 then
+            State.trainAccum = State.trainAccum - count
+            if count > 3000 then count = 3000 end
+            local ev = getMuscleEvent()
+            if ev then
                 pcall(function()
-                    for _ = 1, count do ev:FireServer("rep") end
-                end)
-                State.parallelStats.sent = State.parallelStats.sent + count
-                State.parallelStats.cycles = State.parallelStats.cycles + 1
-            else
-                for i = 1, threads do
-                    local n = per + (i <= rem and 1 or 0)
-                    if n > 0 then
-                        task.spawn(function()
-                            for _ = 1, n do
-                                ev:FireServer("rep")
-                            end
-                        end)
+                    for _ = 1, count do
+                        ev:FireServer("rep")
                     end
-                end
-                State.parallelStats.sent = State.parallelStats.sent + count
-                State.parallelStats.cycles = State.parallelStats.cycles + 1
+                end)
             end
-        else
-            -- 单线程模式
-            pcall(function()
-                for _ = 1, count do
-                    ev:FireServer("rep")
-                end
-            end)
         end
     end,
 })
@@ -1898,13 +1879,18 @@ registerTask({ id = "tex", priority = TaskPriority.TEX,
     end,
 })
 
-registerTask({ id = "netopt", priority = TaskPriority.NETOPT,
-    enabled = function() return NetOpt.mode > 0 end,
-    onEnable = function() NetOpt.lastRescan = 0 end,
-    onDisable = function() end,
+registerTask({ id = "friendrefresh", priority = TaskPriority.FRIEND_REFRESH,
+    enabled = function() return State.friendWhitelist end,
+    onEnable = function()
+        if not FriendWhitelist.loaded then refreshFriendList() end
+    end,
     tick = function()
-        if State.time - NetOpt.lastRescan >= 30 then
-            pcall(applyNetworkOpt)
+        if FriendWhitelist.refreshing then return end
+        local now = tick()
+        if not FriendWhitelist.loaded then
+            refreshFriendList()
+        elseif now - FriendWhitelist.lastRefresh >= FriendWhitelist.refreshInterval then
+            refreshFriendList()
         end
     end,
 })
@@ -2204,7 +2190,7 @@ local function buildUI()
         }, parent)
     end
 
-    -- 锻炼页
+    -- 锻炼
     local trainPage = newPage("TrainPage")
     local trainToggle, fastToggle
     trainToggle = addRowToggle(trainPage, "自动锻炼（固定 10 次/秒）", State.autoTrain, function(v)
@@ -2236,26 +2222,6 @@ local function buildUI()
         State.fastRate = n
         State.degradeLevel = 0
     end)
-
-    -- ★ v20：并行多包
-    addDivider(trainPage, "── 并行多包 ──")
-    addRowToggle(trainPage, "开启并行发包", State.parallelPackets, function(v)
-        State.parallelPackets = v
-        State.parallelStats.sent = 0
-        State.parallelStats.cycles = 0
-        State.parallelStats.lastReport = State.time
-        State.parallelStats._lastRate = 0
-        if v then
-            notify(string.format("并行发包已开启：%d 线", State.parallelThreads), 3)
-        else
-            notify("并行发包已关闭", 2)
-        end
-    end)
-    addInput(trainPage, "并行线程数", State.parallelThreads, 1, 16, function(n)
-        State.parallelThreads = n
-    end)
-    addHint(trainPage, "开启后训练请求会拆分到多个线程并发发送，可能提高高频下的吞吐。并发线程 2~16 之间，越大越猛。")
-
     addDivider(trainPage, "── 防卡顿 ──")
     addRowToggle(trainPage, "快速锻炼卡顿自调节", State.adaptiveEnabled, function(v)
         State.adaptiveEnabled = v
@@ -2269,7 +2235,6 @@ local function buildUI()
     addInput(trainPage, "目标帧率阈值", State.adaptiveThreshold, 10, 120, function(n)
         State.adaptiveThreshold = n
     end)
-
     addDivider(trainPage, "── 工具自动切换 ──")
     local toolPushToggle, toolHandToggle, toolSitToggle
     addRowToggle(trainPage, "自动切换哑铃（兜底）", State.toolDumbbell, function(v) State.toolDumbbell = v end)
@@ -2304,6 +2269,7 @@ local function buildUI()
         State.autoTeleport = v
     end)
     addActionButton(telePage, "强制单次传送", function() doTeleport(true) end)
+    addHint(telePage, "使用传送门坐标。强制单次传送会刷新缓存。")
 
     -- 重生
     local rebPage = newPage("RebPage")
@@ -2314,8 +2280,26 @@ local function buildUI()
     local killPage = newPage("KillPage")
     addRowToggle(killPage, "全图杀戮", State.killEnabled, function(v) State.killEnabled = v end)
     addInput(killPage, "力量/耐久 阈值", State.killThreshold, 1, 100, function(n) State.killThreshold = n end)
+    addDivider(killPage, "── 好友白名单 ──")
+    addRowToggle(killPage, "好友白名单（不打好友）", State.friendWhitelist, function(v)
+        State.friendWhitelist = v
+        if v and not FriendWhitelist.loaded then
+            refreshFriendList()
+        end
+    end)
+    addActionButton(killPage, "手动刷新好友列表", function()
+        if FriendWhitelist.refreshing then
+            notify("好友列表刷新中...", 2)
+        else
+            refreshFriendList()
+            notify("正在刷新好友列表...", 2)
+        end
+    end)
+    addHint(killPage, "开启后：杀戮不会打好友，也不会抢好友的肌肉之王。好友列表自动每 5 分钟刷新一次。")
+
     addDivider(killPage, "── 双工具 ──")
     addRowToggle(killPage, "杀戮+锻炼 双工具切换", State.dualEnabled, function(v) State.dualEnabled = v end)
+
     addDivider(killPage, "── 肌肉之王竞争 ──")
     addRowToggle(killPage, "自动击杀其他肌肉之王", State.autoKingKill, function(v)
         State.autoKingKill = v
@@ -2327,30 +2311,10 @@ local function buildUI()
     addInput(killPage, "对方耐久 / 我力量 上限", State.kingKillThreshold, 1, 1000, function(n)
         State.kingKillThreshold = n
     end)
+    addHint(killPage, "别人是肌肉之王时，会尝试击杀他。如果对方耐久 ≥ 我力量 × 上限，跳过等待。")
 
     -- 设置
     local setPage = newPage("SetPage")
-    addDivider(setPage, "── 网络优化 ──")
-    local netLabel = create("TextLabel", {
-        Size = UD2n(1, -6, 0, 20), BackgroundTransparency = 1,
-        Font = Font.GothamMedium, Text = "当前模式：关闭",
-        TextColor3 = Theme.TextDim, TextSize = 12, TextXAlignment = E_TxtXL,
-    }, setPage)
-    local function updateNetLabel()
-        if NetOpt.mode == 0 then
-            netLabel.Text = "当前模式：关闭"; netLabel.TextColor3 = Theme.TextDim
-        elseif NetOpt.mode == 1 then
-            netLabel.Text = string.format("当前模式：轻度（%d）", #NetOpt.blocked)
-            netLabel.TextColor3 = Theme.Success
-        else
-            netLabel.Text = string.format("当前模式：重度（%d）", #NetOpt.blocked)
-            netLabel.TextColor3 = Theme.Warning
-        end
-    end
-    addActionButton(setPage, "网络优化：关闭", function() setNetOptMode(0); updateNetLabel() end)
-    addActionButton(setPage, "网络优化：轻度", function() setNetOptMode(1); updateNetLabel() end)
-    addActionButton(setPage, "网络优化：重度", function() setNetOptMode(2); updateNetLabel() end)
-
     addDivider(setPage, "── 性能 ──")
     addRowToggle(setPage, "深度防卡顿", State.antiLagEnabled, function(v) State.antiLagEnabled = v end)
     addRowToggle(setPage, "渲染剔除（远处不显示）", State.renderCullEnabled, function(v) State.renderCullEnabled = v end)
@@ -2383,6 +2347,7 @@ local function buildUI()
     addInput(setPage, "信息窗高度比例(%)", math.floor(State.infoHeightRatio * 100), 15, 70, function(n)
         State.infoHeightRatio = n / 100; updateUIScale()
     end)
+    addHint(setPage, "长按屏幕左下角复位按钮 3 秒可重置所有位置和大小。")
 
     local function switchTab(id)
         trainPage.Visible = (id == "train")
@@ -2450,7 +2415,6 @@ local function buildUI()
 
     State.ui.trainToggle = trainToggle
     State.ui.fastToggle = fastToggle
-    State.ui.updateNetLabel = updateNetLabel
 end
 
 -- ============================================================
@@ -2470,9 +2434,10 @@ if State.antiLagEnabled then pcall(enableAntiLag) end
 if State.textureRemoverEnabled then pcall(enableTextureRemover) end
 if State.hideUIEnabled then pcall(hideAllUI) end
 if State.infoWindowEnabled and State.ui.infoGui then State.ui.infoGui.Enabled = true end
-if State.netOptMode and State.netOptMode > 0 then
-    setNetOptMode(State.netOptMode)
-    if State.ui.updateNetLabel then State.ui.updateNetLabel() end
+
+-- 好友白名单：启动时拉取
+if State.friendWhitelist then
+    task.delay(2, function() refreshFriendList() end)
 end
 
 local cam = Workspace.CurrentCamera
