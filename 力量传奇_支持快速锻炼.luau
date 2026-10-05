@@ -1,9 +1,9 @@
 --!nonstrict
--- 肌肉之王自动化 v10
--- 设置页 / 信息悬浮窗 / 宠物加成检测 / 触发器保护
+-- 肌肉之王自动化 v11
+-- 信息窗口修复 / 力量增量 / 悬浮窗最小化 / 深度防卡顿 / 深度去纹理
 
 local SCRIPT_ID   = "__MUSCLE_KING_AUTO__"
-local VERSION     = 1000
+local VERSION     = 1100
 local CONFIG_FILE = "muscle_king_auto_config.json"
 
 do
@@ -21,20 +21,37 @@ local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace         = game:GetService("Workspace")
 local Lighting          = game:GetService("Lighting")
 local HttpService       = game:GetService("HttpService")
+local SoundService      = game:GetService("SoundService")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
+-- 局部 API 缓存（性能关键路径）
+local LP_FindFirstChild    = LocalPlayer.FindFirstChild
 local GetPlayers           = Players.GetPlayers
 local RS_Heartbeat         = RunService.Heartbeat
 local UIS_GetMouseLocation = UserInputService.GetMouseLocation
-local LP_FindFirstChild    = LocalPlayer.FindFirstChild
+local UIS_InputChanged     = UserInputService.InputChanged
+local UIS_InputBegan       = UserInputService.InputBegan
+local UIS_InputEnded       = UserInputService.InputEnded
 local UDim2_new            = UDim2.new
 local UDim2_fromOffset     = UDim2.fromOffset
-local UDim2_fromScale      = UDim2.fromScale
 local Color3_fromRGB       = Color3.fromRGB
 local Vector2_new          = Vector2.new
 local Enum_Font            = Enum.Font
+local ApplyStrokeMode_B    = Enum.ApplyStrokeMode.Border
+local ZIndex_Sibling       = Enum.ZIndexBehavior.Sibling
+local UIAxis_Y             = Enum.AutomaticSize.Y
+local SortOrder_Layout     = Enum.SortOrder.LayoutOrder
+local FillDirection_H      = Enum.FillDirection.Horizontal
+local ScrollingDirection_Y = Enum.ScrollingDirection.Y
+local UInputType_MB1       = Enum.UserInputType.MouseButton1
+local UInputType_Touch     = Enum.UserInputType.Touch
+local UInputType_MMove     = Enum.UserInputType.MouseMovement
+local TextX_Left           = Enum.TextXAlignment.Left
+local TextX_Right          = Enum.TextXAlignment.Right
+local TextY_Top            = Enum.TextYAlignment.Top
+local CamType_Custom       = Enum.CameraType.Custom
 
 local Theme = {
     Background = Color3_fromRGB(20, 22, 28),
@@ -47,6 +64,7 @@ local Theme = {
     TextDim    = Color3_fromRGB(148, 156, 172),
     Warning    = Color3_fromRGB(255, 200, 80),
     Success    = Color3_fromRGB(120, 220, 160),
+    Danger     = Color3_fromRGB(235, 90, 90),
 }
 
 -- ============================================================
@@ -72,15 +90,13 @@ local State = {
     adaptiveEnabled = false, adaptiveThreshold = 30,
     adaptiveStep = 100, adaptiveStableCount = 0, lastAdaptiveAt = 0,
 
-    -- 新功能
     antiLagEnabled = false,
     textureRemoverEnabled = false,
     hideUIEnabled = false,
     infoWindowEnabled = false,
     formatEnabled = true,
 
-    -- 宠物加成
-    petRepBonus = 0, petRepBonusCheckedAt = 0, petRepWarned = false,
+    petRepBonus = 0, petRepBonusCheckedAt = 0,
 
     originalGravity = Workspace.Gravity,
     muscleEventRef = nil, rebirthEventRef = nil, lastRebirthScan = 0,
@@ -90,8 +106,15 @@ local State = {
     lastDegradeAt = 0, degradeLevel = 0,
 
     lastAFKClick = 0, lastSaveAt = 0,
+
+    -- 力量增量
+    sessionStartStrength = nil,
+    strengthCheckAt = 0,
+    lastStrengthSnapshot = 0,
+    strengthPerSec = 0,
 }
 
+-- 角色缓存
 local Cache = { char = nil, hum = nil, hrp = nil }
 local function refreshCache()
     local c = LocalPlayer.Character
@@ -123,14 +146,14 @@ end
 local function corner(p, r) return create("UICorner", { CornerRadius = UDim.new(0, r or 8) }, p) end
 local function stroke(p, c, t)
     return create("UIStroke", { Color = c or Theme.Border, Thickness = t or 1,
-        ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, p)
+        ApplyStrokeMode = ApplyStrokeMode_B }, p)
 end
 
 local function notify(text, duration)
     duration = duration or 3
     if State.destroyed or not State.ui.screen then return end
     local label = create("TextLabel", {
-        AnchorPoint = Vector2.new(0.5, 0),
+        AnchorPoint = Vector2_new(0.5, 0),
         Position = UDim2_new(0.5, 0, 0.04, 0),
         Size = UDim2_fromOffset(440, 52),
         BackgroundColor3 = Color3_fromRGB(30, 32, 40),
@@ -152,19 +175,12 @@ local SUFFIXES = {
 }
 local function formatNumber(n)
     n = tonumber(n) or 0
-    if not State.formatEnabled then
-        return tostring(math.floor(n))
-    end
+    if not State.formatEnabled then return tostring(math.floor(n)) end
     local neg = n < 0
     n = math.abs(n)
-    if n < 1000 then
-        return (neg and "-" or "") .. string.format("%.0f", n)
-    end
+    if n < 1000 then return (neg and "-" or "") .. string.format("%.0f", n) end
     local idx = 1
-    while n >= 1000 and idx < #SUFFIXES do
-        n = n / 1000
-        idx = idx + 1
-    end
+    while n >= 1000 and idx < #SUFFIXES do n = n / 1000; idx = idx + 1 end
     return (neg and "-" or "") .. string.format("%.3f%s", n, SUFFIXES[idx])
 end
 
@@ -229,27 +245,196 @@ local function loadConfig()
 end
 
 -- ============================================================
--- 清理
+-- 深度防卡顿（特效 / 后处理 / 光照 / 声音）
 -- ============================================================
-local AntiLag = { particles = {}, shadows = {}, originalLighting = nil, enabled = false, rescanAt = 0 }
-local TextureRemover = { saved = {}, enabled = false, rescanAt = 0 }
-local HiddenUIs = {}
+local AntiLag = {
+    enabled = false, rescanAt = 0,
+    particles = {}, shadows = {}, sounds = {},
+    lighting = nil, postEffects = {}, atmospheres = {},
+}
+
+local POST_CLASSES = {
+    BloomEffect = true, BlurEffect = true, SunRaysEffect = true,
+    ColorCorrectionEffect = true, DepthOfFieldEffect = true,
+}
+
+local function saveLighting()
+    AntiLag.lighting = {
+        GlobalShadows = Lighting.GlobalShadows,
+        ShadowSoftness = Lighting.ShadowSoftness,
+        Brightness = Lighting.Brightness,
+        Ambient = Lighting.Ambient,
+        OutdoorAmbient = Lighting.OutdoorAmbient,
+        FogEnd = Lighting.FogEnd,
+        FogStart = Lighting.FogStart,
+        FogColor = Lighting.FogColor,
+        Technology = Lighting.Technology,
+    }
+end
+
+local function restoreLighting()
+    if not AntiLag.lighting then return end
+    for k, v in pairs(AntiLag.lighting) do
+        if k ~= "Technology" then pcall(function() Lighting[k] = v end) end
+    end
+    AntiLag.lighting = nil
+end
+
+local function applyAntiLagToLighting()
+    pcall(function()
+        Lighting.GlobalShadows = false
+        Lighting.ShadowSoftness = 0
+        Lighting.Brightness = 1
+        Lighting.OutdoorAmbient = Color3_fromRGB(60, 60, 60)
+        Lighting.Ambient = Color3_fromRGB(40, 40, 40)
+        Lighting.FogEnd = 200
+        Lighting.FogStart = 60
+        Lighting.FogColor = Color3_fromRGB(120, 120, 120)
+    end)
+end
+
+local function scanAntiLag()
+    -- 粒子和阴影
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        local cls = obj.ClassName
+        if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
+        or cls == "Fire" or cls == "Smoke" or cls == "Sparkles" or cls == "Explosion" then
+            if obj.Enabled then
+                obj.Enabled = false
+                table.insert(AntiLag.particles, obj)
+            end
+        elseif cls == "BasePart" and obj.CastShadow then
+            table.insert(AntiLag.shadows, { part = obj, value = true })
+            obj.CastShadow = false
+        end
+    end
+    -- 光照后处理
+    for _, obj in ipairs(Lighting:GetChildren()) do
+        if POST_CLASSES[obj.ClassName] then
+            if obj.Enabled then
+                obj.Enabled = false
+                table.insert(AntiLag.postEffects, obj)
+            end
+        elseif obj.ClassName == "Atmosphere" then
+            table.insert(AntiLag.atmospheres, {
+                obj = obj,
+                Density = obj.Density,
+                Haze = obj.Haze,
+                Glare = obj.Glare,
+            })
+            obj.Density = 0
+            obj.Haze = 0
+            obj.Glare = 0
+        end
+    end
+    -- 声音
+    for _, obj in ipairs(SoundService:GetDescendants()) do
+        if obj:IsA("Sound") and obj.Playing and obj.Volume > 0 then
+            table.insert(AntiLag.sounds, { sound = obj, volume = obj.Volume })
+            obj.Volume = 0
+        end
+    end
+end
+
+local function enableAntiLag()
+    if AntiLag.enabled then return end
+    AntiLag.enabled = true
+    saveLighting()
+    applyAntiLagToLighting()
+    scanAntiLag()
+    AntiLag.rescanAt = State.time + 2
+end
+
+local function rescanAntiLag()
+    if not AntiLag.enabled then return end
+    applyAntiLagToLighting()
+    scanAntiLag()
+    AntiLag.rescanAt = State.time + 2
+end
 
 local function disableAntiLag()
     if not AntiLag.enabled then return end
     AntiLag.enabled = false
     for _, p in ipairs(AntiLag.particles) do pcall(function() p.Enabled = true end) end
     table.clear(AntiLag.particles)
-    for _, item in ipairs(AntiLag.shadows) do
-        pcall(function() item.part.CastShadow = item.value end)
-    end
+    for _, item in ipairs(AntiLag.shadows) do pcall(function() item.part.CastShadow = item.value end) end
     table.clear(AntiLag.shadows)
-    if AntiLag.originalLighting then
-        for k, v in pairs(AntiLag.originalLighting) do
-            pcall(function() Lighting[k] = v end)
-        end
-        AntiLag.originalLighting = nil
+    for _, item in ipairs(AntiLag.sounds) do pcall(function() item.sound.Volume = item.volume end) end
+    table.clear(AntiLag.sounds)
+    for _, fx in ipairs(AntiLag.postEffects) do pcall(function() fx.Enabled = true end) end
+    table.clear(AntiLag.postEffects)
+    for _, item in ipairs(AntiLag.atmospheres) do
+        pcall(function()
+            item.obj.Density = item.Density
+            item.obj.Haze = item.Haze
+            item.obj.Glare = item.Glare
+        end)
     end
+    table.clear(AntiLag.atmospheres)
+    restoreLighting()
+end
+
+-- ============================================================
+-- 深度去纹理
+-- ============================================================
+local TextureRemover = { enabled = false, rescanAt = 0, saved = {} }
+
+local function scanTextures()
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        local cls = obj.ClassName
+        if cls == "Decal" or cls == "Texture" then
+            if obj.Texture ~= "" then
+                table.insert(TextureRemover.saved, { obj = obj, prop = "Texture", value = obj.Texture })
+                obj.Texture = ""
+            end
+        elseif cls == "MeshPart" or cls == "SpecialMesh" then
+            local p = (cls == "MeshPart") and "TextureID" or "TextureId"
+            if obj[p] and obj[p] ~= "" then
+                table.insert(TextureRemover.saved, { obj = obj, prop = p, value = obj[p] })
+                obj[p] = ""
+            end
+        elseif cls == "SurfaceAppearance" then
+            if obj.ColorMap ~= "" then
+                table.insert(TextureRemover.saved, { obj = obj, prop = "ColorMap", value = obj.ColorMap })
+                obj.ColorMap = ""
+            end
+            if obj.AlphaMode == Enum.SurfaceAppearanceAlphaMode.Overlay then
+                table.insert(TextureRemover.saved, { obj = obj, prop = "AlphaMode", value = obj.AlphaMode })
+                obj.AlphaMode = Enum.SurfaceAppearanceAlphaMode.Default
+            end
+        elseif cls == "Sky" then
+            for _, k in ipairs({ "SkyboxBk", "SkyboxDn", "SkyboxFt", "SkyboxLf", "SkyboxUp", "SkyboxFront", "SkyboxBack", "SkyboxLeft", "SkyboxRight" }) do
+                if obj[k] and obj[k] ~= "" then
+                    table.insert(TextureRemover.saved, { obj = obj, prop = k, value = obj[k] })
+                    obj[k] = ""
+                end
+            end
+        elseif cls == "ImageLabel" or cls == "ImageButton" then
+            -- 只处理 PlayerGui 里的，避免影响自己的 UI（也不动主 UI）
+            if obj:IsDescendantOf(PlayerGui)
+            and not (State.ui.screen and obj:IsDescendantOf(State.ui.screen))
+            and not (State.ui.infoGui and obj:IsDescendantOf(State.ui.infoGui)) then
+                if obj.Image ~= "" then
+                    table.insert(TextureRemover.saved, { obj = obj, prop = "Image", value = obj.Image })
+                    obj.Image = ""
+                end
+            end
+        end
+    end
+end
+
+local function enableTextureRemover()
+    if TextureRemover.enabled then return end
+    TextureRemover.enabled = true
+    table.clear(TextureRemover.saved)
+    scanTextures()
+    TextureRemover.rescanAt = State.time + 4
+end
+
+local function rescanTextureRemover()
+    if not TextureRemover.enabled then return end
+    scanTextures()
+    TextureRemover.rescanAt = State.time + 4
 end
 
 local function disableTextureRemover()
@@ -261,13 +446,29 @@ local function disableTextureRemover()
     table.clear(TextureRemover.saved)
 end
 
-local function restoreHiddenUI()
-    for _, gui in ipairs(HiddenUIs) do
-        pcall(function() gui.Enabled = true end)
+-- ============================================================
+-- 隐藏 UI
+-- ============================================================
+local HiddenUIs = {}
+local function hideAllUI()
+    table.clear(HiddenUIs)
+    for _, gui in ipairs(PlayerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui ~= State.ui.screen and gui ~= State.ui.infoGui then
+            if gui.Enabled then
+                gui.Enabled = false
+                table.insert(HiddenUIs, gui)
+            end
+        end
     end
+end
+local function restoreHiddenUI()
+    for _, gui in ipairs(HiddenUIs) do pcall(function() gui.Enabled = true end) end
     table.clear(HiddenUIs)
 end
 
+-- ============================================================
+-- 清理
+-- ============================================================
 local function destroy()
     if State.destroyed then return end
     State.destroyed = true
@@ -321,7 +522,7 @@ local function fixCamera()
     if hum and hum.Parent then
         pcall(function()
             if cam.CameraSubject ~= hum then cam.CameraSubject = hum end
-            if cam.CameraType ~= Enum.CameraType.Custom then cam.CameraType = Enum.CameraType.Custom end
+            if cam.CameraType ~= CamType_Custom then cam.CameraType = CamType_Custom end
         end)
     end
 end
@@ -423,7 +624,6 @@ end
 local function getMyStrength() return getStatValue(LocalPlayer, "Strength") end
 local function getPlayerDurability(plr) return getStatValue(plr, "Durability") end
 
--- 判断是否在机器上（用于避免触发器异常）
 local function isOnMachine()
     local m = LP_FindFirstChild(LocalPlayer, "machineInUse")
     if m and m:IsA("ValueBase") then
@@ -439,12 +639,10 @@ local function isOnMachine()
 end
 
 -- ============================================================
--- 宠物加成检测
+-- 宠物加成
 -- ============================================================
 local function getEquippedPetRepSpeedBonus()
     local total = 0
-
-    -- 优先从 Workspace.<玩家名>.<Pet>.perksFolder 读
     local folder = Workspace:FindFirstChild(LocalPlayer.Name)
     if folder then
         for _, pet in ipairs(folder:GetChildren()) do
@@ -457,17 +655,13 @@ local function getEquippedPetRepSpeedBonus()
             end
         end
     end
-
     if total > 0 then return total end
-
-    -- 回退：从 equippedPets + petPreviews
     local equipped = LP_FindFirstChild(LocalPlayer, "equippedPets")
     if not equipped then return 0 end
-    local previews = ReplicatedStorage:FindFirstChild("shared")
-    if previews then previews = previews:FindFirstChild("runtime") end
-    if previews then previews = previews:FindFirstChild("petPreviews") end
+    local shared = ReplicatedStorage:FindFirstChild("shared")
+    local runtime = shared and shared:FindFirstChild("runtime")
+    local previews = runtime and runtime:FindFirstChild("petPreviews")
     if not previews then return 0 end
-
     for _, slot in ipairs(equipped:GetChildren()) do
         local name = slot.Value
         if type(name) == "string" and name ~= "" then
@@ -491,7 +685,7 @@ local function refreshPetBonus()
 end
 
 -- ============================================================
--- 事件引用
+-- 事件
 -- ============================================================
 local function getMuscleEvent()
     local cached = State.muscleEventRef
@@ -501,23 +695,20 @@ local function getMuscleEvent()
     return ev
 end
 
-local function findRebirthEvent()
-    local rEvents = ReplicatedStorage:FindFirstChild("rEvents")
-    if rEvents then
-        local ev = rEvents:FindFirstChild("rebirthRemote")
-        if ev and (ev:IsA("RemoteEvent") or ev:IsA("RemoteFunction")) then return ev end
-    end
-    return nil
-end
-
 local function getRebirthEvent()
     local cached = State.rebirthEventRef
     if cached and cached.Parent then return cached end
     if State.time - State.lastRebirthScan < 3 then return nil end
     State.lastRebirthScan = State.time
-    local found = findRebirthEvent()
-    State.rebirthEventRef = found
-    return found
+    local rEvents = ReplicatedStorage:FindFirstChild("rEvents")
+    if rEvents then
+        local ev = rEvents:FindFirstChild("rebirthRemote")
+        if ev and (ev:IsA("RemoteEvent") or ev:IsA("RemoteFunction")) then
+            State.rebirthEventRef = ev
+            return ev
+        end
+    end
+    return nil
 end
 
 local MUSCLE_KING_CF
@@ -549,103 +740,7 @@ local function fireRebirth()
 end
 
 -- ============================================================
--- 防卡顿 / 移除纹理 / 隐藏UI
--- ============================================================
-local function enableAntiLag()
-    if AntiLag.enabled then return end
-    AntiLag.enabled = true
-    table.clear(AntiLag.particles)
-    table.clear(AntiLag.shadows)
-    AntiLag.originalLighting = {
-        GlobalShadows = Lighting.GlobalShadows,
-        ShadowSoftness = Lighting.ShadowSoftness,
-        Brightness = Lighting.Brightness,
-        FogEnd = Lighting.FogEnd,
-        FogStart = Lighting.FogStart,
-    }
-    pcall(function()
-        Lighting.GlobalShadows = false
-        Lighting.ShadowSoftness = 0
-        if Lighting.FogEnd > 500 then Lighting.FogEnd = 500 end
-        if Lighting.FogStart > 200 then Lighting.FogStart = 200 end
-    end)
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam")
-        or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") then
-            if obj.Enabled then
-                obj.Enabled = false
-                table.insert(AntiLag.particles, obj)
-            end
-        elseif obj:IsA("BasePart") then
-            if obj.CastShadow then
-                table.insert(AntiLag.shadows, { part = obj, value = true })
-                obj.CastShadow = false
-            end
-        end
-    end
-    AntiLag.rescanAt = State.time + 3
-end
-
-local function rescanAntiLag()
-    if not AntiLag.enabled then return end
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("ParticleEmitter") or obj:IsA("Trail") or obj:IsA("Beam")
-        or obj:IsA("Fire") or obj:IsA("Smoke") or obj:IsA("Sparkles") then
-            if obj.Enabled then
-                obj.Enabled = false
-                table.insert(AntiLag.particles, obj)
-            end
-        elseif obj:IsA("BasePart") and obj.CastShadow then
-            table.insert(AntiLag.shadows, { part = obj, value = true })
-            obj.CastShadow = false
-        end
-    end
-    AntiLag.rescanAt = State.time + 3
-end
-
-local function enableTextureRemover()
-    if TextureRemover.enabled then return end
-    TextureRemover.enabled = true
-    table.clear(TextureRemover.saved)
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Decal") or obj:IsA("Texture") then
-            if obj.Texture ~= "" then
-                table.insert(TextureRemover.saved, { obj = obj, prop = "Texture", value = obj.Texture })
-                obj.Texture = ""
-            end
-        end
-    end
-    TextureRemover.rescanAt = State.time + 5
-end
-
-local function rescanTextureRemover()
-    if not TextureRemover.enabled then return end
-    for _, obj in ipairs(Workspace:GetDescendants()) do
-        if obj:IsA("Decal") or obj:IsA("Texture") then
-            if obj.Texture ~= "" then
-                table.insert(TextureRemover.saved, { obj = obj, prop = "Texture", value = obj.Texture })
-                obj.Texture = ""
-            end
-        end
-    end
-    TextureRemover.rescanAt = State.time + 5
-end
-
-local function hideAllUI()
-    local pg = PlayerGui
-    table.clear(HiddenUIs)
-    for _, gui in ipairs(pg:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui ~= State.ui.screen and gui ~= State.ui.infoGui then
-            if gui.Enabled then
-                gui.Enabled = false
-                table.insert(HiddenUIs, gui)
-            end
-        end
-    end
-end
-
--- ============================================================
--- 双工具切换
+-- 双工具
 -- ============================================================
 local function findPreferredTrainTool()
     if State.toolPushups then
@@ -671,7 +766,6 @@ local function updateDualTool()
     if not hum then return end
     if State.time - State.dualLastSwitch < 0.06 then return end
     State.dualLastSwitch = State.time
-
     if State.dualCurrentMode == "punch" then
         local t = findPreferredTrainTool()
         if t then
@@ -768,7 +862,6 @@ local function runKillTick(dt)
         end
         State.toolOwnedByKill = State.killTarget ~= nil
     end
-
     local target = State.killTarget
     if not target then State.toolOwnedByKill = false return end
     local targetHRP = getCharacterHRP(target)
@@ -777,9 +870,7 @@ local function runKillTick(dt)
         State.toolOwnedByKill = false
         return
     end
-
     applyKillMovement(targetHRP)
-
     local dual = State.dualEnabled and (State.autoTrain or State.fastTrain)
     if not dual then
         if State.time - State.killLastAttack >= 0.05 then
@@ -821,8 +912,7 @@ local function runAdaptive()
         if fps > threshold * 1.15 then
             State.adaptiveStableCount = State.adaptiveStableCount + 1
             if State.adaptiveStableCount >= 2 then
-                local step = State.adaptiveStep
-                State.fastRate = math.min(50000, State.fastRate + step)
+                State.fastRate = math.min(50000, State.fastRate + State.adaptiveStep)
                 State.adaptiveStep = math.min(2000, State.adaptiveStep * 2)
                 State.adaptiveStableCount = 0
                 applyRateToUI(State.fastRate)
@@ -853,64 +943,20 @@ end
 -- ============================================================
 -- 信息悬浮窗
 -- ============================================================
-local InfoWindow = {
+local Info = {
     viewingPlayer = nil,
     listOpen = false,
+    listLastRefresh = 0,
     lastRefresh = 0,
-    predictor = { lastStrength = 0, lastAt = 0, ratePerSec = 0 },
+    minimized = false,
+    rows = {},
+    frames = {},
 }
-
-local function updatePredictor()
-    local s = getMyStrength()
-    local p = InfoWindow.predictor
-    if p.lastAt == 0 then
-        p.lastStrength = s; p.lastAt = State.time; return
-    end
-    local dt = State.time - p.lastAt
-    if dt >= 10 then
-        local gain = s - p.lastStrength
-        if gain > 0 then p.ratePerSec = gain / dt end
-        p.lastStrength = s
-        p.lastAt = State.time
-    end
-end
-
-local InfoUI = { rows = {} }
-
-local function createInfoRow(parent, label, order)
-    local row = create("Frame", {
-        Size = UDim2_new(1, -12, 0, 26),
-        BackgroundTransparency = 1,
-        LayoutOrder = order,
-    }, parent)
-    local lbl = create("TextLabel", {
-        BackgroundTransparency = 1,
-        Size = UDim2_new(0.5, 0, 1, 0),
-        Font = Enum_Font.GothamMedium,
-        Text = label,
-        TextColor3 = Theme.TextDim,
-        TextSize = 13,
-        TextXAlignment = Enum.TextXAlignment.Left,
-    }, row)
-    local val = create("TextLabel", {
-        BackgroundTransparency = 1,
-        Position = UDim2_new(0.5, 0, 0, 0),
-        Size = UDim2_new(0.5, 0, 1, 0),
-        Font = Enum_Font.GothamBold,
-        Text = "-",
-        TextColor3 = Theme.Text,
-        TextSize = 13,
-        TextXAlignment = Enum.TextXAlignment.Right,
-    }, row)
-    return val
-end
 
 local function buildInfoWindow()
     local screen = create("ScreenGui", {
-        Name = "MuscleKingInfoUI",
-        ResetOnSpawn = false,
-        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-        DisplayOrder = 99998,
+        Name = "MuscleKingInfoUI", ResetOnSpawn = false,
+        ZIndexBehavior = ZIndex_Sibling, DisplayOrder = 99998,
     }, PlayerGui)
     State.ui.infoGui = screen
     screen.Enabled = false
@@ -919,83 +965,78 @@ local function buildInfoWindow()
         Name = "InfoFrame",
         AnchorPoint = Vector2_new(1, 1),
         Position = UDim2_new(1, -20, 1, -20),
-        Size = UDim2_fromOffset(260, 320),
+        Size = UDim2_fromOffset(260, 340),
         BackgroundColor3 = Theme.Background,
-        BorderSizePixel = 0,
-        ClipsDescendants = true,
-        Active = true,
+        BorderSizePixel = 0, ClipsDescendants = true, Active = true,
     }, screen)
-    InfoUI.frame = frame
+    Info.frames.frame = frame
     corner(frame, 12)
     stroke(frame, Theme.Border, 1)
 
     local titleBar = create("Frame", {
         Size = UDim2_new(1, 0, 0, 32),
-        BackgroundColor3 = Theme.Surface,
-        BorderSizePixel = 0,
-        Active = true,
+        BackgroundColor3 = Theme.Surface, BorderSizePixel = 0, Active = true,
     }, frame)
     corner(titleBar, 12)
 
     create("TextLabel", {
-        BackgroundTransparency = 1,
-        Position = UDim2_fromOffset(12, 0),
+        BackgroundTransparency = 1, Position = UDim2_fromOffset(12, 0),
         Size = UDim2_new(1, -90, 1, 0),
-        Font = Enum_Font.GothamBold,
-        Text = "实时信息",
-        TextColor3 = Theme.Text,
-        TextSize = 13,
-        TextXAlignment = Enum.TextXAlignment.Left,
+        Font = Enum_Font.GothamBold, Text = "实时信息",
+        TextColor3 = Theme.Text, TextSize = 13,
+        TextXAlignment = TextX_Left,
     }, titleBar)
 
+    -- 最小化按钮
+    local minBtn = create("TextButton", {
+        Size = UDim2_fromOffset(24, 24),
+        Position = UDim2_new(1, -54, 0, 4),
+        BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
+        Font = Enum_Font.GothamBold, Text = "—",
+        TextColor3 = Theme.TextDim, TextSize = 14,
+    }, titleBar)
+    corner(minBtn, 6)
+
+    -- 关闭按钮
     local closeBtn = create("TextButton", {
         Size = UDim2_fromOffset(24, 24),
         Position = UDim2_new(1, -28, 0, 4),
-        BackgroundColor3 = Theme.SurfaceAlt,
-        BorderSizePixel = 0,
-        Font = Enum_Font.GothamBold,
-        Text = "×",
-        TextColor3 = Theme.TextDim,
-        TextSize = 16,
+        BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
+        Font = Enum_Font.GothamBold, Text = "×",
+        TextColor3 = Theme.TextDim, TextSize = 16,
     }, titleBar)
     corner(closeBtn, 6)
 
-    -- 玩家选择按钮
+    -- 玩家按钮
     local playerBtn = create("TextButton", {
         Position = UDim2_fromOffset(10, 40),
         Size = UDim2_new(1, -20, 0, 30),
-        BackgroundColor3 = Theme.Surface,
-        BorderSizePixel = 0,
-        Font = Enum_Font.GothamMedium,
-        Text = "查看：自己 ▼",
-        TextColor3 = Theme.Text,
-        TextSize = 13,
+        BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
+        Font = Enum_Font.GothamMedium, Text = "查看：自己 ▼",
+        TextColor3 = Theme.Text, TextSize = 13,
     }, frame)
     corner(playerBtn, 8)
     stroke(playerBtn, Theme.Border, 1)
-    InfoUI.playerBtn = playerBtn
+    Info.frames.playerBtn = playerBtn
 
-    -- 玩家列表（下拉）
+    -- 玩家列表
     local listFrame = create("ScrollingFrame", {
         Position = UDim2_fromOffset(10, 72),
         Size = UDim2_new(1, -20, 0, 150),
-        BackgroundColor3 = Theme.Surface,
-        BorderSizePixel = 0,
-        ScrollBarThickness = 4,
-        ScrollBarImageColor3 = Theme.Accent,
-        CanvasSize = UDim2_new(0, 0, 0, 0),
-        AutomaticCanvasSize = Enum.AutomaticSize.Y,
-        Visible = false,
-        ZIndex = 5,
+        BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
+        ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.Accent,
+        CanvasSize = UDim2_new(0, 0, 0, 0), AutomaticCanvasSize = UIAxis_Y,
+        ScrollingDirection = ScrollingDirection_Y,
+        Visible = false, ZIndex = 5,
     }, frame)
     corner(listFrame, 8)
     stroke(listFrame, Theme.Border, 1)
-    create("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder }, listFrame)
+    create("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = SortOrder_Layout }, listFrame)
     create("UIPadding", {
         PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4),
         PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4),
     }, listFrame)
-    InfoUI.listFrame = listFrame
+    Info.frames.listFrame = listFrame
 
     -- 数据区
     local dataFrame = create("Frame", {
@@ -1005,98 +1046,142 @@ local function buildInfoWindow()
     }, frame)
     create("UIPadding", {
         PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6),
-        PaddingLeft = UDim.new(0, 0), PaddingRight = UDim.new(0, 0),
+        PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
     }, dataFrame)
-    create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, dataFrame)
+    create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = SortOrder_Layout }, dataFrame)
+    Info.frames.dataFrame = dataFrame
 
-    InfoUI.rows.strength = createInfoRow(dataFrame, "力量", 1)
-    InfoUI.rows.gems     = createInfoRow(dataFrame, "宝石", 2)
-    InfoUI.rows.durability = createInfoRow(dataFrame, "耐力", 3)
-    InfoUI.rows.agility  = createInfoRow(dataFrame, "敏捷", 4)
-    InfoUI.rows.rebirths = createInfoRow(dataFrame, "重生", 5)
-    InfoUI.rows.perHour  = createInfoRow(dataFrame, "每小时预计", 6)
-    InfoUI.rows.perDay   = createInfoRow(dataFrame, "每天预计", 7)
+    local function createRow(label, order)
+        local row = create("Frame", {
+            Size = UDim2_new(1, 0, 0, 22),
+            BackgroundTransparency = 1,
+            LayoutOrder = order,
+        }, dataFrame)
+        create("TextLabel", {
+            BackgroundTransparency = 1,
+            Size = UDim2_new(0.5, 0, 1, 0),
+            Font = Enum_Font.GothamMedium, Text = label,
+            TextColor3 = Theme.TextDim, TextSize = 12,
+            TextXAlignment = TextX_Left,
+        }, row)
+        local val = create("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = UDim2_new(0.5, 0, 0, 0),
+            Size = UDim2_new(0.5, 0, 1, 0),
+            Font = Enum_Font.GothamBold, Text = "-",
+            TextColor3 = Theme.Text, TextSize = 12,
+            TextXAlignment = TextX_Right,
+        }, row)
+        return val
+    end
+
+    Info.rows.strength   = createRow("力量",     1)
+    Info.rows.strengthDelta = createRow("力量增量", 2)
+    Info.rows.gems       = createRow("宝石",     3)
+    Info.rows.durability = createRow("耐力",     4)
+    Info.rows.agility    = createRow("敏捷",     5)
+    Info.rows.rebirths   = createRow("重生",     6)
+    Info.rows.perSec     = createRow("每秒预计",  7)
+    Info.rows.perHour    = createRow("每小时预计", 8)
+    Info.rows.perDay     = createRow("每天预计",  9)
 
     -- 拖动
     local dragging, dragStart, startPos = false, nil, nil
     track(titleBar.InputBegan:Connect(function(input)
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1
-        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if input.UserInputType ~= UInputType_MB1 and input.UserInputType ~= UInputType_Touch then return end
         local ap = closeBtn.AbsolutePosition
         local as = closeBtn.AbsoluteSize
         if input.Position.X >= ap.X and input.Position.X <= ap.X + as.X
         and input.Position.Y >= ap.Y and input.Position.Y <= ap.Y + as.Y then return end
+        local mp = minBtn.AbsolutePosition
+        local ms = minBtn.AbsoluteSize
+        if input.Position.X >= mp.X and input.Position.X <= mp.X + ms.X
+        and input.Position.Y >= mp.Y and input.Position.Y <= mp.Y + ms.Y then return end
         dragging = true
         dragStart = input.Position
         startPos = frame.Position
     end))
-    track(UserInputService.InputChanged:Connect(function(input)
+
+    track(UIS_InputChanged:Connect(function(input)
         if not dragging then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseMovement
-        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if input.UserInputType ~= UInputType_MMove and input.UserInputType ~= UInputType_Touch then return end
         local d = input.Position - dragStart
         frame.Position = UDim2_new(startPos.X.Scale, startPos.X.Offset + d.X,
                                    startPos.Y.Scale, startPos.Y.Offset + d.Y)
     end))
-    track(UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
+
+    track(UIS_InputEnded:Connect(function(input)
+        if input.UserInputType == UInputType_MB1 or input.UserInputType == UInputType_Touch then
             dragging = false
         end
     end))
 
-    -- 关闭按钮：隐藏窗口而不是销毁（因为设置页开关控制）
+    -- 最小化
+    track(minBtn.MouseButton1Click:Connect(function()
+        Info.minimized = not Info.minimized
+        if Info.minimized then
+            playerBtn.Visible = false
+            listFrame.Visible = false
+            dataFrame.Visible = false
+            frame.Size = UDim2_fromOffset(260, 32)
+            minBtn.Text = "+"
+        else
+            playerBtn.Visible = true
+            dataFrame.Visible = true
+            frame.Size = UDim2_fromOffset(260, 340)
+            minBtn.Text = "—"
+        end
+    end))
+
+    -- 关闭
     track(closeBtn.MouseButton1Click:Connect(function()
         State.infoWindowEnabled = false
         screen.Enabled = false
-        InfoWindow.listOpen = false
+        Info.listOpen = false
         listFrame.Visible = false
         if State.ui.infoToggle then State.ui.infoToggle.set(false) end
     end))
 
-    -- 玩家列表按钮
+    -- 玩家列表
     track(playerBtn.MouseButton1Click:Connect(function()
-        InfoWindow.listOpen = not InfoWindow.listOpen
-        listFrame.Visible = InfoWindow.listOpen
-        if InfoWindow.listOpen then
-            -- 填充列表
+        Info.listOpen = not Info.listOpen
+        listFrame.Visible = Info.listOpen
+        if Info.listOpen then
             for _, c in ipairs(listFrame:GetChildren()) do
                 if c:IsA("TextButton") then c:Destroy() end
             end
-            local function addRow(plr, order)
+            local ord = 0
+            local function addRow(plr)
+                ord = ord + 1
                 local name = plr == LocalPlayer and (plr.Name .. " (自己)") or plr.Name
                 local btn = create("TextButton", {
                     Size = UDim2_new(1, 0, 0, 24),
                     BackgroundColor3 = Theme.SurfaceAlt,
                     BorderSizePixel = 0,
                     Font = Enum_Font.GothamMedium,
-                    Text = name,
-                    TextColor3 = Theme.Text,
-                    TextSize = 12,
-                    LayoutOrder = order,
+                    Text = name, TextColor3 = Theme.Text,
+                    TextSize = 12, LayoutOrder = ord,
                 }, listFrame)
                 corner(btn, 6)
                 track(btn.MouseButton1Click:Connect(function()
-                    InfoWindow.viewingPlayer = plr
+                    Info.viewingPlayer = plr
                     playerBtn.Text = "查看：" .. (plr == LocalPlayer and "自己" or plr.Name) .. " ▼"
-                    InfoWindow.listOpen = false
+                    Info.listOpen = false
                     listFrame.Visible = false
                 end))
             end
-            addRow(LocalPlayer, 1)
+            addRow(LocalPlayer)
             local others = GetPlayers(Players)
-            local ord = 2
             for _, plr in ipairs(others) do
-                if plr ~= LocalPlayer then addRow(plr, ord) ord = ord + 1 end
+                if plr ~= LocalPlayer then addRow(plr) end
             end
         end
     end))
 
-    -- 列表失焦自动关闭
-    track(UserInputService.InputBegan:Connect(function(input)
-        if not InfoWindow.listOpen then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1
-        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    -- 列表失焦关闭
+    track(UIS_InputBegan:Connect(function(input)
+        if not Info.listOpen then return end
+        if input.UserInputType ~= UInputType_MB1 and input.UserInputType ~= UInputType_Touch then return end
         local lp = listFrame.AbsolutePosition
         local ls = listFrame.AbsoluteSize
         local pb = playerBtn.AbsolutePosition
@@ -1105,49 +1190,64 @@ local function buildInfoWindow()
         local inList = ip.X >= lp.X and ip.X <= lp.X + ls.X and ip.Y >= lp.Y and ip.Y <= lp.Y + ls.Y
         local inBtn = ip.X >= pb.X and ip.X <= pb.X + ps.X and ip.Y >= pb.Y and ip.Y <= pb.Y + ps.Y
         if not inList and not inBtn then
-            InfoWindow.listOpen = false
+            Info.listOpen = false
             listFrame.Visible = false
         end
     end))
 
-    InfoWindow.viewingPlayer = LocalPlayer
+    Info.viewingPlayer = LocalPlayer
 end
 
 local function refreshInfoWindow()
-    if not InfoWindow.frame or not State.ui.infoGui then return end
+    if not Info.frames.frame or not State.ui.infoGui then return end
     if not State.ui.infoGui.Enabled then return end
+    if Info.minimized then return end
 
-    local plr = InfoWindow.viewingPlayer or LocalPlayer
+    local plr = Info.viewingPlayer
     if not plr or not plr.Parent then
-        InfoWindow.viewingPlayer = LocalPlayer
+        Info.viewingPlayer = LocalPlayer
         plr = LocalPlayer
-        InfoUI.playerBtn.Text = "查看：自己 ▼"
+        if Info.frames.playerBtn then Info.frames.playerBtn.Text = "查看：自己 ▼" end
     end
 
-    local strength = getStatValue(plr, "Strength")
-    local gems = getStatValue(plr, "Gems")
-    local dur = getStatValue(plr, "Durability")
-    local agi = getStatValue(plr, "Agility")
-    local reb = getStatValue(plr, "Rebirths")
+    local strength   = getStatValue(plr, "Strength")
+    local gems       = getStatValue(plr, "Gems")
+    local durability = getStatValue(plr, "Durability")
+    local agility    = getStatValue(plr, "Agility")
+    local rebirths   = getStatValue(plr, "Rebirths")
 
-    InfoUI.rows.strength.Text = formatNumber(strength)
-    InfoUI.rows.gems.Text = formatNumber(gems)
-    InfoUI.rows.durability.Text = formatNumber(dur)
-    InfoUI.rows.agility.Text = formatNumber(agi)
-    InfoUI.rows.rebirths.Text = formatNumber(reb)
+    Info.rows.strength.Text   = formatNumber(strength)
+    Info.rows.gems.Text       = formatNumber(gems)
+    Info.rows.durability.Text = formatNumber(durability)
+    Info.rows.agility.Text    = formatNumber(agility)
+    Info.rows.rebirths.Text   = formatNumber(rebirths)
 
     if plr == LocalPlayer then
-        local p = InfoWindow.predictor
-        InfoUI.rows.perHour.Text = formatNumber(p.ratePerSec * 3600)
-        InfoUI.rows.perDay.Text = formatNumber(p.ratePerSec * 86400)
+        -- 力量增量
+        if State.sessionStartStrength then
+            local delta = strength - State.sessionStartStrength
+            local sign = delta >= 0 and "+" or ""
+            Info.rows.strengthDelta.Text = sign .. formatNumber(delta)
+            if delta >= 0 then
+                Info.rows.strengthDelta.TextColor3 = Theme.Success
+            else
+                Info.rows.strengthDelta.TextColor3 = Theme.Danger
+            end
+        end
+        -- 速率
+        Info.rows.perSec.Text  = formatNumber(State.strengthPerSec)
+        Info.rows.perHour.Text = formatNumber(State.strengthPerSec * 3600)
+        Info.rows.perDay.Text  = formatNumber(State.strengthPerSec * 86400)
     else
-        InfoUI.rows.perHour.Text = "-"
-        InfoUI.rows.perDay.Text = "-"
+        Info.rows.strengthDelta.Text = "-"
+        Info.rows.perSec.Text  = "-"
+        Info.rows.perHour.Text = "-"
+        Info.rows.perDay.Text  = "-"
     end
 end
 
 -- ============================================================
--- 任务链
+-- 主循环（任务调度）
 -- ============================================================
 local TaskPriority = {
     AFK = 200, KILL = 150, DUAL = 140, REBIRTH = 120,
@@ -1160,7 +1260,6 @@ local function registerTask(task)
     table.sort(TaskChain, function(a, b) return a.priority > b.priority end)
 end
 
--- AFK
 registerTask({
     id = "afk", priority = TaskPriority.AFK,
     enabled = function() return true end,
@@ -1172,7 +1271,6 @@ registerTask({
     end,
 })
 
--- 杀戮
 registerTask({
     id = "kill", priority = TaskPriority.KILL,
     enabled = function() return State.killEnabled end,
@@ -1199,7 +1297,6 @@ registerTask({
     tick = runKillTick,
 })
 
--- 双工具
 registerTask({
     id = "dual", priority = TaskPriority.DUAL,
     enabled = function()
@@ -1211,7 +1308,6 @@ registerTask({
     tick = function() updateDualTool() end,
 })
 
--- 重生
 registerTask({
     id = "rebirth", priority = TaskPriority.REBIRTH,
     enabled = function() return State.autoRebirth end,
@@ -1224,7 +1320,6 @@ registerTask({
     end,
 })
 
--- 传送
 registerTask({
     id = "teleport", priority = TaskPriority.TELEPORT,
     enabled = function() return State.autoTeleport and not State.killEnabled end,
@@ -1236,7 +1331,6 @@ registerTask({
     end,
 })
 
--- 摄像机矫正
 registerTask({
     id = "camera", priority = TaskPriority.CAMERA,
     enabled = function() return State.killEnabled or State.autoTeleport end,
@@ -1248,20 +1342,33 @@ registerTask({
     end,
 })
 
--- 信息窗口刷新
 registerTask({
     id = "info", priority = TaskPriority.INFO,
     enabled = function() return State.infoWindowEnabled end,
     tick = function()
-        updatePredictor()
-        if State.time - InfoWindow.lastRefresh >= 0.5 then
-            InfoWindow.lastRefresh = State.time
+        -- 更新每秒增量
+        if State.time - State.strengthCheckAt >= 1 then
+            State.strengthCheckAt = State.time
+            local s = getMyStrength()
+            if State.sessionStartStrength == nil then
+                State.sessionStartStrength = s
+                State.lastStrengthSnapshot = s
+            else
+                local d = s - State.lastStrengthSnapshot
+                if d >= 0 then
+                    -- 滑动平均，避免抖动
+                    State.strengthPerSec = State.strengthPerSec * 0.7 + d * 0.3
+                end
+                State.lastStrengthSnapshot = s
+            end
+        end
+        if State.time - Info.lastRefresh >= 0.5 then
+            Info.lastRefresh = State.time
             refreshInfoWindow()
         end
     end,
 })
 
--- 工具切换
 registerTask({
     id = "tool", priority = TaskPriority.TOOL,
     enabled = function()
@@ -1305,7 +1412,6 @@ registerTask({
     end,
 })
 
--- 锻炼
 registerTask({
     id = "train", priority = TaskPriority.TRAIN,
     enabled = function() return State.autoTrain or State.fastTrain end,
@@ -1314,18 +1420,13 @@ registerTask({
         if State.fastTrain then rate = State.fastRate
         elseif State.autoTrain then rate = 10 end
         if rate <= 0 then return end
-
         State.trainAccum = State.trainAccum + rate * dt
         local count = math.floor(State.trainAccum)
         if count > 0 then
             State.trainAccum = State.trainAccum - count
             if count > 2000 then count = 2000 end
-
-            -- 触发器保护：不在机器上时不发送，避免异常触发
-            if not isOnMachine() then
-                return
-            end
-
+            -- 触发器保护
+            if not isOnMachine() then return end
             local ev = getMuscleEvent()
             if ev then
                 for _ = 1, count do
@@ -1336,7 +1437,6 @@ registerTask({
     end,
 })
 
--- 保存
 registerTask({
     id = "save", priority = TaskPriority.SAVE,
     enabled = function() return true end,
@@ -1349,9 +1449,10 @@ registerTask({
 })
 
 -- ============================================================
--- 全局状态
+-- 全局更新（独立于任务链）
 -- ============================================================
-local function updateGlobalState(dt)
+local function updateGlobal(dt)
+    -- 重力统一管理
     if State.killEnabled or State.autoTeleport then
         if Workspace.Gravity ~= 0 then pcall(function() Workspace.Gravity = 0 end) end
     else
@@ -1360,6 +1461,7 @@ local function updateGlobalState(dt)
         end
     end
 
+    -- 帧率窗口
     State.fpsWinTime = State.fpsWinTime + dt
     State.fpsWinFrames = State.fpsWinFrames + 1
     if State.fpsWinTime >= 0.5 then
@@ -1372,25 +1474,28 @@ local function updateGlobalState(dt)
         end
     end
 
-    -- 定期重扫防卡顿 / 纹理
+    -- 防卡顿 / 纹理定期重扫
     if AntiLag.enabled and State.time >= AntiLag.rescanAt then rescanAntiLag() end
     if TextureRemover.enabled and State.time >= TextureRemover.rescanAt then rescanTextureRemover() end
 
-    -- 宠物加成检测
+    -- 宠物加成
     if State.time - State.petRepBonusCheckedAt >= 5 then
         State.petRepBonusCheckedAt = State.time
         refreshPetBonus()
     end
+
+    -- 力量快照（会话开始）
+    if State.sessionStartStrength == nil then
+        State.sessionStartStrength = getMyStrength()
+        State.lastStrengthSnapshot = State.sessionStartStrength
+    end
 end
 
--- ============================================================
--- 主循环
--- ============================================================
 local function onHeartbeat(dt)
     if State.destroyed then return end
     State.time = State.time + dt
     refreshCache()
-    updateGlobalState(dt)
+    updateGlobal(dt)
 
     for i = 1, #TaskChain do
         local task = TaskChain[i]
@@ -1424,12 +1529,12 @@ track(LocalPlayer.CharacterAdded:Connect(function()
 end))
 
 -- ============================================================
--- UI
+-- 主 UI
 -- ============================================================
 local function buildUI()
     local screen = create("ScreenGui", {
         Name = "MuscleKingAutoUI", ResetOnSpawn = false,
-        ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 99999,
+        ZIndexBehavior = ZIndex_Sibling, DisplayOrder = 99999,
     }, PlayerGui)
     State.ui.screen = screen
 
@@ -1459,7 +1564,7 @@ local function buildUI()
         Size = UDim2_new(1, -110, 1, 0),
         Font = Enum_Font.GothamBold, Text = "肌肉之王自动化",
         TextColor3 = Theme.Text, TextSize = 15,
-        TextXAlignment = Enum.TextXAlignment.Left,
+        TextXAlignment = TextX_Left,
     }, titleBar)
 
     local minBtn = create("TextButton", {
@@ -1467,7 +1572,7 @@ local function buildUI()
         Position = UDim2_new(1, -68, 0, 7),
         BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
         Font = Enum_Font.GothamBold, Text = "—",
-        TextColor3 = Theme.TextDim, TextSize = 16, AutoButtonColor = true,
+        TextColor3 = Theme.TextDim, TextSize = 16,
     }, titleBar)
     corner(minBtn, 8)
 
@@ -1476,7 +1581,7 @@ local function buildUI()
         Position = UDim2_new(1, -36, 0, 7),
         BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
         Font = Enum_Font.GothamBold, Text = "×",
-        TextColor3 = Theme.TextDim, TextSize = 18, AutoButtonColor = true,
+        TextColor3 = Theme.TextDim, TextSize = 18,
     }, titleBar)
     corner(closeBtn, 8)
 
@@ -1493,7 +1598,7 @@ local function buildUI()
             Position = UDim2_new((order - 1) * TAB_W, 2, 0, 5),
             BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
             Font = Enum_Font.GothamMedium, Text = text,
-            TextColor3 = Theme.TextDim, TextSize = 11, AutoButtonColor = true,
+            TextColor3 = Theme.TextDim, TextSize = 11,
         }, tabBar)
         corner(btn, 8)
         return btn
@@ -1516,16 +1621,15 @@ local function buildUI()
             Name = name, Size = UDim2_new(1, 0, 1, 0),
             BackgroundTransparency = 1, BorderSizePixel = 0,
             ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.Accent,
-            CanvasSize = UDim2_new(0, 0, 0, 0),
-            AutomaticCanvasSize = Enum.AutomaticSize.Y,
-            ScrollingDirection = Enum.ScrollingDirection.Y,
+            CanvasSize = UDim2_new(0, 0, 0, 0), AutomaticCanvasSize = UIAxis_Y,
+            ScrollingDirection = ScrollingDirection_Y,
             Visible = false, ClipsDescendants = true,
         }, content)
         create("UIPadding", {
             PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
             PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10),
         }, page)
-        create("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+        create("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = SortOrder_Layout }, page)
         return page
     end
 
@@ -1534,7 +1638,7 @@ local function buildUI()
             Size = UDim2_new(1, -6, 0, 22), BackgroundTransparency = 1,
             Font = Enum_Font.GothamBold, Text = text,
             TextColor3 = Theme.TextDim, TextSize = 11,
-            TextXAlignment = Enum.TextXAlignment.Left,
+            TextXAlignment = TextX_Left,
         }, parent)
     end
 
@@ -1549,7 +1653,7 @@ local function buildUI()
             Size = UDim2_new(1, -76, 1, 0),
             Font = Enum_Font.GothamMedium, Text = label,
             TextColor3 = Theme.Text, TextSize = 13,
-            TextXAlignment = Enum.TextXAlignment.Left,
+            TextXAlignment = TextX_Left,
         }, row)
         local tb = create("Frame", {
             AnchorPoint = Vector2_new(1, 0.5),
@@ -1600,7 +1704,7 @@ local function buildUI()
             Size = UDim2_new(1, -132, 1, 0),
             Font = Enum_Font.GothamMedium, Text = label,
             TextColor3 = Theme.Text, TextSize = 13,
-            TextXAlignment = Enum.TextXAlignment.Left,
+            TextXAlignment = TextX_Left,
         }, row)
         local box = create("TextBox", {
             AnchorPoint = Vector2_new(1, 0.5),
@@ -1628,7 +1732,7 @@ local function buildUI()
             Size = UDim2_new(1, -6, 0, 38),
             BackgroundColor3 = Theme.AccentDim, BorderSizePixel = 0,
             Font = Enum_Font.GothamBold, Text = label,
-            TextColor3 = Theme.Text, TextSize = 14, AutoButtonColor = true,
+            TextColor3 = Theme.Text, TextSize = 14,
         }, parent)
         corner(btn, 10); stroke(btn, Theme.Accent, 1)
         track(btn.MouseButton1Click:Connect(onClick))
@@ -1640,12 +1744,12 @@ local function buildUI()
             Size = UDim2_new(1, -6, 0, 32), BackgroundTransparency = 1,
             Font = Enum_Font.Gotham, Text = text,
             TextColor3 = Theme.TextDim, TextSize = 11,
-            TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
-            TextYAlignment = Enum.TextYAlignment.Top,
+            TextWrapped = true, TextXAlignment = TextX_Left,
+            TextYAlignment = TextY_Top,
         }, parent)
     end
 
-    -- ===== 锻炼 =====
+    -- 锻炼
     local trainPage = newPage("TrainPage")
     local trainToggle, fastToggle
     trainToggle = addRowToggle(trainPage, "自动锻炼（固定 10 次/秒）", State.autoTrain, function(v)
@@ -1657,7 +1761,6 @@ local function buildUI()
         State.degradeLevel = 0
         if v and State.autoTrain then State.autoTrain = false trainToggle.set(false) end
         if v then
-            -- 检查宠物 Rep 加成
             refreshPetBonus()
             if State.petRepBonus < 100 then
                 notify(string.format("反复速度不足（当前 %d%%），功能可能无效", State.petRepBonus), 5)
@@ -1713,7 +1816,7 @@ local function buildUI()
         end
     end)
 
-    -- ===== 传送 =====
+    -- 传送
     local telePage = newPage("TelePage")
     State.ui.teleToggle = addRowToggle(telePage, "自动前往肌肉之王", State.autoTeleport, function(v)
         State.autoTeleport = v
@@ -1721,29 +1824,28 @@ local function buildUI()
     addActionButton(telePage, "单次传送", function() doTeleport() end)
     addHint(telePage, "每 0.05 秒循环传送，重力强制为 0，每 0.5 秒自动矫正摄像机。杀戮开启时会暂时接管。")
 
-    -- ===== 重生 =====
+    -- 重生
     local rebPage = newPage("RebPage")
     addRowToggle(rebPage, "自动重生", State.autoRebirth, function(v) State.autoRebirth = v end)
     addInput(rebPage, "频率（次/秒）", State.rebirthRate, 1, 100, function(n) State.rebirthRate = n end)
     addHint(rebPage, "使用 rEvents.rebirthRemote（RemoteFunction）+ 'rebirthRequest'。可与杀戮同时运行。")
 
-    -- ===== 杀戮 =====
+    -- 杀戮
     local killPage = newPage("KillPage")
     addRowToggle(killPage, "全图杀戮", State.killEnabled, function(v) State.killEnabled = v end)
     addInput(killPage, "力量/耐久 阈值", State.killThreshold, 1, 100, function(n) State.killThreshold = n end)
     addDivider(killPage, "── 双工具 ──")
     addRowToggle(killPage, "杀戮+锻炼 双工具切换", State.dualEnabled, function(v) State.dualEnabled = v end)
-    addHint(killPage, "杀戮期间会暂停自动传送，退出后自动恢复。")
+    addHint(killPage, "杀戮期间暂停自动传送，退出后自动恢复。")
 
-    -- ===== 设置 =====
+    -- 设置
     local setPage = newPage("SetPage")
-
     addDivider(setPage, "── 性能 ──")
-    addRowToggle(setPage, "防卡顿（移除粒子/阴影）", State.antiLagEnabled, function(v)
+    addRowToggle(setPage, "深度防卡顿", State.antiLagEnabled, function(v)
         State.antiLagEnabled = v
         if v then pcall(enableAntiLag) else pcall(disableAntiLag) end
     end)
-    addRowToggle(setPage, "移除纹理", State.textureRemoverEnabled, function(v)
+    addRowToggle(setPage, "深度移除纹理", State.textureRemoverEnabled, function(v)
         State.textureRemoverEnabled = v
         if v then pcall(enableTextureRemover) else pcall(disableTextureRemover) end
     end)
@@ -1757,11 +1859,8 @@ local function buildUI()
         State.infoWindowEnabled = v
         if State.ui.infoGui then State.ui.infoGui.Enabled = v end
     end)
-    addRowToggle(setPage, "数字格式化显示", State.formatEnabled, function(v)
-        State.formatEnabled = v
-    end)
-
-    addHint(setPage, "信息悬浮窗可自由拖动，右上角 × 关闭。悬浮窗内的玩家列表点击其他玩家可查看其信息。")
+    addRowToggle(setPage, "数字格式化显示", State.formatEnabled, function(v) State.formatEnabled = v end)
+    addHint(setPage, "信息悬浮窗可自由拖动、最小化。玩家列表点击其他玩家可查看其信息。")
 
     local function switchTab(id)
         trainPage.Visible = (id == "train")
@@ -1796,22 +1895,21 @@ local function buildUI()
            and pos.Y >= ap.Y and pos.Y <= ap.Y + as.Y
     end
     track(titleBar.InputBegan:Connect(function(input)
-        if input.UserInputType ~= Enum.UserInputType.MouseButton1
-        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if input.UserInputType ~= UInputType_MB1 and input.UserInputType ~= UInputType_Touch then return end
         if posIn(minBtn, input.Position) or posIn(closeBtn, input.Position) then return end
         dragging = true; dragStart = input.Position; dragStartPos = main.Position
     end))
-    track(UserInputService.InputChanged:Connect(function(input)
+    track(UIS_InputChanged:Connect(function(input)
         if not dragging then return end
-        if input.UserInputType ~= Enum.UserInputType.MouseMovement
-        and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        if input.UserInputType ~= UInputType_MMove and input.UserInputType ~= UInputType_Touch then return end
         local d = input.Position - dragStart
         main.Position = UDim2_new(dragStartPos.X.Scale, dragStartPos.X.Offset + d.X,
                                   dragStartPos.Y.Scale, dragStartPos.Y.Offset + d.Y)
     end))
-    track(UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    track(UIS_InputEnded:Connect(function(input)
+        if input.UserInputType == UInputType_MB1 or input.UserInputType == UInputType_Touch then
+            dragging = false
+        end
     end))
 
     local minimized = false
@@ -1841,7 +1939,6 @@ loadConfig()
 buildUI()
 buildInfoWindow()
 
--- 应用已加载的配置到 UI 与副作用
 if State.ui.rateBox then
     State.ui.rateBox.TextEditable = not State.adaptiveEnabled
     State.ui.rateBox.TextColor3 = State.adaptiveEnabled and Theme.TextDim or Theme.Text
