@@ -1,9 +1,9 @@
 --!nonstrict
--- 肌肉之王自动化 v15
--- 修复 Vec3.new bug / 传送缓存失效 / 训练批处理 / 重生后状态重置
+-- 肌肉之王自动化 v17
+-- 修复语法 / 渲染剔除实时生效 / 快速锻炼停止清理 / 定期清理防溢出
 
 local SCRIPT_ID   = "__MUSCLE_KING_AUTO__"
-local VERSION     = 1500
+local VERSION     = 1700
 local CONFIG_FILE = "muscle_king_auto_config.json"
 
 do
@@ -26,7 +26,6 @@ local SoundService      = game:GetService("SoundService")
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
-local LP_FFC       = LocalPlayer.FindFirstChild
 local GetPlayers   = Players.GetPlayers
 local RS_HB        = RunService.Heartbeat
 local UIS_IC       = UserInputService.InputChanged
@@ -73,9 +72,6 @@ local DEFAULT = {
     infoPos = UD2n(1, -280, 1, -360),
 }
 
--- ============================================================
--- 状态
--- ============================================================
 local State = {
     destroyed = false, conns = {}, ui = {},
 
@@ -90,6 +86,10 @@ local State = {
     killEnabled = false, killThreshold = 5,
     killScanAt = 0, killTarget = nil, killLastAttack = 0,
     killSavedState = nil, toolOwnedByKill = false,
+
+    autoKingKill = false, kingKillThreshold = 20,
+    kingKillTarget = nil, kingKillLastAttack = 0,
+    kingKillActive = false, lastKingCheck = 0,
 
     dualEnabled = true, dualLastSwitch = 0, dualCurrentMode = "punch",
 
@@ -117,12 +117,9 @@ local State = {
     lastDegradeAt = 0, degradeLevel = 0,
 
     lastAFKClick = 0, lastSaveAt = 0,
+    lastSweepAt = 0,
     sessionStartStrength = nil, strengthCheckAt = 0,
     lastStrengthSnapshot = 0, strengthPerSec = 0,
-
-    -- 传送诊断
-    lastTeleportOk = false,
-    lastTeleportReason = "",
 }
 
 local Cache = { char = nil, hum = nil, hrp = nil }
@@ -141,9 +138,6 @@ local function refreshCache()
     end
 end
 
--- ============================================================
--- 通用
--- ============================================================
 local function track(c) if c then table.insert(State.conns, c) end return c end
 local function create(cls, props, parent)
     local i = Instance.new(cls)
@@ -172,9 +166,6 @@ local function notify(text, duration)
     task.delay(duration, function() pcall(function() label:Destroy() end) end)
 end
 
--- ============================================================
--- 数字格式化
--- ============================================================
 local SUFFIXES = { "", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc",
     "Ud", "Dd", "Td", "Qad", "Qid", "Sxd", "Spd", "Ocd", "Nod", "Vg" }
 local function formatNumber(n)
@@ -188,9 +179,6 @@ local function formatNumber(n)
     return (neg and "-" or "") .. string.format("%.3f%s", n, SUFFIXES[idx])
 end
 
--- ============================================================
--- 配置
--- ============================================================
 local function saveConfig()
     if State.destroyed or type(writefile) ~= "function" then return end
     local data = {
@@ -199,6 +187,7 @@ local function saveConfig()
         toolDumbbell = State.toolDumbbell, toolPushups = State.toolPushups,
         toolHandstands = State.toolHandstands, toolSitups = State.toolSitups,
         killThreshold = State.killThreshold, dualEnabled = State.dualEnabled,
+        autoKingKill = State.autoKingKill, kingKillThreshold = State.kingKillThreshold,
         adaptiveEnabled = State.adaptiveEnabled, adaptiveThreshold = State.adaptiveThreshold,
         antiLagEnabled = State.antiLagEnabled,
         renderCullEnabled = State.renderCullEnabled, renderCullDist = State.renderCullDist,
@@ -249,6 +238,8 @@ local function loadConfig()
     State.toolSitups = bool("toolSitups", State.toolSitups)
     State.killThreshold = num("killThreshold", State.killThreshold, 1, 100)
     State.dualEnabled = bool("dualEnabled", State.dualEnabled)
+    State.autoKingKill = bool("autoKingKill", State.autoKingKill)
+    State.kingKillThreshold = num("kingKillThreshold", State.kingKillThreshold, 1, 1000)
     State.adaptiveEnabled = bool("adaptiveEnabled", State.adaptiveEnabled)
     State.adaptiveThreshold = num("adaptiveThreshold", State.adaptiveThreshold, 10, 120)
     State.antiLagEnabled = bool("antiLagEnabled", State.antiLagEnabled)
@@ -335,7 +326,6 @@ local function rescanAntiLag()
     AntiLag.rescanAt = State.time + 2
 end
 local function disableAntiLag()
-    if not AntiLag.enabled then return end
     AntiLag.enabled = false
     for _, p in ipairs(AntiLag.particles) do pcall(function() p.Enabled = true end) end
     table.clear(AntiLag.particles)
@@ -363,7 +353,7 @@ local function disableAntiLag()
 end
 
 -- ============================================================
--- 渲染剔除
+-- 渲染剔除（距离改动会立即生效）
 -- ============================================================
 local RenderCull = { hidden = {}, rescanAt = 0 }
 local function cullModel(model)
@@ -414,11 +404,15 @@ local function scanRenderCull()
     for model in pairs(RenderCull.hidden) do
         if not model.Parent then RenderCull.hidden[model] = nil end
     end
-    RenderCull.rescanAt = State.time + 1.5
+    RenderCull.rescanAt = State.time + 1
 end
 local function disableRenderCull()
     for model in pairs(RenderCull.hidden) do uncullModel(model) end
     table.clear(RenderCull.hidden)
+end
+local function forceRescanRenderCull()
+    pcall(disableRenderCull)
+    RenderCull.rescanAt = 0
 end
 
 -- ============================================================
@@ -503,23 +497,26 @@ end
 -- ============================================================
 -- 纹理移除
 -- ============================================================
-local TextureRemover = { enabled = false, rescanAt = 0, saved = {} }
+local TextureRemover = { enabled = false, rescanAt = 0, saved = {}, seen = {} }
 local function scanTextures()
     for _, obj in ipairs(Workspace:GetDescendants()) do
         local cls = obj.ClassName
         if cls == "Decal" or cls == "Texture" then
-            if obj.Texture ~= "" then
+            if not TextureRemover.seen[obj] and obj.Texture ~= "" then
+                TextureRemover.seen[obj] = true
                 table.insert(TextureRemover.saved, { obj = obj, prop = "Texture", value = obj.Texture })
                 obj.Texture = ""
             end
         elseif cls == "MeshPart" or cls == "SpecialMesh" then
             local p = (cls == "MeshPart") and "TextureID" or "TextureId"
-            if obj[p] and obj[p] ~= "" then
+            if not TextureRemover.seen[obj] and obj[p] and obj[p] ~= "" then
+                TextureRemover.seen[obj] = true
                 table.insert(TextureRemover.saved, { obj = obj, prop = p, value = obj[p] })
                 obj[p] = ""
             end
         elseif cls == "SurfaceAppearance" then
-            if obj.ColorMap ~= "" then
+            if not TextureRemover.seen[obj] and obj.ColorMap ~= "" then
+                TextureRemover.seen[obj] = true
                 table.insert(TextureRemover.saved, { obj = obj, prop = "ColorMap", value = obj.ColorMap })
                 obj.ColorMap = ""
             end
@@ -530,6 +527,7 @@ local function enableTextureRemover()
     if TextureRemover.enabled then return end
     TextureRemover.enabled = true
     table.clear(TextureRemover.saved)
+    table.clear(TextureRemover.seen)
     scanTextures()
     TextureRemover.rescanAt = State.time + 4
 end
@@ -539,17 +537,14 @@ local function rescanTextureRemover()
     TextureRemover.rescanAt = State.time + 4
 end
 local function disableTextureRemover()
-    if not TextureRemover.enabled then return end
     TextureRemover.enabled = false
     for _, item in ipairs(TextureRemover.saved) do
         pcall(function() item.obj[item.prop] = item.value end)
     end
     table.clear(TextureRemover.saved)
+    table.clear(TextureRemover.seen)
 end
 
--- ============================================================
--- 隐藏 UI
--- ============================================================
 local HiddenUIs = {}
 local function hideAllUI()
     table.clear(HiddenUIs)
@@ -568,8 +563,75 @@ local function restoreHiddenUI()
 end
 
 -- ============================================================
--- 清理
+-- 定期清理溢出（不干扰正在运行的功能）
 -- ============================================================
+local function sweepOverflow()
+    -- AntiLag.particles
+    for i = #AntiLag.particles, 1, -1 do
+        local p = AntiLag.particles[i]
+        if not p or not p.Parent then table.remove(AntiLag.particles, i) end
+    end
+    -- AntiLag.shadows
+    for i = #AntiLag.shadows, 1, -1 do
+        local it = AntiLag.shadows[i]
+        if not it.part or not it.part.Parent then table.remove(AntiLag.shadows, i) end
+    end
+    -- AntiLag.sounds
+    for i = #AntiLag.sounds, 1, -1 do
+        local it = AntiLag.sounds[i]
+        if not it.sound or not it.sound.Parent then table.remove(AntiLag.sounds, i) end
+    end
+    -- AntiLag.postEffects
+    for i = #AntiLag.postEffects, 1, -1 do
+        local fx = AntiLag.postEffects[i]
+        if not fx or not fx.Parent then table.remove(AntiLag.postEffects, i) end
+    end
+    -- AntiLag.atmospheres
+    for i = #AntiLag.atmospheres, 1, -1 do
+        local it = AntiLag.atmospheres[i]
+        if not it.obj or not it.obj.Parent then table.remove(AntiLag.atmospheres, i) end
+    end
+    -- RenderCull.hidden
+    for model in pairs(RenderCull.hidden) do
+        if not model.Parent then RenderCull.hidden[model] = nil end
+    end
+    -- TextureRemover.saved
+    for i = #TextureRemover.saved, 1, -1 do
+        local it = TextureRemover.saved[i]
+        if not it.obj or not it.obj.Parent then table.remove(TextureRemover.saved, i) end
+    end
+    -- TextureRemover.seen
+    for obj in pairs(TextureRemover.seen) do
+        if not obj.Parent then TextureRemover.seen[obj] = nil end
+    end
+    -- PetHider
+    for i = #PetHider.own, 1, -1 do
+        if not PetHider.own[i].Parent then table.remove(PetHider.own, i) end
+    end
+    for i = #PetHider.all, 1, -1 do
+        if not PetHider.all[i].Parent then table.remove(PetHider.all, i) end
+    end
+    for i = #PetHider.machines, 1, -1 do
+        if not PetHider.machines[i].Parent then table.remove(PetHider.machines, i) end
+    end
+    -- HiddenUIs
+    for i = #HiddenUIs, 1, -1 do
+        if not HiddenUIs[i].Parent then table.remove(HiddenUIs, i) end
+    end
+end
+
+-- ============================================================
+-- 训练停止时的清理
+-- ============================================================
+local function cleanupTrainingState()
+    State.trainAccum = 0
+    State.degradeLevel = 0
+    State.fpsWinTime = 0
+    State.fpsWinFrames = 0
+    State.adaptiveStableCount = 0
+    State.adaptiveStep = 100
+end
+
 local function destroy()
     if State.destroyed then return end
     pcall(saveConfig)
@@ -611,14 +673,11 @@ local function performAFKClick()
         pcall(function()
             VIM:SendMouseButtonEvent(tx, ty, 0, true, game, 0)
             VIM:SendMouseButtonEvent(tx, ty, 0, false, game, 0)
-            if hasOrig then VIM:SendSendMouseMoveEvent(ox, oy, game) end
+            if hasOrig then VIM:SendMouseMoveEvent(ox, oy, game) end
         end)
     end
 end
 
--- ============================================================
--- 摄像机
--- ============================================================
 local function fixCamera()
     local cam = Workspace.CurrentCamera
     if not cam then return end
@@ -646,22 +705,10 @@ local function matchKeyword(name, list)
     for i = 1, #list do if n:find(list[i]) then return true end end
     return false
 end
-local function isToolMatch(tool, list)
-    if not tool or not tool:IsA("Tool") then return false end
-    return matchKeyword(tool.Name, list)
-end
 local function isEquipped(list)
     local char = Cache.char
     if not char then return false end
     for _, c in ipairs(char:GetChildren()) do
-        if c:IsA("Tool") and matchKeyword(c.Name, list) then return true end
-    end
-    return false
-end
-local function hasInBackpack(list)
-    local bp = LP_FFC(LocalPlayer, "Backpack")
-    if not bp then return false end
-    for _, c in ipairs(bp:GetChildren()) do
         if c:IsA("Tool") and matchKeyword(c.Name, list) then return true end
     end
     return false
@@ -673,7 +720,7 @@ local function findAnyTool(list)
             if c:IsA("Tool") and matchKeyword(c.Name, list) then return c end
         end
     end
-    local bp = LP_FFC(LocalPlayer, "Backpack")
+    local bp = LocalPlayer:FindFirstChild("Backpack")
     if bp then
         for _, c in ipairs(bp:GetChildren()) do
             if c:IsA("Tool") and matchKeyword(c.Name, list) then return c end
@@ -685,7 +732,7 @@ local function tryEquip(list)
     if isEquipped(list) then return true end
     local hum = Cache.hum
     if not hum then return false end
-    local bp = LP_FFC(LocalPlayer, "Backpack")
+    local bp = LocalPlayer:FindFirstChild("Backpack")
     if not bp then return false end
     for _, c in ipairs(bp:GetChildren()) do
         if c:IsA("Tool") and matchKeyword(c.Name, list) then
@@ -695,7 +742,7 @@ local function tryEquip(list)
     end
     return false
 end
-local function toolExists(list) return isEquipped(list) or hasInBackpack(list) end
+local function toolExists(list) return isEquipped(list) or (LocalPlayer:FindFirstChild("Backpack") and findAnyTool(list) ~= nil) end
 local function suicide()
     local hum = Cache.hum
     if hum and hum.Health > 0 then hum.Health = 0
@@ -720,7 +767,7 @@ local function getMyStrength() return getStatValue(LocalPlayer, "Strength") end
 local function getPlayerDurability(plr) return getStatValue(plr, "Durability") end
 
 -- ============================================================
--- 宠物反复速度加成
+-- 宠物反复速度
 -- ============================================================
 local REP_KEYWORDS = { "rep", "反复", "反击", "reptime", "repspeed", "reptimeboost" }
 local function isRepKeyword(name)
@@ -730,48 +777,58 @@ local function isRepKeyword(name)
     end
     return false
 end
-local function scanPetPerks(petFolder)
+local function readRepBonusFromPerks(perks)
+    if not perks then return 0 end
     local total = 0
-    local detail = {}
-    local perks = petFolder:FindFirstChild("perksFolder")
-    if not perks then return 0, {} end
     for _, p in ipairs(perks:GetChildren()) do
         if p:IsA("ValueBase") and isRepKeyword(p.Name) then
-            local v = tonumber(p.Value) or 0
-            if v > 0 then
-                total = total + v
-                table.insert(detail, p.Name .. "=" .. tostring(v))
-            end
+            total = total + (tonumber(p.Value) or 0)
         end
     end
-    return total, detail
+    return total
 end
 local function getEquippedPetRepSpeedBonus()
     local total = 0
     local detail = {}
     local ownFolder = Workspace:FindFirstChild(LocalPlayer.Name)
     if ownFolder then
+        local seenSlots = {}
         for _, pet in ipairs(ownFolder:GetChildren()) do
-            local t, d = scanPetPerks(pet)
-            total = total + t
-            for _, x in ipairs(d) do table.insert(detail, pet.Name .. ":" .. x) end
+            local slot = pet:GetAttribute("equippedSlot")
+            local key
+            if slot and slot ~= "" then key = "slot:" .. slot
+            else key = "obj:" .. tostring(pet) end
+            if not seenSlots[key] then
+                seenSlots[key] = true
+                local perks = pet:FindFirstChild("perksFolder")
+                local v = readRepBonusFromPerks(perks)
+                if v > 0 then
+                    total = total + v
+                    table.insert(detail, (slot or pet.Name) .. "=" .. tostring(v))
+                end
+            end
         end
+        if total > 0 then return total, detail end
     end
-    if total > 0 then return total, detail end
-    local equipped = LP_FFC(LocalPlayer, "equippedPets")
+    local equipped = LocalPlayer:FindFirstChild("equippedPets")
     if not equipped then return 0, {} end
     local shared = ReplicatedStorage:FindFirstChild("shared")
     local runtime = shared and shared:FindFirstChild("runtime")
     local previews = runtime and runtime:FindFirstChild("petPreviews")
     if not previews then return 0, {} end
+    local seen = {}
     for _, slot in ipairs(equipped:GetChildren()) do
-        local name = slot.Value
-        if type(name) == "string" and name ~= "" then
-            local pet = previews:FindFirstChild(name)
-            if pet then
-                local t, d = scanPetPerks(pet)
-                total = total + t
-                for _, x in ipairs(d) do table.insert(detail, name .. ":" .. x) end
+        local petName = slot.Value
+        if type(petName) == "string" and petName ~= "" then
+            local petModel = previews:FindFirstChild(petName)
+            if petModel and not seen[petModel] then
+                seen[petModel] = true
+                local perks = petModel:FindFirstChild("perksFolder")
+                local v = readRepBonusFromPerks(perks)
+                if v > 0 then
+                    total = total + v
+                    table.insert(detail, petName .. "=" .. tostring(v))
+                end
             end
         end
     end
@@ -784,7 +841,7 @@ local function refreshPetBonus()
 end
 
 -- ============================================================
--- 事件（每次严格验证 Parent）
+-- 事件
 -- ============================================================
 local function getMuscleEvent()
     local cached = State.muscleEventRef
@@ -820,64 +877,201 @@ local function fireRebirth()
 end
 
 -- ============================================================
--- 传送（重写：不带缓存，直接获取；使用 V3n 而非 Vec3.new）
+-- 肌肉之王检测
 -- ============================================================
--- 该函数每 0.05 秒最多找一次传送门，结果缓存不超过 5 秒
-local PortalCache, PortalCacheAt = nil, 0
+local function getMuscleKing()
+    local shared = ReplicatedStorage:FindFirstChild("shared")
+    if not shared then return nil end
+    local state = shared:FindFirstChild("state")
+    if not state then return nil end
+    local world = state:FindFirstChild("World")
+    if not world then return nil end
+    local mk = world:FindFirstChild("muscleKing")
+    if not mk then return nil end
+    if mk:IsA("ObjectValue") then
+        local v = mk.Value
+        if v and v:IsA("Player") then return v end
+    elseif mk:IsA("StringValue") then
+        if mk.Value ~= "" then return Players:FindFirstChild(mk.Value) end
+    end
+    return nil
+end
 
+-- ============================================================
+-- 传送
+-- ============================================================
+local PortalCache, PortalCacheAt = nil, 0
 local function findPortalNow()
     local p = Workspace:FindFirstChild("beachToMuscleKing", true)
     if p and p:IsA("BasePart") then return p end
     return nil
 end
-
 local function getPortal()
-    if PortalCache and PortalCache.Parent
-    and State.time - PortalCacheAt < 5 then
+    if PortalCache and PortalCache.Parent and State.time - PortalCacheAt < 5 then
         return PortalCache
     end
     PortalCache = findPortalNow()
     PortalCacheAt = State.time
     return PortalCache
 end
-
--- 返回 CFrame 或 nil
 local function getTargetCF()
     local portal = getPortal()
-    if portal then
-        -- 直接站在传送门位置 + Y 偏移 3
-        -- 注意：用 CN（CFrame.new）而不是 CFrame.new，用 V3n 而不是 V3n.new
-        return CN(portal.Position + V3n(0, 3, 0))
-    end
-    -- 兜底坐标（用户给的 muscle king 位置）
+    if portal then return CN(portal.Position + V3n(0, 3, 0)) end
     return CN(V3n(-8727.1, 406.7, -5796.4))
 end
-
 local function doTeleport(force)
-    if force then
-        PortalCache = nil
-        PortalCacheAt = 0
-    end
+    if force then PortalCache = nil; PortalCacheAt = 0 end
     local hrp = Cache.hrp
-    if not hrp then
-        State.lastTeleportOk = false
-        State.lastTeleportReason = "no hrp"
-        return false
-    end
+    if not hrp then return false end
     local cf = getTargetCF()
-    if not cf then
-        State.lastTeleportOk = false
-        State.lastTeleportReason = "no cf"
-        return false
-    end
-    local ok = pcall(function()
+    if not cf then return false end
+    return pcall(function()
         hrp.CFrame = cf
         hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
         hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
     end)
-    State.lastTeleportOk = ok
-    State.lastTeleportReason = ok and "ok" or "pcall failed"
-    return ok
+end
+
+-- ============================================================
+-- 杀戮工具函数
+-- ============================================================
+local function getCharacterHRP(plr)
+    local char = plr and plr.Character
+    if not char then return nil end
+    local hrp = char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    local h = char:FindFirstChildOfClass("Humanoid")
+    if not h or h.Health <= 0 then return nil end
+    return hrp, h
+end
+local function applyKillMovement(targetHRP)
+    local hrp = Cache.hrp
+    if not hrp then return end
+    local delta = targetHRP.Position - hrp.Position
+    local distSq = delta.X*delta.X + delta.Y*delta.Y + delta.Z*delta.Z
+    if distSq > 9 then
+        local dist = math.sqrt(distSq)
+        local newPos = targetHRP.Position - delta / dist * 2.5
+        local newCF = CN(newPos, targetHRP.Position)
+        pcall(function()
+            hrp.CFrame = newCF
+            hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+            hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
+        end)
+    end
+end
+local function activatePunch()
+    local char = Cache.char
+    if not char then return end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool then pcall(function() tool:Activate() end) end
+end
+
+-- ============================================================
+-- 全图杀戮
+-- ============================================================
+local function selectKillTarget()
+    local myStrength = getMyStrength()
+    local threshold = State.killThreshold or 5
+    local list = GetPlayers(Players)
+    for i = 1, #list do
+        local plr = list[i]
+        if plr ~= LocalPlayer then
+            local hrp = getCharacterHRP(plr)
+            if hrp then
+                local dur = getPlayerDurability(plr)
+                if dur == nil then return plr end
+                if myStrength > 0 and myStrength * threshold >= dur then return plr end
+            end
+        end
+    end
+    return nil
+end
+local function runKillTick(dt)
+    if State.time - State.killScanAt >= 0.5 then
+        State.killScanAt = State.time
+        local cur = State.killTarget
+        local valid = cur and getCharacterHRP(cur)
+        if not valid then
+            State.killTarget = selectKillTarget()
+        else
+            local myStrength = getMyStrength()
+            local dur = getPlayerDurability(cur)
+            if dur and myStrength > 0 and myStrength * (State.killThreshold or 5) < dur then
+                State.killTarget = selectKillTarget()
+            end
+        end
+        State.toolOwnedByKill = State.killTarget ~= nil
+    end
+    local target = State.killTarget
+    if not target then State.toolOwnedByKill = false return end
+    local targetHRP = getCharacterHRP(target)
+    if not targetHRP then
+        State.killTarget = nil
+        State.toolOwnedByKill = false
+        return
+    end
+    applyKillMovement(targetHRP)
+    local dual = State.dualEnabled and (State.autoTrain or State.fastTrain)
+    if not dual then
+        if State.time - State.killLastAttack >= 0.05 then
+            State.killLastAttack = State.time
+            if not isEquipped(TOOL_KEYWORDS.punch) then
+                tryEquip(TOOL_KEYWORDS.punch)
+            end
+            activatePunch()
+        end
+    end
+end
+
+-- ============================================================
+-- 肌肉之王竞争
+-- ============================================================
+local function runKingKillTick(dt)
+    if State.time - State.lastKingCheck >= 0.5 then
+        State.lastKingCheck = State.time
+        local king = getMuscleKing()
+        if not king or king == LocalPlayer then
+            State.kingKillTarget = nil
+            State.kingKillActive = false
+            return
+        end
+        local hrp = getCharacterHRP(king)
+        if not hrp then
+            State.kingKillTarget = nil
+            State.kingKillActive = false
+            return
+        end
+        local myStrength = getMyStrength()
+        local targetDur = getPlayerDurability(king)
+        local threshold = State.kingKillThreshold or 20
+        if targetDur and myStrength > 0 and targetDur >= myStrength * threshold then
+            State.kingKillTarget = nil
+            State.kingKillActive = false
+            return
+        end
+        State.kingKillTarget = king
+    end
+    local target = State.kingKillTarget
+    if not target then
+        State.kingKillActive = false
+        return
+    end
+    local targetHRP = getCharacterHRP(target)
+    if not targetHRP then
+        State.kingKillTarget = nil
+        State.kingKillActive = false
+        return
+    end
+    State.kingKillActive = true
+    applyKillMovement(targetHRP)
+    if State.time - State.kingKillLastAttack >= 0.05 then
+        State.kingKillLastAttack = State.time
+        if not isEquipped(TOOL_KEYWORDS.punch) then
+            tryEquip(TOOL_KEYWORDS.punch)
+        end
+        activatePunch()
+    end
 end
 
 -- ============================================================
@@ -927,94 +1121,6 @@ local function updateDualTool()
             end)
         else
             State.dualCurrentMode = "train"
-        end
-    end
-end
-
--- ============================================================
--- 杀戮
--- ============================================================
-local function getCharacterHRP(plr)
-    local char = plr and plr.Character
-    if not char then return nil end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return nil end
-    local h = char:FindFirstChildOfClass("Humanoid")
-    if not h or h.Health <= 0 then return nil end
-    return hrp, h
-end
-local function selectKillTarget()
-    local myStrength = getMyStrength()
-    local threshold = State.killThreshold or 5
-    local list = GetPlayers(Players)
-    for i = 1, #list do
-        local plr = list[i]
-        if plr ~= LocalPlayer then
-            local hrp = getCharacterHRP(plr)
-            if hrp then
-                local dur = getPlayerDurability(plr)
-                if dur == nil then return plr end
-                if myStrength > 0 and myStrength * threshold >= dur then return plr end
-            end
-        end
-    end
-    return nil
-end
-local function applyKillMovement(targetHRP)
-    local hrp = Cache.hrp
-    if not hrp then return end
-    local delta = targetHRP.Position - hrp.Position
-    local distSq = delta.X*delta.X + delta.Y*delta.Y + delta.Z*delta.Z
-    if distSq > 9 then
-        local dist = math.sqrt(distSq)
-        local newPos = targetHRP.Position - delta / dist * 2.5
-        local newCF = CN(newPos, targetHRP.Position)
-        pcall(function()
-            hrp.CFrame = newCF
-            hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
-            hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
-        end)
-    end
-end
-local function activatePunch()
-    local char = Cache.char
-    if not char then return end
-    local tool = char:FindFirstChildOfClass("Tool")
-    if tool then pcall(function() tool:Activate() end) end
-end
-local function runKillTick(dt)
-    if State.time - State.killScanAt >= 0.5 then
-        State.killScanAt = State.time
-        local cur = State.killTarget
-        local valid = cur and getCharacterHRP(cur)
-        if not valid then
-            State.killTarget = selectKillTarget()
-        else
-            local myStrength = getMyStrength()
-            local dur = getPlayerDurability(cur)
-            if dur and myStrength > 0 and myStrength * (State.killThreshold or 5) < dur then
-                State.killTarget = selectKillTarget()
-            end
-        end
-        State.toolOwnedByKill = State.killTarget ~= nil
-    end
-    local target = State.killTarget
-    if not target then State.toolOwnedByKill = false return end
-    local targetHRP = getCharacterHRP(target)
-    if not targetHRP then
-        State.killTarget = nil
-        State.toolOwnedByKill = false
-        return
-    end
-    applyKillMovement(targetHRP)
-    local dual = State.dualEnabled and (State.autoTrain or State.fastTrain)
-    if not dual then
-        if State.time - State.killLastAttack >= 0.05 then
-            State.killLastAttack = State.time
-            if not isEquipped(TOOL_KEYWORDS.punch) then
-                tryEquip(TOOL_KEYWORDS.punch)
-            end
-            activatePunch()
         end
     end
 end
@@ -1070,6 +1176,7 @@ local function handleDegradation()
         State.degradeLevel = 3; State.fastTrain = false; State.autoTrain = false
         if State.ui.fastToggle then State.ui.fastToggle.set(false) end
         if State.ui.trainToggle then State.ui.trainToggle.set(false) end
+        cleanupTrainingState()
         notify("孩子，你的设备这么差就别玩游戏了", 6)
     end
 end
@@ -1114,10 +1221,8 @@ local function buildInfoWindow()
     State.ui.infoScale = uiScale
 
     local frame = create("Frame", {
-        Name = "InfoFrame",
-        AnchorPoint = V2n(0, 0),
-        Position = DEFAULT.infoPos,
-        Size = UD2o(260, 340),
+        Name = "InfoFrame", AnchorPoint = V2n(0, 0),
+        Position = DEFAULT.infoPos, Size = UD2o(260, 340),
         BackgroundColor3 = Theme.Background,
         BorderSizePixel = 0, ClipsDescendants = true, Active = true,
     }, screen)
@@ -1130,13 +1235,11 @@ local function buildInfoWindow()
         BorderSizePixel = 0, Active = true,
     }, frame)
     corner(titleBar, 12)
-
     create("TextLabel", {
         BackgroundTransparency = 1, Position = UD2o(12, 0),
         Size = UD2n(1, -90, 1, 0),
         Font = Font.GothamBold, Text = "实时信息",
-        TextColor3 = Theme.Text, TextSize = 13,
-        TextXAlignment = E_TxtXL,
+        TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
     }, titleBar)
 
     local minBtn = create("TextButton", {
@@ -1146,7 +1249,6 @@ local function buildInfoWindow()
         TextColor3 = Theme.TextDim, TextSize = 14,
     }, titleBar)
     corner(minBtn, 6)
-
     local closeBtn = create("TextButton", {
         Size = UD2o(24, 24), Position = UD2n(1, -28, 0, 4),
         BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
@@ -1170,8 +1272,7 @@ local function buildInfoWindow()
         BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
         ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.Accent,
         CanvasSize = UD2n(0, 0, 0, 0), AutomaticCanvasSize = E_AS_Y,
-        ScrollingDirection = E_ScrollY,
-        Visible = false, ZIndex = 5,
+        ScrollingDirection = E_ScrollY, Visible = false, ZIndex = 5,
     }, frame)
     corner(listFrame, 8)
     stroke(listFrame, Theme.Border, 1)
@@ -1201,19 +1302,16 @@ local function buildInfoWindow()
         create("TextLabel", {
             BackgroundTransparency = 1, Size = UD2n(0.5, 0, 1, 0),
             Font = Font.GothamMedium, Text = label,
-            TextColor3 = Theme.TextDim, TextSize = 12,
-            TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.TextDim, TextSize = 12, TextXAlignment = E_TxtXL,
         }, row)
         local val = create("TextLabel", {
             BackgroundTransparency = 1, Position = UD2n(0.5, 0, 0, 0),
             Size = UD2n(0.5, 0, 1, 0),
             Font = Font.GothamBold, Text = "-",
-            TextColor3 = Theme.Text, TextSize = 12,
-            TextXAlignment = E_TxtXR,
+            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXR,
         }, row)
         return val
     end
-
     Info.rows.strength   = createRow("力量", 1)
     Info.rows.strengthDelta = createRow("力量增量", 2)
     Info.rows.gems       = createRow("宝石", 3)
@@ -1385,23 +1483,16 @@ local function buildResetButton()
     local screen = State.ui.screen
     if not screen then return end
     local btn = create("TextButton", {
-        Name = "ResetBtn",
-        AnchorPoint = V2n(0, 1),
-        Position = UD2n(0, 20, 1, -20),
-        Size = UD2o(56, 56),
-        BackgroundColor3 = Theme.Surface,
-        BackgroundTransparency = 0.25,
-        BorderSizePixel = 0,
-        Text = "复位",
-        Font = Font.GothamBold,
-        TextColor3 = Theme.TextDim,
-        TextSize = 12,
+        Name = "ResetBtn", AnchorPoint = V2n(0, 1),
+        Position = UD2n(0, 20, 1, -20), Size = UD2o(56, 56),
+        BackgroundColor3 = Theme.Surface, BackgroundTransparency = 0.25,
+        BorderSizePixel = 0, Text = "复位",
+        Font = Font.GothamBold, TextColor3 = Theme.TextDim, TextSize = 12,
         ZIndex = 150,
     }, screen)
     corner(btn, 28)
     stroke(btn, Theme.Border, 1)
     State.ui.resetBtn = btn
-
     track(btn.InputBegan:Connect(function(input)
         if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
         ResetBtnState.pressAt = tick()
@@ -1456,10 +1547,10 @@ end
 -- 任务链
 -- ============================================================
 local TaskPriority = {
-    AFK = 200, KILL = 150, DUAL = 140, REBIRTH = 120,
+    AFK = 200, KING_KILL = 160, KILL = 150, DUAL = 140, REBIRTH = 120,
     TELEPORT = 100, CAMERA = 90, INFO = 85, TOOL = 80, TRAIN = 60,
-    RESET = 55,
-    ANTILAG = 40, CULL = 35, HIDER = 30, TEX = 25, SAVE = 10,
+    RESET = 55, ANTILAG = 40, CULL = 35, HIDER = 30, TEX = 25,
+    SWEEP = 20, SAVE = 10,
 }
 
 local TaskChain = {}
@@ -1478,8 +1569,17 @@ registerTask({ id = "afk", priority = TaskPriority.AFK,
     end,
 })
 
+registerTask({ id = "kingKill", priority = TaskPriority.KING_KILL,
+    enabled = function() return State.autoKingKill end,
+    onDisable = function()
+        State.kingKillTarget = nil
+        State.kingKillActive = false
+    end,
+    tick = runKingKillTick,
+})
+
 registerTask({ id = "kill", priority = TaskPriority.KILL,
-    enabled = function() return State.killEnabled end,
+    enabled = function() return State.killEnabled and not State.kingKillActive end,
     onEnable = function()
         State.killSavedState = { autoTeleport = State.autoTeleport }
         State.autoTeleport = false
@@ -1498,7 +1598,6 @@ registerTask({ id = "kill", priority = TaskPriority.KILL,
         State.killTarget = nil
         State.toolOwnedByKill = false
         State.dualCurrentMode = "punch"
-        notify("已退出杀戮模式", 3)
     end,
     tick = runKillTick,
 })
@@ -1507,6 +1606,7 @@ registerTask({ id = "dual", priority = TaskPriority.DUAL,
     enabled = function()
         return State.dualEnabled and State.killEnabled
             and State.killTarget ~= nil and (State.autoTrain or State.fastTrain)
+            and not State.kingKillActive
     end,
     onDisable = function() State.dualCurrentMode = "punch" end,
     tick = function() updateDualTool() end,
@@ -1524,7 +1624,9 @@ registerTask({ id = "rebirth", priority = TaskPriority.REBIRTH,
 })
 
 registerTask({ id = "teleport", priority = TaskPriority.TELEPORT,
-    enabled = function() return State.autoTeleport and not State.killEnabled end,
+    enabled = function()
+        return State.autoTeleport and not State.killEnabled and not State.kingKillActive
+    end,
     tick = function()
         if State.time - State.lastTeleportAt >= 0.05 then
             State.lastTeleportAt = State.time
@@ -1534,7 +1636,7 @@ registerTask({ id = "teleport", priority = TaskPriority.TELEPORT,
 })
 
 registerTask({ id = "camera", priority = TaskPriority.CAMERA,
-    enabled = function() return State.killEnabled or State.autoTeleport end,
+    enabled = function() return State.killEnabled or State.autoTeleport or State.kingKillActive end,
     tick = function()
         if State.time - State.lastCameraFix >= 0.5 then
             State.lastCameraFix = State.time
@@ -1571,6 +1673,7 @@ registerTask({ id = "tool", priority = TaskPriority.TOOL,
     enabled = function()
         local isTraining = State.autoTrain or State.fastTrain
         return isTraining and not State.toolCooldown and not State.toolOwnedByKill
+            and not State.kingKillActive
     end,
     tick = function()
         if State.time - State.lastToolCheck < 0.1 then return end
@@ -1609,15 +1712,15 @@ registerTask({ id = "tool", priority = TaskPriority.TOOL,
     end,
 })
 
--- 训练：批量 pcall，无机器检查
 registerTask({ id = "train", priority = TaskPriority.TRAIN,
-    enabled = function() return State.autoTrain or State.fastTrain end,
+    enabled = function()
+        return (State.autoTrain or State.fastTrain) and not State.kingKillActive
+    end,
     tick = function(dt)
         local rate = 0
         if State.fastTrain then rate = State.fastRate
         elseif State.autoTrain then rate = 10 end
         if rate <= 0 then return end
-
         State.trainAccum = State.trainAccum + rate * dt
         local count = math.floor(State.trainAccum)
         if count > 0 then
@@ -1625,7 +1728,6 @@ registerTask({ id = "train", priority = TaskPriority.TRAIN,
             if count > 3000 then count = 3000 end
             local ev = getMuscleEvent()
             if ev then
-                -- 单个 pcall 包住整个循环，减少开销
                 pcall(function()
                     for _ = 1, count do
                         ev:FireServer("rep")
@@ -1642,21 +1744,32 @@ registerTask({ id = "reset", priority = TaskPriority.RESET,
 })
 
 registerTask({ id = "antilag", priority = TaskPriority.ANTILAG,
-    enabled = function() return AntiLag.enabled end,
+    enabled = function() return State.antiLagEnabled end,
+    onEnable = function() pcall(enableAntiLag) end,
+    onDisable = function() pcall(disableAntiLag) end,
     tick = function()
-        if State.time >= AntiLag.rescanAt then rescanAntiLag() end
+        if AntiLag.enabled and State.time >= AntiLag.rescanAt then rescanAntiLag() end
     end,
 })
 
 registerTask({ id = "cull", priority = TaskPriority.CULL,
     enabled = function() return State.renderCullEnabled end,
+    onEnable = function() RenderCull.rescanAt = 0 end,
+    onDisable = function() pcall(disableRenderCull) end,
     tick = function()
         if State.time >= RenderCull.rescanAt then scanRenderCull() end
     end,
 })
 
 registerTask({ id = "hider", priority = TaskPriority.HIDER,
-    enabled = function() return State.hideOwnPets or State.hideAllPets or State.hideMachines end,
+    enabled = function()
+        return State.hideOwnPets or State.hideAllPets or State.hideMachines
+    end,
+    onEnable = function() PetHider.rescanAt = 0 end,
+    onDisable = function()
+        pcall(restoreHiddenPets)
+        pcall(restoreHiddenMachines)
+    end,
     tick = function()
         if State.time >= PetHider.rescanAt then
             pcall(restoreHiddenPets)
@@ -1668,9 +1781,23 @@ registerTask({ id = "hider", priority = TaskPriority.HIDER,
 })
 
 registerTask({ id = "tex", priority = TaskPriority.TEX,
-    enabled = function() return TextureRemover.enabled end,
+    enabled = function() return State.textureRemoverEnabled end,
+    onEnable = function() pcall(enableTextureRemover) end,
+    onDisable = function() pcall(disableTextureRemover) end,
     tick = function()
-        if State.time >= TextureRemover.rescanAt then rescanTextureRemover() end
+        if TextureRemover.enabled and State.time >= TextureRemover.rescanAt then
+            rescanTextureRemover()
+        end
+    end,
+})
+
+registerTask({ id = "sweep", priority = TaskPriority.SWEEP,
+    enabled = function() return true end,
+    tick = function()
+        if State.time - State.lastSweepAt >= 30 then
+            State.lastSweepAt = State.time
+            pcall(sweepOverflow)
+        end
     end,
 })
 
@@ -1688,8 +1815,7 @@ registerTask({ id = "save", priority = TaskPriority.SAVE,
 -- 全局更新
 -- ============================================================
 local function updateGlobal(dt)
-    -- 重力：只在需要时切换
-    local wantZero = State.killEnabled or State.autoTeleport
+    local wantZero = State.killEnabled or State.autoTeleport or State.kingKillActive
     if wantZero then
         if Workspace.Gravity ~= 0 then pcall(function() Workspace.Gravity = 0 end) end
     else
@@ -1697,7 +1823,6 @@ local function updateGlobal(dt)
             pcall(function() Workspace.Gravity = State.originalGravity end)
         end
     end
-
     State.fpsWinTime = State.fpsWinTime + dt
     State.fpsWinFrames = State.fpsWinFrames + 1
     if State.fpsWinTime >= 0.5 then
@@ -1747,10 +1872,11 @@ local function onHeartbeat(dt)
     end
 end
 
--- ★ 关键修复：CharacterAdded 时清空所有关键缓存
 track(LocalPlayer.CharacterAdded:Connect(function()
     Cache.char = nil; Cache.hum = nil; Cache.hrp = nil
     State.killTarget = nil
+    State.kingKillTarget = nil
+    State.kingKillActive = false
     State.toolCooldown = false
     State.toolOwnedByKill = false
     State.dualCurrentMode = "punch"
@@ -1782,8 +1908,7 @@ local function buildUI()
 
     local main = create("Frame", {
         Name = "Main", AnchorPoint = V2n(0, 0),
-        Position = DEFAULT.mainPos,
-        Size = UD2o(WIN_W, WIN_H),
+        Position = DEFAULT.mainPos, Size = UD2o(WIN_W, WIN_H),
         BackgroundColor3 = Theme.Background,
         BorderSizePixel = 0, ClipsDescendants = true, Active = true,
     }, screen)
@@ -1797,13 +1922,11 @@ local function buildUI()
         BorderSizePixel = 0, Active = true,
     }, main)
     corner(titleBar, 14)
-
     create("TextLabel", {
         BackgroundTransparency = 1, Position = UD2o(14, 0),
         Size = UD2n(1, -110, 1, 0),
         Font = Font.GothamBold, Text = "肌肉之王自动化",
-        TextColor3 = Theme.Text, TextSize = 15,
-        TextXAlignment = E_TxtXL,
+        TextColor3 = Theme.Text, TextSize = 15, TextXAlignment = E_TxtXL,
     }, titleBar)
 
     local minBtn = create("TextButton", {
@@ -1814,7 +1937,6 @@ local function buildUI()
         TextColor3 = Theme.TextDim, TextSize = 16,
     }, titleBar)
     corner(minBtn, 8)
-
     local closeBtn = create("TextButton", {
         Name = "Close", Size = UD2o(28, 26),
         Position = UD2n(1, -36, 0, 7),
@@ -1842,7 +1964,6 @@ local function buildUI()
         corner(btn, 8)
         return btn
     end
-
     local tabTrain = makeTab("train", "锻炼", 1)
     local tabTele  = makeTab("tele",  "传送", 2)
     local tabReb   = makeTab("reb",   "重生", 3)
@@ -1861,8 +1982,7 @@ local function buildUI()
             BackgroundTransparency = 1, BorderSizePixel = 0,
             ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.Accent,
             CanvasSize = UD2n(0, 0, 0, 0), AutomaticCanvasSize = E_AS_Y,
-            ScrollingDirection = E_ScrollY,
-            Visible = false, ClipsDescendants = true,
+            ScrollingDirection = E_ScrollY, Visible = false, ClipsDescendants = true,
         }, content)
         create("UIPadding", {
             PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
@@ -1876,8 +1996,7 @@ local function buildUI()
         return create("TextLabel", {
             Size = UD2n(1, -6, 0, 22), BackgroundTransparency = 1,
             Font = Font.GothamBold, Text = text,
-            TextColor3 = Theme.TextDim, TextSize = 11,
-            TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.TextDim, TextSize = 11, TextXAlignment = E_TxtXL,
         }, parent)
     end
 
@@ -1891,8 +2010,7 @@ local function buildUI()
             BackgroundTransparency = 1, Position = UD2o(12, 0),
             Size = UD2n(1, -76, 1, 0),
             Font = Font.GothamMedium, Text = label,
-            TextColor3 = Theme.Text, TextSize = 13,
-            TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
         }, row)
         local tb = create("Frame", {
             AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -12, 0.5, 0),
@@ -1940,8 +2058,7 @@ local function buildUI()
             BackgroundTransparency = 1, Position = UD2o(12, 0),
             Size = UD2n(1, -132, 1, 0),
             Font = Font.GothamMedium, Text = label,
-            TextColor3 = Theme.Text, TextSize = 13,
-            TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
         }, row)
         local box = create("TextBox", {
             AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -12, 0.5, 0),
@@ -1979,8 +2096,7 @@ local function buildUI()
             Size = UD2n(1, -6, 0, 32), BackgroundTransparency = 1,
             Font = Font.Gotham, Text = text,
             TextColor3 = Theme.TextDim, TextSize = 11,
-            TextWrapped = true, TextXAlignment = E_TxtXL,
-            TextYAlignment = E_TxtYT,
+            TextWrapped = true, TextXAlignment = E_TxtXL, TextYAlignment = E_TxtYT,
         }, parent)
     end
 
@@ -1990,16 +2106,23 @@ local function buildUI()
     trainToggle = addRowToggle(trainPage, "自动锻炼（固定 10 次/秒）", State.autoTrain, function(v)
         State.autoTrain = v
         if v and State.fastTrain then State.fastTrain = false fastToggle.set(false) end
+        if v then cleanupTrainingState() end
     end)
     fastToggle = addRowToggle(trainPage, "快速锻炼（自定义频率）", State.fastTrain, function(v)
         State.fastTrain = v
-        State.degradeLevel = 0
-        if v and State.autoTrain then State.autoTrain = false trainToggle.set(false) end
+        if v and State.autoTrain then
+            State.autoTrain = false trainToggle.set(false)
+        end
         if v then
+            cleanupTrainingState()
             refreshPetBonus()
             if State.petRepBonus < 100 then
                 notify(string.format("反复速度不足（当前 %d%%），功能可能无效", State.petRepBonus), 5)
             end
+        else
+            -- ★ 关闭时清理
+            cleanupTrainingState()
+            pcall(sweepOverflow)
         end
     end)
     State.ui.rateBox = addInput(trainPage, "频率（次/秒）", State.fastRate, 1, 50000, function(n)
@@ -2072,39 +2195,41 @@ local function buildUI()
     addInput(killPage, "力量/耐久 阈值", State.killThreshold, 1, 100, function(n) State.killThreshold = n end)
     addDivider(killPage, "── 双工具 ──")
     addRowToggle(killPage, "杀戮+锻炼 双工具切换", State.dualEnabled, function(v) State.dualEnabled = v end)
+    addDivider(killPage, "── 肌肉之王竞争 ──")
+    addRowToggle(killPage, "自动击杀其他肌肉之王", State.autoKingKill, function(v)
+        State.autoKingKill = v
+        if not v then
+            State.kingKillTarget = nil
+            State.kingKillActive = false
+        end
+    end)
+    addInput(killPage, "对方耐久 / 我力量 上限", State.kingKillThreshold, 1, 1000, function(n)
+        State.kingKillThreshold = n
+    end)
+    addHint(killPage, "别人是肌肉之王时，会尝试击杀他。如果对方耐久 ≥ 我力量 × 上限，跳过等待。")
 
     -- 设置
     local setPage = newPage("SetPage")
     addDivider(setPage, "── 性能 ──")
     addRowToggle(setPage, "深度防卡顿", State.antiLagEnabled, function(v)
         State.antiLagEnabled = v
-        if v then pcall(enableAntiLag) else pcall(disableAntiLag) end
     end)
     addRowToggle(setPage, "渲染剔除（远处不显示）", State.renderCullEnabled, function(v)
         State.renderCullEnabled = v
-        if not v then pcall(disableRenderCull) end
     end)
     addInput(setPage, "剔除距离（studs）", State.renderCullDist, 100, 5000, function(n)
         State.renderCullDist = n
+        -- ★ 距离改变立即生效
+        pcall(forceRescanRenderCull)
     end)
     addRowToggle(setPage, "深度移除纹理", State.textureRemoverEnabled, function(v)
         State.textureRemoverEnabled = v
-        if v then pcall(enableTextureRemover) else pcall(disableTextureRemover) end
     end)
 
     addDivider(setPage, "── 隐藏 ──")
-    addRowToggle(setPage, "隐藏自己的宠物", State.hideOwnPets, function(v)
-        State.hideOwnPets = v
-        if not v then pcall(restoreHiddenPets) end
-    end)
-    addRowToggle(setPage, "隐藏所有玩家宠物", State.hideAllPets, function(v)
-        State.hideAllPets = v
-        if not v then pcall(restoreHiddenPets) end
-    end)
-    addRowToggle(setPage, "隐藏器械", State.hideMachines, function(v)
-        State.hideMachines = v
-        if not v then pcall(restoreHiddenMachines) end
-    end)
+    addRowToggle(setPage, "隐藏自己的宠物", State.hideOwnPets, function(v) State.hideOwnPets = v end)
+    addRowToggle(setPage, "隐藏所有玩家宠物", State.hideAllPets, function(v) State.hideAllPets = v end)
+    addRowToggle(setPage, "隐藏器械", State.hideMachines, function(v) State.hideMachines = v end)
     addRowToggle(setPage, "隐藏其他 UI", State.hideUIEnabled, function(v)
         State.hideUIEnabled = v
         if v then pcall(hideAllUI) else pcall(restoreHiddenUI) end
@@ -2152,7 +2277,6 @@ local function buildUI()
     track(tabSet.MouseButton1Click:Connect(function() switchTab("set") end))
     switchTab("train")
 
-    -- 拖动
     local dragging, dragStart, dragStartPos = false, nil, nil
     local function posIn(btn, pos)
         local ap = btn.AbsolutePosition; local as = btn.AbsoluteSize
