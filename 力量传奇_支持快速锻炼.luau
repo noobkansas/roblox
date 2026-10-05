@@ -1,9 +1,9 @@
 --!nonstrict
--- 肌肉之王自动化 v13
--- 传送坐标修复 / 悬空检测 / 复位按钮 / UI缩放 / 快速锻炼放宽
+-- 肌肉之王自动化 v15
+-- 修复 Vec3.new bug / 传送缓存失效 / 训练批处理 / 重生后状态重置
 
 local SCRIPT_ID   = "__MUSCLE_KING_AUTO__"
-local VERSION     = 1300
+local VERSION     = 1500
 local CONFIG_FILE = "muscle_king_auto_config.json"
 
 do
@@ -39,6 +39,8 @@ local UD2n         = UDim2.new
 local UD2o         = UDim2.fromOffset
 local C3           = Color3.fromRGB
 local V2n          = Vector2.new
+local V3n          = Vector3.new
+local CN           = CFrame.new
 local Font         = Enum.Font
 local E_StrokeMode = Enum.ApplyStrokeMode.Border
 local E_ZIdx       = Enum.ZIndexBehavior.Sibling
@@ -52,7 +54,6 @@ local E_TxtXL      = Enum.TextXAlignment.Left
 local E_TxtXR      = Enum.TextXAlignment.Right
 local E_TxtYT      = Enum.TextYAlignment.Top
 local E_CamCustom  = Enum.CameraType.Custom
-local E_RayExclude = Enum.RaycastFilterType.Exclude
 
 local isMobile = UIS_Touch and not UIS_Kb
 
@@ -65,9 +66,6 @@ local Theme = {
     Danger = C3(235, 90, 90),
 }
 
--- ============================================================
--- 默认值（复位用）
--- ============================================================
 local DEFAULT = {
     uiHeightRatio = 0.4,
     infoHeightRatio = 0.28,
@@ -122,8 +120,9 @@ local State = {
     sessionStartStrength = nil, strengthCheckAt = 0,
     lastStrengthSnapshot = 0, strengthPerSec = 0,
 
-    -- 触发器状态：仅在长时间(≥5秒)不在机器上时跳过
-    offMachineSince = 0,
+    -- 传送诊断
+    lastTeleportOk = false,
+    lastTeleportReason = "",
 }
 
 local Cache = { char = nil, hum = nil, hrp = nil }
@@ -267,7 +266,7 @@ local function loadConfig()
 end
 
 -- ============================================================
--- 防卡顿（不制造雾）
+-- 防卡顿
 -- ============================================================
 local AntiLag = {
     enabled = false, rescanAt = 0,
@@ -278,7 +277,6 @@ local POST_CLASSES = {
     BloomEffect = true, BlurEffect = true, SunRaysEffect = true,
     ColorCorrectionEffect = true, DepthOfFieldEffect = true,
 }
-
 local function scanAntiLag()
     for _, obj in ipairs(Workspace:GetDescendants()) do
         local cls = obj.ClassName
@@ -313,7 +311,6 @@ local function scanAntiLag()
         end
     end
 end
-
 local function enableAntiLag()
     if AntiLag.enabled then return end
     AntiLag.enabled = true
@@ -328,7 +325,6 @@ local function enableAntiLag()
     scanAntiLag()
     AntiLag.rescanAt = State.time + 2
 end
-
 local function rescanAntiLag()
     if not AntiLag.enabled then return end
     pcall(function()
@@ -338,7 +334,6 @@ local function rescanAntiLag()
     scanAntiLag()
     AntiLag.rescanAt = State.time + 2
 end
-
 local function disableAntiLag()
     if not AntiLag.enabled then return end
     AntiLag.enabled = false
@@ -553,7 +548,7 @@ local function disableTextureRemover()
 end
 
 -- ============================================================
--- 隐藏其他 UI
+-- 隐藏 UI
 -- ============================================================
 local HiddenUIs = {}
 local function hideAllUI()
@@ -616,7 +611,7 @@ local function performAFKClick()
         pcall(function()
             VIM:SendMouseButtonEvent(tx, ty, 0, true, game, 0)
             VIM:SendMouseButtonEvent(tx, ty, 0, false, game, 0)
-            if hasOrig then VIM:SendMouseMoveEvent(ox, oy, game) end
+            if hasOrig then VIM:SendSendMouseMoveEvent(ox, oy, game) end
         end)
     end
 end
@@ -724,20 +719,6 @@ end
 local function getMyStrength() return getStatValue(LocalPlayer, "Strength") end
 local function getPlayerDurability(plr) return getStatValue(plr, "Durability") end
 
-local function isOnMachine()
-    local m = LP_FFC(LocalPlayer, "machineInUse")
-    if m and m:IsA("ValueBase") then
-        local v = m.Value
-        if v ~= nil and v ~= "" then return true end
-    end
-    local t = LP_FFC(LocalPlayer, "treadmillInUse")
-    if t and t:IsA("ValueBase") then
-        local v = t.Value
-        if v ~= nil and v ~= "" then return true end
-    end
-    return false
-end
-
 -- ============================================================
 -- 宠物反复速度加成
 -- ============================================================
@@ -803,12 +784,12 @@ local function refreshPetBonus()
 end
 
 -- ============================================================
--- 事件
+-- 事件（每次严格验证 Parent）
 -- ============================================================
 local function getMuscleEvent()
     local cached = State.muscleEventRef
-    if cached and cached.Parent then return cached end
-    local ev = LP_FFC(LocalPlayer, "muscleEvent")
+    if cached and cached.Parent == LocalPlayer then return cached end
+    local ev = LocalPlayer:FindFirstChild("muscleEvent")
     State.muscleEventRef = ev
     return ev
 end
@@ -827,97 +808,6 @@ local function getRebirthEvent()
     end
     return nil
 end
-
--- ============================================================
--- 传送（修复：用 beachToMuscleKing 触发服务端传送门 + 悬空检测）
--- ============================================================
-local TargetCF, TargetCFAt = nil, 0
-local MUSCLE_KING_FALLBACK = Vector3.new(-8727.1, 406.7, -5796.4)
-
--- 找地面
-local function findGroundY(pos)
-    local params = RaycastParams.new()
-    params.FilterType = E_RayExclude
-    if Cache.char then
-        params.FilterDescendantsInstances = { Cache.char }
-    else
-        params.FilterDescendantsInstances = {}
-    end
-    local origin = pos + Vector3.new(0, 100, 0)
-    local dir = Vector3.new(0, -500, 0)
-    local result = Workspace:Raycast(origin, dir, params)
-    if result then return result.Position.Y end
-    return nil
-end
-
--- 用传送门 Part 触发服务端传送（游戏会自动处理传送逻辑）
-local function findMuscleKingPortal()
-    -- 优先 beachToMuscleKing（游戏里真实进入用的传送门）
-    local portal = Workspace:FindFirstChild("beachToMuscleKing", true)
-    if portal and portal:IsA("BasePart") then return portal end
-    -- 从 areaTeleportParts 找
-    local atp = Workspace:FindFirstChild("areaTeleportParts")
-    if atp then
-        for _, p in ipairs(atp:GetChildren()) do
-            if p:IsA("BasePart") and p.Name:lower():find("beach") and p.Name:lower():find("muscle") then
-                return p
-            end
-        end
-    end
-    return nil
-end
-
-local function getTargetCF()
-    if TargetCF and State.time - TargetCFAt < 10 then return TargetCF end
-    TargetCFAt = State.time
-
-    -- 优先用传送门 Part 的 CFrame（站在上面触发服务端传送）
-    local portal = findMuscleKingPortal()
-    if portal then
-        local basePos = portal.Position
-        local gy = findGroundY(basePos)
-        local finalPos = gy and Vector3.new(basePos.X, gy + 3, basePos.Z)
-                        or Vector3.new(basePos.X, basePos.Y + 3, basePos.Z)
-        TargetCF = CFrame.new(finalPos)
-        return TargetCF
-    end
-
-    -- 回退硬编码（检查地面）
-    local gy = findGroundY(MUSCLE_KING_FALLBACK)
-    local finalPos = gy and Vector3.new(MUSCLE_KING_FALLBACK.X, gy + 3, MUSCLE_KING_FALLBACK.Z)
-                    or MUSCLE_KING_FALLBACK
-    TargetCF = CFrame.new(finalPos)
-    return TargetCF
-end
-
--- 是否已在目标区域（避免重复传回主岛）
-local function isInTargetArea()
-    local hrp = Cache.hrp
-    if not hrp then return false end
-    -- 用 currentMap 检查
-    local cur = LP_FFC(LocalPlayer, "currentMap")
-    if cur and cur:IsA("StringValue") then
-        local v = cur.Value:lower()
-        if v:find("muscle") or v:find("king") then return true end
-    end
-    -- 用距离检查：离传送门远 = 已经进去了
-    local portal = findMuscleKingPortal()
-    if portal then
-        local d = hrp.Position - portal.Position
-        local dsq = d.X*d.X + d.Y*d.Y + d.Z*d.Z
-        if dsq > 100*100 then return true end
-    end
-    return false
-end
-
-local function doTeleport(force)
-    local hrp = Cache.hrp
-    if not hrp then return end
-    if not force and isInTargetArea() then return end
-    local cf = getTargetCF()
-    pcall(function() hrp.CFrame = cf end)
-end
-
 local function fireRebirth()
     local ev = getRebirthEvent()
     if not ev then return end
@@ -927,6 +817,67 @@ local function fireRebirth()
             elseif ev:IsA("RemoteEvent") then ev:FireServer("rebirthRequest") end
         end)
     end)
+end
+
+-- ============================================================
+-- 传送（重写：不带缓存，直接获取；使用 V3n 而非 Vec3.new）
+-- ============================================================
+-- 该函数每 0.05 秒最多找一次传送门，结果缓存不超过 5 秒
+local PortalCache, PortalCacheAt = nil, 0
+
+local function findPortalNow()
+    local p = Workspace:FindFirstChild("beachToMuscleKing", true)
+    if p and p:IsA("BasePart") then return p end
+    return nil
+end
+
+local function getPortal()
+    if PortalCache and PortalCache.Parent
+    and State.time - PortalCacheAt < 5 then
+        return PortalCache
+    end
+    PortalCache = findPortalNow()
+    PortalCacheAt = State.time
+    return PortalCache
+end
+
+-- 返回 CFrame 或 nil
+local function getTargetCF()
+    local portal = getPortal()
+    if portal then
+        -- 直接站在传送门位置 + Y 偏移 3
+        -- 注意：用 CN（CFrame.new）而不是 CFrame.new，用 V3n 而不是 V3n.new
+        return CN(portal.Position + V3n(0, 3, 0))
+    end
+    -- 兜底坐标（用户给的 muscle king 位置）
+    return CN(V3n(-8727.1, 406.7, -5796.4))
+end
+
+local function doTeleport(force)
+    if force then
+        PortalCache = nil
+        PortalCacheAt = 0
+    end
+    local hrp = Cache.hrp
+    if not hrp then
+        State.lastTeleportOk = false
+        State.lastTeleportReason = "no hrp"
+        return false
+    end
+    local cf = getTargetCF()
+    if not cf then
+        State.lastTeleportOk = false
+        State.lastTeleportReason = "no cf"
+        return false
+    end
+    local ok = pcall(function()
+        hrp.CFrame = cf
+        hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+        hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
+    end)
+    State.lastTeleportOk = ok
+    State.lastTeleportReason = ok and "ok" or "pcall failed"
+    return ok
 end
 
 -- ============================================================
@@ -1017,11 +968,11 @@ local function applyKillMovement(targetHRP)
     if distSq > 9 then
         local dist = math.sqrt(distSq)
         local newPos = targetHRP.Position - delta / dist * 2.5
-        local newCF = CFrame.new(newPos, targetHRP.Position)
+        local newCF = CN(newPos, targetHRP.Position)
         pcall(function()
             hrp.CFrame = newCF
-            hrp.AssemblyLinearVelocity = Vector3.zero
-            hrp.AssemblyAngularVelocity = Vector3.zero
+            hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+            hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
         end)
     end
 end
@@ -1151,7 +1102,6 @@ local Info = {
     viewingPlayer = nil, listOpen = false, lastRefresh = 0,
     minimized = false, rows = {}, frames = {},
 }
-
 local function buildInfoWindow()
     local screen = create("ScreenGui", {
         Name = "MuscleKingInfoUI", ResetOnSpawn = false,
@@ -1160,13 +1110,12 @@ local function buildInfoWindow()
     State.ui.infoGui = screen
     screen.Enabled = false
 
-    -- 改：UIScale 挂到 ScreenGui
     local uiScale = create("UIScale", { Scale = 1 }, screen)
     State.ui.infoScale = uiScale
 
     local frame = create("Frame", {
         Name = "InfoFrame",
-        AnchorPoint = V2n(0, 0),  -- 改：左上角固定
+        AnchorPoint = V2n(0, 0),
         Position = DEFAULT.infoPos,
         Size = UD2o(260, 340),
         BackgroundColor3 = Theme.Background,
@@ -1414,19 +1363,13 @@ local function refreshInfoWindow()
 end
 
 -- ============================================================
--- 复位按钮（长按 3 秒）
+-- 复位按钮
 -- ============================================================
 local ResetBtnState = { pressAt = 0, holding = false, lastStep = 0 }
-
 local function doResetAll()
-    -- 复位配置到默认
     State.uiHeightRatio = DEFAULT.uiHeightRatio
     State.infoHeightRatio = DEFAULT.infoHeightRatio
-    -- 复位主窗口位置
-    if State.ui.main then
-        State.ui.main.Position = DEFAULT.mainPos
-    end
-    -- 复位信息窗
+    if State.ui.main then State.ui.main.Position = DEFAULT.mainPos end
     if Info.frames.frame then
         Info.frames.frame.Position = DEFAULT.infoPos
         Info.minimized = false
@@ -1434,13 +1377,10 @@ local function doResetAll()
         if Info.frames.playerBtn then Info.frames.playerBtn.Visible = true end
         if Info.frames.dataFrame then Info.frames.dataFrame.Visible = true end
     end
-    -- 更新缩放
     updateUIScale()
-    -- 保存
     pcall(saveConfig)
     notify("已复位所有位置和大小", 3)
 end
-
 local function buildResetButton()
     local screen = State.ui.screen
     if not screen then return end
@@ -1461,7 +1401,6 @@ local function buildResetButton()
     corner(btn, 28)
     stroke(btn, Theme.Border, 1)
     State.ui.resetBtn = btn
-    ResetBtnState.lastStep = 0
 
     track(btn.InputBegan:Connect(function(input)
         if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
@@ -1479,7 +1418,6 @@ local function buildResetButton()
         end
     end))
 end
-
 local function tickResetButton()
     if not ResetBtnState.holding then return end
     local btn = State.ui.resetBtn
@@ -1549,7 +1487,7 @@ registerTask({ id = "kill", priority = TaskPriority.KILL,
         State.killTarget = nil
         State.killScanAt = 0
         State.dualCurrentMode = "punch"
-        notify("已进入全图杀戮模式（自动传送已暂停）", 3)
+        notify("已进入全图杀戮模式", 3)
     end,
     onDisable = function()
         if State.killSavedState then
@@ -1560,7 +1498,7 @@ registerTask({ id = "kill", priority = TaskPriority.KILL,
         State.killTarget = nil
         State.toolOwnedByKill = false
         State.dualCurrentMode = "punch"
-        notify("已退出杀戮模式（自动传送已恢复）", 3)
+        notify("已退出杀戮模式", 3)
     end,
     tick = runKillTick,
 })
@@ -1671,6 +1609,7 @@ registerTask({ id = "tool", priority = TaskPriority.TOOL,
     end,
 })
 
+-- 训练：批量 pcall，无机器检查
 registerTask({ id = "train", priority = TaskPriority.TRAIN,
     enabled = function() return State.autoTrain or State.fastTrain end,
     tick = function(dt)
@@ -1678,29 +1617,20 @@ registerTask({ id = "train", priority = TaskPriority.TRAIN,
         if State.fastTrain then rate = State.fastRate
         elseif State.autoTrain then rate = 10 end
         if rate <= 0 then return end
+
         State.trainAccum = State.trainAccum + rate * dt
         local count = math.floor(State.trainAccum)
         if count > 0 then
             State.trainAccum = State.trainAccum - count
-            if count > 2000 then count = 2000 end
-            -- 放宽触发器检查：仅在连续 ≥5 秒不在机器上时才跳过
-            if not isOnMachine() then
-                if State.offMachineSince == 0 then
-                    State.offMachineSince = State.time
-                end
-                if State.time - State.offMachineSince < 5 then
-                    -- 短时间内仍发送（可能只是状态抖动）
-                else
-                    return
-                end
-            else
-                State.offMachineSince = 0
-            end
+            if count > 3000 then count = 3000 end
             local ev = getMuscleEvent()
             if ev then
-                for _ = 1, count do
-                    pcall(function() ev:FireServer("rep") end)
-                end
+                -- 单个 pcall 包住整个循环，减少开销
+                pcall(function()
+                    for _ = 1, count do
+                        ev:FireServer("rep")
+                    end
+                end)
             end
         end
     end,
@@ -1758,13 +1688,16 @@ registerTask({ id = "save", priority = TaskPriority.SAVE,
 -- 全局更新
 -- ============================================================
 local function updateGlobal(dt)
-    if State.killEnabled or State.autoTeleport then
+    -- 重力：只在需要时切换
+    local wantZero = State.killEnabled or State.autoTeleport
+    if wantZero then
         if Workspace.Gravity ~= 0 then pcall(function() Workspace.Gravity = 0 end) end
     else
         if Workspace.Gravity ~= State.originalGravity then
             pcall(function() Workspace.Gravity = State.originalGravity end)
         end
     end
+
     State.fpsWinTime = State.fpsWinTime + dt
     State.fpsWinFrames = State.fpsWinFrames + 1
     if State.fpsWinTime >= 0.5 then
@@ -1814,13 +1747,17 @@ local function onHeartbeat(dt)
     end
 end
 
+-- ★ 关键修复：CharacterAdded 时清空所有关键缓存
 track(LocalPlayer.CharacterAdded:Connect(function()
     Cache.char = nil; Cache.hum = nil; Cache.hrp = nil
     State.killTarget = nil
     State.toolCooldown = false
     State.toolOwnedByKill = false
     State.dualCurrentMode = "punch"
-    State.offMachineSince = 0
+    State.muscleEventRef = nil
+    State.rebirthEventRef = nil
+    PortalCache = nil
+    PortalCacheAt = 0
     table.clear(RenderCull.hidden)
     table.clear(PetHider.own)
     table.clear(PetHider.all)
@@ -2119,14 +2056,15 @@ local function buildUI()
     State.ui.teleToggle = addRowToggle(telePage, "自动前往肌肉之王", State.autoTeleport, function(v)
         State.autoTeleport = v
     end)
-    addActionButton(telePage, "强制单次传送", function() doTeleport(true) end)
-    addHint(telePage, "用传送门 Part 触发服务端传送（会自动检查地板高度，避免悬空）。")
+    addActionButton(telePage, "强制单次传送", function()
+        doTeleport(true)
+    end)
+    addHint(telePage, "使用传送门坐标。强制单次传送会刷新缓存。")
 
     -- 重生
     local rebPage = newPage("RebPage")
     addRowToggle(rebPage, "自动重生", State.autoRebirth, function(v) State.autoRebirth = v end)
     addInput(rebPage, "频率（次/秒）", State.rebirthRate, 1, 100, function(n) State.rebirthRate = n end)
-    addHint(rebPage, "使用 rEvents.rebirthRemote（RemoteFunction）+ 'rebirthRequest'。")
 
     -- 杀戮
     local killPage = newPage("KillPage")
@@ -2134,7 +2072,6 @@ local function buildUI()
     addInput(killPage, "力量/耐久 阈值", State.killThreshold, 1, 100, function(n) State.killThreshold = n end)
     addDivider(killPage, "── 双工具 ──")
     addRowToggle(killPage, "杀戮+锻炼 双工具切换", State.dualEnabled, function(v) State.dualEnabled = v end)
-    addHint(killPage, "杀戮期间暂停自动传送，退出后自动恢复。")
 
     -- 设置
     local setPage = newPage("SetPage")
