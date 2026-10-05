@@ -1,13 +1,13 @@
 --!nonstrict
--- 肌肉之王自动化 v21
--- 移除：网络优化、并行发包
--- 新增：好友白名单（杀戮 / 肌肉之王竞争均生效）
+-- 肌肉之王自动化 v23
+-- UI 完全重写（紧凑顶栏+Tab，专业深色主题，可调窗口大小）
+-- 修复：信息任务报错、无工具时误自杀
 
 local SCRIPT_ID   = "__MUSCLE_KING_AUTO__"
-local VERSION     = 2100
+local VERSION     = 2300
 local CONFIG_FILE = "muscle_king_auto_config.json"
--- __VERSION__ = 2100
--- __CHANGELOG__ = "新增：好友白名单（不打好友，也不打好友中的肌肉之王） / 移除：网络优化、并行发包"
+-- __VERSION__ = 2300
+-- __CHANGELOG__ = "UI 完全重写（紧凑顶栏 + Tab）/ 修复信息任务报错 / 修复无工具时误自杀 / 移除 emoji"
 
 do
     local existing = _G[SCRIPT_ID]
@@ -26,12 +26,15 @@ local Lighting          = game:GetService("Lighting")
 local HttpService       = game:GetService("HttpService")
 local SoundService      = game:GetService("SoundService")
 local MarketplaceService= game:GetService("MarketplaceService")
+local VirtualUser       = game:GetService("VirtualUser")
+local StarterGui        = game:GetService("StarterGui")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
 local GetPlayers   = Players.GetPlayers
 local RS_HB        = RunService.Heartbeat
+local RS_RS        = RunService.RenderStepped
 local UIS_IC       = UserInputService.InputChanged
 local UIS_IB       = UserInputService.InputBegan
 local UIS_IE       = UserInputService.InputEnded
@@ -40,6 +43,7 @@ local UIS_Touch    = UserInputService.TouchEnabled
 local UIS_Kb       = UserInputService.KeyboardEnabled
 local UD2n         = UDim2.new
 local UD2o         = UDim2.fromOffset
+local UD2s         = UDim2.fromScale
 local C3           = Color3.fromRGB
 local V2n          = Vector2.new
 local V3n          = Vector3.new
@@ -55,49 +59,54 @@ local E_UI_Touch   = Enum.UserInputType.Touch
 local E_UI_MMove   = Enum.UserInputType.MouseMovement
 local E_TxtXL      = Enum.TextXAlignment.Left
 local E_TxtXR      = Enum.TextXAlignment.Right
-local E_TxtYT      = Enum.TextYAlignment.Top
 local E_CamCustom  = Enum.CameraType.Custom
 
 local isMobile = UIS_Touch and not UIS_Kb
 
+-- 新配色（专业深色蓝紫）
 local Theme = {
-    Background = C3(20, 22, 28), Surface = C3(28, 31, 39),
-    SurfaceAlt = C3(36, 40, 50), Border = C3(50, 56, 70),
-    Accent = C3(96, 158, 255), AccentDim = C3(42, 70, 120),
-    Text = C3(232, 236, 244), TextDim = C3(148, 156, 172),
-    Warning = C3(255, 200, 80), Success = C3(120, 220, 160),
-    Danger = C3(235, 90, 90),
+    Bg         = C3(17, 19, 26),
+    Surface    = C3(23, 26, 34),
+    SurfaceAlt = C3(30, 34, 45),
+    Border     = C3(43, 48, 62),
+    Accent     = C3(88, 130, 255),
+    AccentDim  = C3(38, 58, 110),
+    Success    = C3(96, 212, 144),
+    Warning    = C3(244, 184, 96),
+    Danger     = C3(230, 96, 96),
+    Text       = C3(226, 230, 240),
+    TextDim    = C3(140, 148, 168),
+    TextMuted  = C3(90, 98, 116),
 }
 
 local DEFAULT = {
-    uiHeightRatio = 0.4,
-    infoHeightRatio = 0.28,
-    mainPos = UD2n(0.5, -175, 0.5, -220),
-    infoPos = UD2n(1, -280, 1, -360),
+    uiWidthPct = 40,   -- 窗口宽度占屏幕比例
+    uiHeightPct = 46,  -- 窗口高度占屏幕比例
+    mainPos = UD2n(0.5, -260, 0.5, -190),
+    infoPos = UD2n(1, -300, 1, -420),
 }
 
+-- ============================================================
+-- 状态
+-- ============================================================
 local State = {
     destroyed = false, conns = {}, ui = {},
 
     autoTrain = false, fastTrain = false, fastRate = 20,
+    toolDumbbell = false, toolPushups = false,
+    toolHandstands = false, toolSitups = false,
+    lastToolCheck = 0, toolCooldown = false, _noToolWarned = false,
+
     autoTeleport = false, lastTeleportAt = 0, lastCameraFix = 0,
     autoRebirth = false, rebirthRate = 2, lastRebirthAt = 0,
-
-    toolDumbbell = true, toolPushups = false,
-    toolHandstands = false, toolSitups = false,
-    lastToolCheck = 0, toolCooldown = false,
 
     killEnabled = false, killThreshold = 5,
     killScanAt = 0, killTarget = nil, killLastAttack = 0,
     killSavedState = nil, toolOwnedByKill = false,
-
-    -- 好友白名单（杀戮 / kingKill 生效）
     friendWhitelist = false,
-
     autoKingKill = false, kingKillThreshold = 20,
     kingKillTarget = nil, kingKillLastAttack = 0,
     kingKillActive = false, lastKingCheck = 0,
-
     dualEnabled = true, dualLastSwitch = 0, dualCurrentMode = "punch",
 
     adaptiveEnabled = false, adaptiveThreshold = 30,
@@ -108,105 +117,74 @@ local State = {
     hideOwnPets = false, hideAllPets = false, hideMachines = false,
     textureRemoverEnabled = false,
     hideUIEnabled = false,
-    infoWindowEnabled = false,
+
+    infoWindowEnabled = false, infoLastRefresh = 0,
     formatEnabled = true,
 
+    autoPetBuy = false, selectedPet = "",
+    autoWheel = false,
+    autoBoss = false, bossHeight = 70,
+    autoPackRebirth = false, trainRate = 1200,
+    autoEatEgg = false, giftAmount = 0, selectedEggTarget = "",
+
     petRepBonus = 0, petRepBonusCheckedAt = 0, petRepBonusDetail = {},
-
-    uiHeightRatio = DEFAULT.uiHeightRatio,
-    infoHeightRatio = DEFAULT.infoHeightRatio,
-
+    uiWidthPct = DEFAULT.uiWidthPct,
+    uiHeightPct = DEFAULT.uiHeightPct,
     originalGravity = Workspace.Gravity,
     muscleEventRef = nil, rebirthEventRef = nil, lastRebirthScan = 0,
 
     trainAccum = 0, time = 0,
     fpsWinTime = 0, fpsWinFrames = 0, avgFps = 60,
     lastDegradeAt = 0, degradeLevel = 0,
-
     lastAFKClick = 0, lastSaveAt = 0, lastSweepAt = 0,
     sessionStartStrength = nil, strengthCheckAt = 0,
     lastStrengthSnapshot = 0, strengthPerSec = 0,
-
-    ping = 0,
-    lastPingCheck = 0,
+    ping = 0, lastPingCheck = 0,
+    friendCount = 0,
+    _lastSuicide = 0, _suicideCount = 0,
 }
 
--- ============================================================
--- 好友白名单
--- ============================================================
-local FriendWhitelist = {
-    ids = {},           -- userId -> true
-    loaded = false,
-    count = 0,
-    lastRefresh = 0,
-    refreshing = false,
-    refreshInterval = 300,  -- 5 分钟
-}
-
+local FriendWhitelist = { ids = {}, loaded = false, refreshing = false, lastRefresh = 0 }
 local function refreshFriendList()
     if FriendWhitelist.refreshing then return end
     FriendWhitelist.refreshing = true
     task.spawn(function()
-        local newIds = {}
-        local success = false
-
-        -- 方式1：GetFriendsAsync（分页拉取全部好友）
-        local ok1 = pcall(function()
+        local ids = {}
+        pcall(function()
             local pages = LocalPlayer:GetFriendsAsync()
             while pages do
                 for _, item in ipairs(pages:GetCurrentPage()) do
-                    if item.Id then newIds[item.Id] = true end
+                    if item.Id then ids[item.Id] = true end
                 end
                 if pages.IsFinished then break end
                 pages:AdvanceToNextPageAsync()
             end
         end)
-        if ok1 then success = true end
-
-        -- 方式2：GetFriendsOnline（补充当前在线的好友）
-        local ok2 = pcall(function()
-            local online = LocalPlayer:GetFriendsOnline(200)
-            for _, f in ipairs(online) do
-                if f.VisitorId then newIds[f.VisitorId] = true end
+        pcall(function()
+            for _, f in ipairs(LocalPlayer:GetFriendsOnline(200)) do
+                if f.VisitorId then ids[f.VisitorId] = true end
             end
         end)
-        if ok2 then success = true end
-
-        if success then
-            FriendWhitelist.ids = newIds
-            FriendWhitelist.loaded = true
-            local n = 0
-            for _ in pairs(newIds) do n = n + 1 end
-            FriendWhitelist.count = n
-            FriendWhitelist.lastRefresh = tick()
-        end
-
+        FriendWhitelist.ids = ids
+        FriendWhitelist.loaded = true
+        local n = 0
+        for _ in pairs(ids) do n = n + 1 end
+        State.friendCount = n
+        FriendWhitelist.lastRefresh = tick()
         FriendWhitelist.refreshing = false
     end)
 end
-
 local function isFriend(plr)
     if not plr or not plr.UserId then return false end
     return FriendWhitelist.ids[plr.UserId] == true
 end
 
--- ============================================================
--- 反复速度缓存（乘法模型）
--- ============================================================
-local RepCache = {
-    pet = 0, ult = 0, x2 = false,
-    petTimeMul = 1, ultTimeMul = 1, passMul = 1,
-    speedMul = 1, detail = {},
-    lastRefresh = 0, lastPassCheck = 0,
-}
+local RepCache = { pet = 0, ult = 0, x2 = false, speedMul = 1, lastRefresh = 0, lastPassCheck = 0 }
 local X2_REP_PASS_ID = 6998482
-
 local Cache = { char = nil, hum = nil, hrp = nil }
 local function refreshCache()
     local c = LocalPlayer.Character
-    if c ~= Cache.char then
-        Cache.char = c; Cache.hum = nil; Cache.hrp = nil
-    end
+    if c ~= Cache.char then Cache.char = c; Cache.hum = nil; Cache.hrp = nil end
     if c then
         if not Cache.hum or not Cache.hum.Parent then
             Cache.hum = c:FindFirstChildOfClass("Humanoid")
@@ -225,9 +203,25 @@ local function create(cls, props, parent)
     return i
 end
 local function corner(p, r) return create("UICorner", { CornerRadius = UDim.new(0, r or 8) }, p) end
-local function stroke(p, c, t)
+local function stroke(p, c, t, tr)
     return create("UIStroke", { Color = c or Theme.Border, Thickness = t or 1,
-        ApplyStrokeMode = E_StrokeMode }, p)
+        Transparency = tr or 0, ApplyStrokeMode = E_StrokeMode }, p)
+end
+local function padding(p, t, b, l, r)
+    return create("UIPadding", {
+        PaddingTop = UDim.new(0, t or 0), PaddingBottom = UDim.new(0, b or 0),
+        PaddingLeft = UDim.new(0, l or 0), PaddingRight = UDim.new(0, r or 0),
+    }, p)
+end
+local function listLayout(p, spacing, h)
+    return create("UIListLayout", {
+        Padding = UDim.new(0, spacing or 6),
+        FillDirection = h and Enum.FillDirection.Horizontal or Enum.FillDirection.Vertical,
+        SortOrder = E_SortL,
+    }, p)
+end
+local function gradient(p, c1, c2, rot)
+    return create("UIGradient", { Color = ColorSequence.new(c1, c2 or c1), Rotation = rot or 0 }, p)
 end
 
 local function notify(text, duration)
@@ -235,13 +229,12 @@ local function notify(text, duration)
     if State.destroyed or not State.ui.screen then return end
     local label = create("TextLabel", {
         AnchorPoint = V2n(0.5, 0), Position = UD2n(0.5, 0, 0.04, 0),
-        Size = UD2o(440, 52), BackgroundColor3 = C3(30, 32, 40),
-        BorderSizePixel = 0, Font = Font.GothamBold,
-        Text = text, TextColor3 = Theme.Warning,
-        TextSize = 15, TextWrapped = true, ZIndex = 200,
+        Size = UD2o(400, 40), BackgroundColor3 = Theme.Surface,
+        BorderSizePixel = 0, Font = Font.GothamMedium,
+        Text = text, TextColor3 = Theme.Text,
+        TextSize = 13, TextWrapped = true, ZIndex = 500,
     }, State.ui.screen)
-    corner(label, 10)
-    stroke(label, Theme.Warning, 2)
+    corner(label, 10); stroke(label, Theme.Accent, 1.5, 0.3)
     task.delay(duration, function() pcall(function() label:Destroy() end) end)
 end
 
@@ -258,13 +251,16 @@ local function formatNumber(n)
     return (neg and "-" or "") .. string.format("%.3f%s", n, SUFFIXES[idx])
 end
 
+-- ============================================================
+-- 配置
+-- ============================================================
 local function saveConfig()
     if State.destroyed or type(writefile) ~= "function" then return end
     local data = {
         autoTrain = State.autoTrain, fastTrain = State.fastTrain, fastRate = State.fastRate,
-        autoTeleport = State.autoTeleport, autoRebirth = State.autoRebirth, rebirthRate = State.rebirthRate,
         toolDumbbell = State.toolDumbbell, toolPushups = State.toolPushups,
         toolHandstands = State.toolHandstands, toolSitups = State.toolSitups,
+        autoRebirth = State.autoRebirth, rebirthRate = State.rebirthRate,
         killThreshold = State.killThreshold, dualEnabled = State.dualEnabled,
         friendWhitelist = State.friendWhitelist,
         autoKingKill = State.autoKingKill, kingKillThreshold = State.kingKillThreshold,
@@ -276,13 +272,13 @@ local function saveConfig()
         hideUIEnabled = State.hideUIEnabled,
         infoWindowEnabled = State.infoWindowEnabled,
         formatEnabled = State.formatEnabled,
-        uiHeightRatio = State.uiHeightRatio,
-        infoHeightRatio = State.infoHeightRatio,
+        selectedPet = State.selectedPet, bossHeight = State.bossHeight,
+        giftAmount = State.giftAmount,
+        uiWidthPct = State.uiWidthPct, uiHeightPct = State.uiHeightPct,
     }
     local ok, enc = pcall(HttpService.JSONEncode, HttpService, data)
     if ok and enc then pcall(writefile, CONFIG_FILE, enc) end
 end
-
 local function loadConfig()
     if type(isfile) ~= "function" or type(readfile) ~= "function" then return end
     local exists = false
@@ -292,71 +288,63 @@ local function loadConfig()
     if not ok or type(content) ~= "string" then return end
     local ok2, data = pcall(HttpService.JSONDecode, HttpService, content)
     if not ok2 or type(data) ~= "table" then return end
-    local function bool(k, f) if type(data[k]) == "boolean" then return data[k] end return f end
-    local function num(k, f, lo, hi)
+    local function b(k, f) if type(data[k]) == "boolean" then return data[k] end return f end
+    local function n(k, f, lo, hi)
         local v = tonumber(data[k]) if not v then return f end
         v = math.floor(v)
         if lo then v = math.max(lo, v) end
         if hi then v = math.min(hi, v) end
         return v
     end
-    local function fnum(k, f, lo, hi)
-        local v = tonumber(data[k]) if not v then return f end
-        if lo then v = math.max(lo, v) end
-        if hi then v = math.min(hi, v) end
-        return v
-    end
-    State.autoTrain = bool("autoTrain", State.autoTrain)
-    State.fastTrain = bool("fastTrain", State.fastTrain)
-    State.fastRate = num("fastRate", State.fastRate, 1, 50000)
-    State.autoTeleport = bool("autoTeleport", State.autoTeleport)
-    State.autoRebirth = bool("autoRebirth", State.autoRebirth)
-    State.rebirthRate = num("rebirthRate", State.rebirthRate, 1, 100)
-    State.toolDumbbell = bool("toolDumbbell", State.toolDumbbell)
-    State.toolPushups = bool("toolPushups", State.toolPushups)
-    State.toolHandstands = bool("toolHandstands", State.toolHandstands)
-    State.toolSitups = bool("toolSitups", State.toolSitups)
-    State.killThreshold = num("killThreshold", State.killThreshold, 1, 100)
-    State.dualEnabled = bool("dualEnabled", State.dualEnabled)
-    State.friendWhitelist = bool("friendWhitelist", State.friendWhitelist)
-    State.autoKingKill = bool("autoKingKill", State.autoKingKill)
-    State.kingKillThreshold = num("kingKillThreshold", State.kingKillThreshold, 1, 1000)
-    State.adaptiveEnabled = bool("adaptiveEnabled", State.adaptiveEnabled)
-    State.adaptiveThreshold = num("adaptiveThreshold", State.adaptiveThreshold, 10, 120)
-    State.antiLagEnabled = bool("antiLagEnabled", State.antiLagEnabled)
-    State.renderCullEnabled = bool("renderCullEnabled", State.renderCullEnabled)
-    State.renderCullDist = num("renderCullDist", State.renderCullDist, 100, 5000)
-    State.hideOwnPets = bool("hideOwnPets", State.hideOwnPets)
-    State.hideAllPets = bool("hideAllPets", State.hideAllPets)
-    State.hideMachines = bool("hideMachines", State.hideMachines)
-    State.textureRemoverEnabled = bool("textureRemoverEnabled", State.textureRemoverEnabled)
-    State.hideUIEnabled = bool("hideUIEnabled", State.hideUIEnabled)
-    State.infoWindowEnabled = bool("infoWindowEnabled", State.infoWindowEnabled)
-    State.formatEnabled = bool("formatEnabled", State.formatEnabled)
-    State.uiHeightRatio = fnum("uiHeightRatio", State.uiHeightRatio, 0.2, 0.9)
-    State.infoHeightRatio = fnum("infoHeightRatio", State.infoHeightRatio, 0.15, 0.7)
+    State.autoTrain = b("autoTrain", State.autoTrain)
+    State.fastTrain = b("fastTrain", State.fastTrain)
+    State.fastRate = n("fastRate", State.fastRate, 1, 50000)
+    State.toolDumbbell = b("toolDumbbell", State.toolDumbbell)
+    State.toolPushups = b("toolPushups", State.toolPushups)
+    State.toolHandstands = b("toolHandstands", State.toolHandstands)
+    State.toolSitups = b("toolSitups", State.toolSitups)
+    State.autoRebirth = b("autoRebirth", State.autoRebirth)
+    State.rebirthRate = n("rebirthRate", State.rebirthRate, 1, 100)
+    State.killThreshold = n("killThreshold", State.killThreshold, 1, 100)
+    State.dualEnabled = b("dualEnabled", State.dualEnabled)
+    State.friendWhitelist = b("friendWhitelist", State.friendWhitelist)
+    State.autoKingKill = b("autoKingKill", State.autoKingKill)
+    State.kingKillThreshold = n("kingKillThreshold", State.kingKillThreshold, 1, 1000)
+    State.adaptiveEnabled = b("adaptiveEnabled", State.adaptiveEnabled)
+    State.adaptiveThreshold = n("adaptiveThreshold", State.adaptiveThreshold, 10, 120)
+    State.antiLagEnabled = b("antiLagEnabled", State.antiLagEnabled)
+    State.renderCullEnabled = b("renderCullEnabled", State.renderCullEnabled)
+    State.renderCullDist = n("renderCullDist", State.renderCullDist, 100, 5000)
+    State.hideOwnPets = b("hideOwnPets", State.hideOwnPets)
+    State.hideAllPets = b("hideAllPets", State.hideAllPets)
+    State.hideMachines = b("hideMachines", State.hideMachines)
+    State.textureRemoverEnabled = b("textureRemoverEnabled", State.textureRemoverEnabled)
+    State.hideUIEnabled = b("hideUIEnabled", State.hideUIEnabled)
+    State.infoWindowEnabled = b("infoWindowEnabled", State.infoWindowEnabled)
+    State.formatEnabled = b("formatEnabled", State.formatEnabled)
+    if type(data.selectedPet) == "string" then State.selectedPet = data.selectedPet end
+    State.bossHeight = n("bossHeight", State.bossHeight, 0, 200)
+    State.giftAmount = n("giftAmount", State.giftAmount, 0, 9999)
+    State.uiWidthPct = n("uiWidthPct", State.uiWidthPct, 30, 90)
+    State.uiHeightPct = n("uiHeightPct", State.uiHeightPct, 30, 90)
 end
 
 -- ============================================================
--- 反复速度检测
+-- 反复速度
 -- ============================================================
 local function collectPetRepTimes()
-    local sumPct = 0
-    local timeMul = 1
-    local detail = {}
+    local sumPct, timeMul = 0, 1
     local own = Workspace:FindFirstChild(LocalPlayer.Name)
-    if not own then return 0, 1, detail end
-    local seenSlots = {}
+    if not own then return 0, 1 end
+    local seen = {}
     for _, pet in ipairs(own:GetChildren()) do
         if pet:IsA("Model") then
-            local slotName = nil
-            local slotObj = pet:FindFirstChild("equippedSlot")
-            if slotObj and slotObj:IsA("StringValue") and slotObj.Value ~= "" then
-                slotName = slotObj.Value
-            end
-            local key = slotName or ("obj:" .. tostring(pet))
-            if not seenSlots[key] then
-                seenSlots[key] = true
+            local slot
+            local s = pet:FindFirstChild("equippedSlot")
+            if s and s:IsA("StringValue") and s.Value ~= "" then slot = s.Value end
+            local key = slot or ("obj:" .. tostring(pet))
+            if not seen[key] then
+                seen[key] = true
                 local perks = pet:FindFirstChild("perksFolder")
                 if perks then
                     for _, p in ipairs(perks:GetChildren()) do
@@ -364,11 +352,9 @@ local function collectPetRepTimes()
                             local v = tonumber(p.Value) or 0
                             if v > 0 then
                                 sumPct = sumPct + v
-                                local mult = 1 - (v / 100)
-                                if mult < 0.001 then mult = 0.001 end
-                                timeMul = timeMul * mult
-                                table.insert(detail, string.format("%s:%s=%d",
-                                    slotName or pet.Name, p.Name, v))
+                                local m = 1 - v / 100
+                                if m < 0.001 then m = 0.001 end
+                                timeMul = timeMul * m
                             end
                         end
                     end
@@ -376,16 +362,14 @@ local function collectPetRepTimes()
             end
         end
     end
-    return sumPct, timeMul, detail
+    return sumPct, timeMul
 end
-
-local function readUltRepPct()
+local function readUltPct()
     local v = LocalPlayer:FindFirstChild("UltimateRepSpeed")
     if v and v:IsA("ValueBase") then return (tonumber(v.Value) or 0) * 5 end
     return 0
 end
-
-local function checkX2RepPass()
+local function checkX2Pass()
     local now = tick()
     if now - RepCache.lastPassCheck < 60 then return RepCache.x2 end
     RepCache.lastPassCheck = now
@@ -395,111 +379,71 @@ local function checkX2RepPass()
     RepCache.x2 = (ok and owns) and true or false
     return RepCache.x2
 end
-
 local function refreshRepSpeed()
-    local petPct, petTimeMul, detail = collectPetRepTimes()
-    local ultPct = readUltRepPct()
-    local x2 = checkX2RepPass()
-    local ultTimeMul = 1 - (ultPct / 100)
-    if ultTimeMul < 0.001 then ultTimeMul = 0.001 end
+    local petPct, petMul = collectPetRepTimes()
+    local ultPct = readUltPct()
+    local x2 = checkX2Pass()
+    local ultMul = math.max(0.001, 1 - ultPct / 100)
     local passMul = x2 and 0.5 or 1
     RepCache.pet = petPct
     RepCache.ult = ultPct
     RepCache.x2 = x2
-    RepCache.petTimeMul = petTimeMul
-    RepCache.ultTimeMul = ultTimeMul
-    RepCache.passMul = passMul
-    RepCache.detail = detail
-    local totalTime = petTimeMul * ultTimeMul * passMul
-    if totalTime < 0.0001 then totalTime = 0.0001 end
-    RepCache.speedMul = 1 / totalTime
-end
-
-local function refreshPetBonus()
-    refreshRepSpeed()
-    State.petRepBonus = RepCache.pet
-    State.petRepBonusDetail = RepCache.detail
+    local tt = math.max(0.0001, petMul * ultMul * passMul)
+    RepCache.speedMul = 1 / tt
 end
 
 -- ============================================================
--- 防卡顿
+-- 性能 / 隐藏
 -- ============================================================
-local AntiLag = {
-    enabled = false, rescanAt = 0,
-    particles = {}, shadows = {}, sounds = {},
-    lighting = nil, postEffects = {}, atmospheres = {},
-}
-local POST_CLASSES = {
-    BloomEffect = true, BlurEffect = true, SunRaysEffect = true,
-    ColorCorrectionEffect = true, DepthOfFieldEffect = true,
-}
+local AntiLag = { enabled = false, rescanAt = 0, particles = {}, shadows = {}, sounds = {}, lighting = nil, postEffects = {}, atmospheres = {} }
+local POST = { BloomEffect = true, BlurEffect = true, SunRaysEffect = true, ColorCorrectionEffect = true, DepthOfFieldEffect = true }
 local function scanAntiLag()
     for _, obj in ipairs(Workspace:GetDescendants()) do
         local cls = obj.ClassName
-        if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
-        or cls == "Fire" or cls == "Smoke" or cls == "Sparkles" then
+        if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam" or cls == "Fire" or cls == "Smoke" or cls == "Sparkles" then
             if obj.Enabled then obj.Enabled = false; table.insert(AntiLag.particles, obj) end
         elseif cls == "BasePart" and obj.CastShadow then
-            table.insert(AntiLag.shadows, { part = obj, value = true })
-            obj.CastShadow = false
+            table.insert(AntiLag.shadows, { part = obj, value = true }); obj.CastShadow = false
         end
     end
     for _, obj in ipairs(Lighting:GetChildren()) do
-        if POST_CLASSES[obj.ClassName] then
+        if POST[obj.ClassName] then
             if obj.Enabled then obj.Enabled = false; table.insert(AntiLag.postEffects, obj) end
         elseif obj.ClassName == "Atmosphere" then
-            table.insert(AntiLag.atmospheres, {
-                obj = obj, Density = obj.Density, Haze = obj.Haze, Glare = obj.Glare,
-            })
+            table.insert(AntiLag.atmospheres, { obj = obj, Density = obj.Density, Haze = obj.Haze, Glare = obj.Glare })
             obj.Density = 0; obj.Haze = 0; obj.Glare = 0
         end
     end
     for _, obj in ipairs(SoundService:GetDescendants()) do
         if obj:IsA("Sound") and obj.Playing and obj.Volume > 0 then
-            table.insert(AntiLag.sounds, { sound = obj, volume = obj.Volume })
-            obj.Volume = 0
+            table.insert(AntiLag.sounds, { sound = obj, volume = obj.Volume }); obj.Volume = 0
         end
     end
 end
 local function enableAntiLag()
     if AntiLag.enabled then return end
     AntiLag.enabled = true
-    AntiLag.lighting = {
-        GlobalShadows = Lighting.GlobalShadows,
-        ShadowSoftness = Lighting.ShadowSoftness,
-    }
-    pcall(function()
-        Lighting.GlobalShadows = false
-        Lighting.ShadowSoftness = 0
-    end)
-    scanAntiLag()
-    AntiLag.rescanAt = State.time + 2
+    AntiLag.lighting = { GlobalShadows = Lighting.GlobalShadows, ShadowSoftness = Lighting.ShadowSoftness }
+    pcall(function() Lighting.GlobalShadows = false; Lighting.ShadowSoftness = 0 end)
+    scanAntiLag(); AntiLag.rescanAt = State.time + 2
 end
 local function rescanAntiLag()
     if not AntiLag.enabled then return end
-    pcall(function()
-        Lighting.GlobalShadows = false
-        Lighting.ShadowSoftness = 0
-    end)
-    scanAntiLag()
-    AntiLag.rescanAt = State.time + 2
+    pcall(function() Lighting.GlobalShadows = false; Lighting.ShadowSoftness = 0 end)
+    scanAntiLag(); AntiLag.rescanAt = State.time + 2
 end
 local function disableAntiLag()
     AntiLag.enabled = false
     for _, p in ipairs(AntiLag.particles) do pcall(function() p.Enabled = true end) end
     table.clear(AntiLag.particles)
-    for _, item in ipairs(AntiLag.shadows) do pcall(function() item.part.CastShadow = item.value end) end
+    for _, it in ipairs(AntiLag.shadows) do pcall(function() it.part.CastShadow = it.value end) end
     table.clear(AntiLag.shadows)
-    for _, item in ipairs(AntiLag.sounds) do pcall(function() item.sound.Volume = item.volume end) end
+    for _, it in ipairs(AntiLag.sounds) do pcall(function() it.sound.Volume = it.volume end) end
     table.clear(AntiLag.sounds)
     for _, fx in ipairs(AntiLag.postEffects) do pcall(function() fx.Enabled = true end) end
     table.clear(AntiLag.postEffects)
-    for _, item in ipairs(AntiLag.atmospheres) do
-        pcall(function()
-            item.obj.Density = item.Density
-            item.obj.Haze = item.Haze
-            item.obj.Glare = item.Glare
-        end)
+    for _, it in ipairs(AntiLag.atmospheres) do
+        pcall(function() it.obj.Density = it.Density; it.obj.Haze = it.Haze; it.obj.Glare = it.Glare end)
     end
     table.clear(AntiLag.atmospheres)
     if AntiLag.lighting then
@@ -511,48 +455,37 @@ local function disableAntiLag()
     end
 end
 
--- ============================================================
--- 渲染剔除
--- ============================================================
 local RenderCull = { hidden = {}, rescanAt = 0 }
-local function cullModel(model)
-    local saved = {}
-    for _, p in ipairs(model:GetDescendants()) do
+local function cullModel(m)
+    local s = {}
+    for _, p in ipairs(m:GetDescendants()) do
         if p:IsA("BasePart") then
-            saved[p] = { ltm = p.LocalTransparencyModifier, tr = p.Transparency }
-            pcall(function()
-                p.LocalTransparencyModifier = 1
-                p.Transparency = 1
-            end)
+            s[p] = { ltm = p.LocalTransparencyModifier, tr = p.Transparency }
+            pcall(function() p.LocalTransparencyModifier = 1; p.Transparency = 1 end)
         end
     end
-    RenderCull.hidden[model] = saved
+    RenderCull.hidden[m] = s
 end
-local function uncullModel(model)
-    local saved = RenderCull.hidden[model]
-    if not saved then return end
-    for p, v in pairs(saved) do
+local function uncullModel(m)
+    local s = RenderCull.hidden[m]; if not s then return end
+    for p, v in pairs(s) do
         if p.Parent then
-            pcall(function()
-                p.LocalTransparencyModifier = v.ltm
-                p.Transparency = v.tr
-            end)
+            pcall(function() p.LocalTransparencyModifier = v.ltm; p.Transparency = v.tr end)
         end
     end
-    RenderCull.hidden[model] = nil
+    RenderCull.hidden[m] = nil
 end
 local function scanRenderCull()
-    local hrp = Cache.hrp
-    if not hrp then return end
+    local hrp = Cache.hrp; if not hrp then return end
     local pos = hrp.Position
-    local threshSq = (State.renderCullDist or 500) ^ 2
+    local tSq = (State.renderCullDist or 500) ^ 2
     for _, obj in ipairs(Workspace:GetChildren()) do
         if obj:IsA("Model") and obj ~= Cache.char and not Players:GetPlayerFromCharacter(obj) then
             local prim = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
             if prim then
                 local d = prim.Position - pos
                 local dsq = d.X*d.X + d.Y*d.Y + d.Z*d.Z
-                if dsq > threshSq then
+                if dsq > tSq then
                     if not RenderCull.hidden[obj] then cullModel(obj) end
                 else
                     if RenderCull.hidden[obj] then uncullModel(obj) end
@@ -560,43 +493,30 @@ local function scanRenderCull()
             end
         end
     end
-    for model in pairs(RenderCull.hidden) do
-        if not model.Parent then RenderCull.hidden[model] = nil end
+    for m in pairs(RenderCull.hidden) do
+        if not m.Parent then RenderCull.hidden[m] = nil end
     end
     RenderCull.rescanAt = State.time + 1
 end
 local function disableRenderCull()
-    for model in pairs(RenderCull.hidden) do uncullModel(model) end
+    for m in pairs(RenderCull.hidden) do uncullModel(m) end
     table.clear(RenderCull.hidden)
 end
-local function forceRescanRenderCull()
-    pcall(disableRenderCull)
-    RenderCull.rescanAt = 0
-end
 
--- ============================================================
--- 隐藏宠物 / 器械
--- ============================================================
 local PetHider = { own = {}, all = {}, machines = {}, rescanAt = 0 }
-local function hideModelParts(model)
-    if not model or not model.Parent then return end
-    for _, p in ipairs(model:GetDescendants()) do
+local function hidePart(m)
+    if not m or not m.Parent then return end
+    for _, p in ipairs(m:GetDescendants()) do
         if p:IsA("BasePart") then
-            pcall(function()
-                p.LocalTransparencyModifier = 1
-                p.Transparency = 1
-            end)
+            pcall(function() p.LocalTransparencyModifier = 1; p.Transparency = 1 end)
         end
     end
 end
-local function showModelParts(model)
-    if not model or not model.Parent then return end
-    for _, p in ipairs(model:GetDescendants()) do
+local function showPart(m)
+    if not m or not m.Parent then return end
+    for _, p in ipairs(m:GetDescendants()) do
         if p:IsA("BasePart") then
-            pcall(function()
-                p.LocalTransparencyModifier = 0
-                p.Transparency = 0
-            end)
+            pcall(function() p.LocalTransparencyModifier = 0; p.Transparency = 0 end)
         end
     end
 end
@@ -606,8 +526,7 @@ local function scanHidePets()
         if own then
             for _, pet in ipairs(own:GetChildren()) do
                 if pet:IsA("Model") or pet:IsA("Folder") then
-                    table.insert(PetHider.own, pet)
-                    hideModelParts(pet)
+                    table.insert(PetHider.own, pet); hidePart(pet)
                 end
             end
         end
@@ -619,8 +538,7 @@ local function scanHidePets()
                 if f then
                     for _, pet in ipairs(f:GetChildren()) do
                         if pet:IsA("Model") or pet:IsA("Folder") then
-                            table.insert(PetHider.all, pet)
-                            hideModelParts(pet)
+                            table.insert(PetHider.all, pet); hidePart(pet)
                         end
                     end
                 end
@@ -630,9 +548,9 @@ local function scanHidePets()
     PetHider.rescanAt = State.time + 2
 end
 local function restoreHiddenPets()
-    for _, m in ipairs(PetHider.own) do showModelParts(m) end
+    for _, m in ipairs(PetHider.own) do showPart(m) end
     table.clear(PetHider.own)
-    for _, m in ipairs(PetHider.all) do showModelParts(m) end
+    for _, m in ipairs(PetHider.all) do showPart(m) end
     table.clear(PetHider.all)
 end
 local function scanHideMachines()
@@ -640,68 +558,55 @@ local function scanHideMachines()
     local mf = Workspace:FindFirstChild("machinesFolder")
     if mf then
         for _, m in ipairs(mf:GetChildren()) do
-            if m:IsA("Model") then
-                table.insert(PetHider.machines, m)
-                hideModelParts(m)
-            end
+            if m:IsA("Model") then table.insert(PetHider.machines, m); hidePart(m) end
         end
     end
     PetHider.rescanAt = State.time + 2
 end
 local function restoreHiddenMachines()
-    for _, m in ipairs(PetHider.machines) do showModelParts(m) end
+    for _, m in ipairs(PetHider.machines) do showPart(m) end
     table.clear(PetHider.machines)
 end
 
--- ============================================================
--- 纹理移除
--- ============================================================
-local TextureRemover = { enabled = false, rescanAt = 0, saved = {}, seen = {} }
+local TexRem = { enabled = false, rescanAt = 0, saved = {}, seen = {} }
 local function scanTextures()
     for _, obj in ipairs(Workspace:GetDescendants()) do
         local cls = obj.ClassName
         if cls == "Decal" or cls == "Texture" then
-            if not TextureRemover.seen[obj] and obj.Texture ~= "" then
-                TextureRemover.seen[obj] = true
-                table.insert(TextureRemover.saved, { obj = obj, prop = "Texture", value = obj.Texture })
+            if not TexRem.seen[obj] and obj.Texture ~= "" then
+                TexRem.seen[obj] = true
+                table.insert(TexRem.saved, { obj = obj, prop = "Texture", value = obj.Texture })
                 obj.Texture = ""
             end
         elseif cls == "MeshPart" or cls == "SpecialMesh" then
             local p = (cls == "MeshPart") and "TextureID" or "TextureId"
-            if not TextureRemover.seen[obj] and obj[p] and obj[p] ~= "" then
-                TextureRemover.seen[obj] = true
-                table.insert(TextureRemover.saved, { obj = obj, prop = p, value = obj[p] })
+            if not TexRem.seen[obj] and obj[p] and obj[p] ~= "" then
+                TexRem.seen[obj] = true
+                table.insert(TexRem.saved, { obj = obj, prop = p, value = obj[p] })
                 obj[p] = ""
             end
         elseif cls == "SurfaceAppearance" then
-            if not TextureRemover.seen[obj] and obj.ColorMap ~= "" then
-                TextureRemover.seen[obj] = true
-                table.insert(TextureRemover.saved, { obj = obj, prop = "ColorMap", value = obj.ColorMap })
+            if not TexRem.seen[obj] and obj.ColorMap ~= "" then
+                TexRem.seen[obj] = true
+                table.insert(TexRem.saved, { obj = obj, prop = "ColorMap", value = obj.ColorMap })
                 obj.ColorMap = ""
             end
         end
     end
 end
-local function enableTextureRemover()
-    if TextureRemover.enabled then return end
-    TextureRemover.enabled = true
-    table.clear(TextureRemover.saved)
-    table.clear(TextureRemover.seen)
-    scanTextures()
-    TextureRemover.rescanAt = State.time + 4
+local function enableTex()
+    if TexRem.enabled then return end
+    TexRem.enabled = true; table.clear(TexRem.saved); table.clear(TexRem.seen)
+    scanTextures(); TexRem.rescanAt = State.time + 4
 end
-local function rescanTextureRemover()
-    if not TextureRemover.enabled then return end
-    scanTextures()
-    TextureRemover.rescanAt = State.time + 4
+local function rescanTex()
+    if not TexRem.enabled then return end
+    scanTextures(); TexRem.rescanAt = State.time + 4
 end
-local function disableTextureRemover()
-    TextureRemover.enabled = false
-    for _, item in ipairs(TextureRemover.saved) do
-        pcall(function() item.obj[item.prop] = item.value end)
-    end
-    table.clear(TextureRemover.saved)
-    table.clear(TextureRemover.seen)
+local function disableTex()
+    TexRem.enabled = false
+    for _, it in ipairs(TexRem.saved) do pcall(function() it.obj[it.prop] = it.value end) end
+    table.clear(TexRem.saved); table.clear(TexRem.seen)
 end
 
 local HiddenUIs = {}
@@ -719,166 +624,77 @@ local function restoreHiddenUI()
 end
 
 local function sweepOverflow()
-    for i = #AntiLag.particles, 1, -1 do
-        local p = AntiLag.particles[i]
-        if not p or not p.Parent then table.remove(AntiLag.particles, i) end
-    end
-    for i = #AntiLag.shadows, 1, -1 do
-        local it = AntiLag.shadows[i]
-        if not it.part or not it.part.Parent then table.remove(AntiLag.shadows, i) end
-    end
-    for i = #AntiLag.sounds, 1, -1 do
-        local it = AntiLag.sounds[i]
-        if not it.sound or not it.sound.Parent then table.remove(AntiLag.sounds, i) end
-    end
-    for i = #AntiLag.postEffects, 1, -1 do
-        local fx = AntiLag.postEffects[i]
-        if not fx or not fx.Parent then table.remove(AntiLag.postEffects, i) end
-    end
-    for i = #AntiLag.atmospheres, 1, -1 do
-        local it = AntiLag.atmospheres[i]
-        if not it.obj or not it.obj.Parent then table.remove(AntiLag.atmospheres, i) end
-    end
-    for model in pairs(RenderCull.hidden) do
-        if not model.Parent then RenderCull.hidden[model] = nil end
-    end
-    for i = #TextureRemover.saved, 1, -1 do
-        local it = TextureRemover.saved[i]
-        if not it.obj or not it.obj.Parent then table.remove(TextureRemover.saved, i) end
-    end
-    for obj in pairs(TextureRemover.seen) do
-        if not obj.Parent then TextureRemover.seen[obj] = nil end
-    end
+    for i = #AntiLag.particles, 1, -1 do local p = AntiLag.particles[i]; if not p or not p.Parent then table.remove(AntiLag.particles, i) end end
+    for i = #AntiLag.shadows, 1, -1 do local it = AntiLag.shadows[i]; if not it.part or not it.part.Parent then table.remove(AntiLag.shadows, i) end end
+    for i = #AntiLag.sounds, 1, -1 do local it = AntiLag.sounds[i]; if not it.sound or not it.sound.Parent then table.remove(AntiLag.sounds, i) end end
+    for i = #AntiLag.postEffects, 1, -1 do local fx = AntiLag.postEffects[i]; if not fx or not fx.Parent then table.remove(AntiLag.postEffects, i) end end
+    for i = #AntiLag.atmospheres, 1, -1 do local it = AntiLag.atmospheres[i]; if not it.obj or not it.obj.Parent then table.remove(AntiLag.atmospheres, i) end end
+    for m in pairs(RenderCull.hidden) do if not m.Parent then RenderCull.hidden[m] = nil end end
+    for i = #TexRem.saved, 1, -1 do local it = TexRem.saved[i]; if not it.obj or not it.obj.Parent then table.remove(TexRem.saved, i) end end
+    for o in pairs(TexRem.seen) do if not o.Parent then TexRem.seen[o] = nil end end
     for i = #PetHider.own, 1, -1 do if not PetHider.own[i].Parent then table.remove(PetHider.own, i) end end
     for i = #PetHider.all, 1, -1 do if not PetHider.all[i].Parent then table.remove(PetHider.all, i) end end
     for i = #PetHider.machines, 1, -1 do if not PetHider.machines[i].Parent then table.remove(PetHider.machines, i) end end
     for i = #HiddenUIs, 1, -1 do if not HiddenUIs[i].Parent then table.remove(HiddenUIs, i) end end
 end
 
-local function cleanupTrainingState()
-    State.trainAccum = 0
-    State.degradeLevel = 0
-    State.fpsWinTime = 0
-    State.fpsWinFrames = 0
-    State.adaptiveStableCount = 0
-    State.adaptiveStep = 100
-end
-
-local function destroy()
-    if State.destroyed then return end
-    pcall(saveConfig)
-    State.destroyed = true
-    for _, c in ipairs(State.conns) do pcall(function() c:Disconnect() end) end
-    table.clear(State.conns)
-    pcall(function() Workspace.Gravity = State.originalGravity end)
-    pcall(disableAntiLag)
-    pcall(disableRenderCull)
-    pcall(restoreHiddenPets)
-    pcall(restoreHiddenMachines)
-    pcall(disableTextureRemover)
-    pcall(restoreHiddenUI)
-    if State.ui.screen then pcall(function() State.ui.screen:Destroy() end) State.ui.screen = nil end
-    if State.ui.infoGui then pcall(function() State.ui.infoGui:Destroy() end) State.ui.infoGui = nil end
-    if _G[SCRIPT_ID] and _G[SCRIPT_ID].version == VERSION then _G[SCRIPT_ID] = nil end
-end
-
-local function performAFKClick()
-    if State.destroyed then return end
-    local cam = Workspace.CurrentCamera
-    local vp = cam and cam.ViewportSize or V2n(1920, 1080)
-    local tx, ty = vp.X - 8, vp.Y - 8
-    local ox, oy, hasOrig = 0, 0, false
-    local ok0, mloc = pcall(UIS_GML, UserInputService)
-    if ok0 and mloc then ox, oy = mloc.X, mloc.Y hasOrig = true end
-    if type(mousemoveabs) == "function" and type(mouse1click) == "function" then
-        local ok = pcall(function()
-            mousemoveabs(tx, ty); mouse1click()
-            if hasOrig then mousemoveabs(ox, oy) end
-        end)
-        if ok then return end
-    end
-    local ok2, VIM = pcall(function() return game:GetService("VirtualInputManager") end)
-    if ok2 and VIM then
-        pcall(function()
-            VIM:SendMouseButtonEvent(tx, ty, 0, true, game, 0)
-            VIM:SendMouseButtonEvent(tx, ty, 0, false, game, 0)
-            if hasOrig then VIM:SendMouseMoveEvent(ox, oy, game) end
-        end)
-    end
-end
-
-local function fixCamera()
-    local cam = Workspace.CurrentCamera
-    if not cam then return end
-    local hum = Cache.hum
-    if hum and hum.Parent then
-        pcall(function()
-            if cam.CameraSubject ~= hum then cam.CameraSubject = hum end
-            if cam.CameraType ~= E_CamCustom then cam.CameraType = E_CamCustom end
-        end)
-    end
-end
-
 -- ============================================================
--- 工具
+-- 工具切换（修复：无选中工具时不自杀）
 -- ============================================================
-local TOOL_KEYWORDS = {
+local TOOL_KW = {
     dumbbell   = { "barbell", "dumbbell", "weight", "哑铃", "杠铃" },
     pushups    = { "pushup", "push up", "push-up", "俯卧撑" },
     handstands = { "handstand", "hand stand", "hand-stand", "倒立" },
     situps     = { "situp", "sit up", "sit-up", "仰卧起坐" },
     punch      = { "punch", "拳", "fist", "空手", "拳头" },
 }
-local function matchKeyword(name, list)
-    local n = name:lower()
+local function matchKw(n, list)
+    n = n:lower()
     for i = 1, #list do if n:find(list[i]) then return true end end
     return false
 end
 local function isEquipped(list)
-    local char = Cache.char
-    if not char then return false end
-    for _, c in ipairs(char:GetChildren()) do
-        if c:IsA("Tool") and matchKeyword(c.Name, list) then return true end
+    local c = Cache.char; if not c then return false end
+    for _, t in ipairs(c:GetChildren()) do
+        if t:IsA("Tool") and matchKw(t.Name, list) then return true end
     end
     return false
 end
-local function findAnyTool(list)
-    local char = Cache.char
-    if char then
-        for _, c in ipairs(char:GetChildren()) do
-            if c:IsA("Tool") and matchKeyword(c.Name, list) then return c end
+local function findTool(list)
+    local c = Cache.char
+    if c then
+        for _, t in ipairs(c:GetChildren()) do
+            if t:IsA("Tool") and matchKw(t.Name, list) then return t end
         end
     end
     local bp = LocalPlayer:FindFirstChild("Backpack")
     if bp then
-        for _, c in ipairs(bp:GetChildren()) do
-            if c:IsA("Tool") and matchKeyword(c.Name, list) then return c end
+        for _, t in ipairs(bp:GetChildren()) do
+            if t:IsA("Tool") and matchKw(t.Name, list) then return t end
         end
     end
     return nil
 end
 local function tryEquip(list)
     if isEquipped(list) then return true end
-    local hum = Cache.hum
-    if not hum then return false end
-    local bp = LocalPlayer:FindFirstChild("Backpack")
-    if not bp then return false end
+    local hum = Cache.hum; if not hum then return false end
+    local bp = LocalPlayer:FindFirstChild("Backpack"); if not bp then return false end
     for _, c in ipairs(bp:GetChildren()) do
-        if c:IsA("Tool") and matchKeyword(c.Name, list) then
+        if c:IsA("Tool") and matchKw(c.Name, list) then
             pcall(function() hum:EquipTool(c) end)
             return true
         end
     end
     return false
 end
-local function toolExists(list) return isEquipped(list) or (findAnyTool(list) ~= nil) end
+local function toolExists(list) return isEquipped(list) or findTool(list) ~= nil end
 local function suicide()
     local hum = Cache.hum
     if hum and hum.Health > 0 then hum.Health = 0
     elseif Cache.char then pcall(function() Cache.char:BreakJoints() end) end
 end
 
-local function getStatValue(plr, name)
+local function stat(plr, name)
     if not plr then return 0 end
     local v = plr:FindFirstChild(name)
     if v and v:IsA("ValueBase") then return tonumber(v.Value) or 0 end
@@ -889,24 +705,23 @@ local function getStatValue(plr, name)
     end
     return 0
 end
-local function getMyStrength() return getStatValue(LocalPlayer, "Strength") end
-local function getPlayerDurability(plr) return getStatValue(plr, "Durability") end
+local function myStrength() return stat(LocalPlayer, "Strength") end
 
 local function getMuscleEvent()
-    local cached = State.muscleEventRef
-    if cached and cached.Parent == LocalPlayer then return cached end
+    local c = State.muscleEventRef
+    if c and c.Parent == LocalPlayer then return c end
     local ev = LocalPlayer:FindFirstChild("muscleEvent")
     State.muscleEventRef = ev
     return ev
 end
 local function getRebirthEvent()
-    local cached = State.rebirthEventRef
-    if cached and cached.Parent then return cached end
+    local c = State.rebirthEventRef
+    if c and c.Parent then return c end
     if State.time - State.lastRebirthScan < 3 then return nil end
     State.lastRebirthScan = State.time
-    local rEvents = ReplicatedStorage:FindFirstChild("rEvents")
-    if rEvents then
-        local ev = rEvents:FindFirstChild("rebirthRemote")
+    local r = ReplicatedStorage:FindFirstChild("rEvents")
+    if r then
+        local ev = r:FindFirstChild("rebirthRemote")
         if ev and (ev:IsA("RemoteEvent") or ev:IsA("RemoteFunction")) then
             State.rebirthEventRef = ev
             return ev
@@ -915,12 +730,11 @@ local function getRebirthEvent()
     return nil
 end
 local function fireRebirth()
-    local ev = getRebirthEvent()
-    if not ev then return end
+    local ev = getRebirthEvent(); if not ev then return end
     task.spawn(function()
         pcall(function()
             if ev:IsA("RemoteFunction") then ev:InvokeServer("rebirthRequest")
-            elseif ev:IsA("RemoteEvent") then ev:FireServer("rebirthRequest") end
+            else ev:FireServer("rebirthRequest") end
         end)
     end)
 end
@@ -943,31 +757,22 @@ local function getMuscleKing()
     return nil
 end
 
+-- ============================================================
+-- 传送
+-- ============================================================
 local PortalCache, PortalCacheAt = nil, 0
-local function findPortalNow()
-    local p = Workspace:FindFirstChild("beachToMuscleKing", true)
-    if p and p:IsA("BasePart") then return p end
-    return nil
-end
 local function getPortal()
-    if PortalCache and PortalCache.Parent and State.time - PortalCacheAt < 5 then
-        return PortalCache
-    end
-    PortalCache = findPortalNow()
+    if PortalCache and PortalCache.Parent and State.time - PortalCacheAt < 5 then return PortalCache end
+    local p = Workspace:FindFirstChild("beachToMuscleKing", true)
+    PortalCache = (p and p:IsA("BasePart")) and p or nil
     PortalCacheAt = State.time
     return PortalCache
 end
-local function getTargetCF()
-    local portal = getPortal()
-    if portal then return CN(portal.Position + V3n(0, 3, 0)) end
-    return CN(V3n(-8727.1, 406.7, -5796.4))
-end
-local function doTeleport(force)
+local function teleportMuscleKing(force)
     if force then PortalCache = nil; PortalCacheAt = 0 end
-    local hrp = Cache.hrp
-    if not hrp then return false end
-    local cf = getTargetCF()
-    if not cf then return false end
+    local hrp = Cache.hrp; if not hrp then return false end
+    local portal = getPortal()
+    local cf = portal and CN(portal.Position + V3n(0, 3, 0)) or CN(V3n(-8727.1, 406.7, -5796.4))
     return pcall(function()
         hrp.CFrame = cf
         hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
@@ -975,651 +780,586 @@ local function doTeleport(force)
     end)
 end
 
-local function getCharacterHRP(plr)
-    local char = plr and plr.Character
-    if not char then return nil end
-    local hrp = char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return nil end
-    local h = char:FindFirstChildOfClass("Humanoid")
-    if not h or h.Health <= 0 then return nil end
-    return hrp, h
+local TELEPORTS = {
+    { name = "大厅", pos = V3n(-0.75, 90.61, 242.78) },
+    { name = "小岛", pos = V3n(-32.14, 8.51, 1904.41) },
+    { name = "冰霜健身房", pos = V3n(-2623.41, 6.99, -409.34) },
+    { name = "神话健身房", pos = V3n(2250.39, 6.99, 1072.77) },
+    { name = "永恒健身房", pos = V3n(-6758.39, 6.99, -1284.45) },
+    { name = "传奇健身房", pos = V3n(4603.40, 990.99, -3897.44) },
+    { name = "肌肉之王健身房", pos = V3n(-8625.40, 16.99, -5730.41) },
+    { name = "丛林健身房", pos = V3n(-8685.01, 5.99, 2392.06) },
+    { name = "工业健身房", pos = V3n(-5496.68, 59.04, 4927.74) },
+    { name = "超载健身房", pos = V3n(-3045.30, 165.41, 4990.69) },
+    { name = "无转盘岛", pos = V3n(1952.09, 1, 6179.98) },
+    { name = "熔岩争斗", pos = V3n(4472.53, 118.90, -8848.54) },
+    { name = "沙漠争斗", pos = V3n(973.62, 15.92, -7277.01) },
+    { name = "海滩争斗", pos = V3n(-1880.89, 15.87, -6137.75) },
+}
+local function teleportTo(pos)
+    local hrp = Cache.hrp; if not hrp then return false end
+    return pcall(function()
+        hrp.CFrame = CN(pos)
+        hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+        hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
+    end)
 end
-local function applyKillMovement(targetHRP)
-    local hrp = Cache.hrp
-    if not hrp then return end
+
+-- ============================================================
+-- 杀戮
+-- ============================================================
+local function getCharHRP(plr)
+    local c = plr and plr.Character
+    if not c then return nil end
+    local hrp = c:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    local h = c:FindFirstChildOfClass("Humanoid")
+    if not h or h.Health <= 0 then return nil end
+    return hrp
+end
+local function applyKillMove(targetHRP)
+    local hrp = Cache.hrp; if not hrp then return end
     local delta = targetHRP.Position - hrp.Position
-    local distSq = delta.X*delta.X + delta.Y*delta.Y + delta.Z*delta.Z
-    if distSq > 9 then
-        local dist = math.sqrt(distSq)
+    local dsq = delta.X*delta.X + delta.Y*delta.Y + delta.Z*delta.Z
+    if dsq > 9 then
+        local dist = math.sqrt(dsq)
         local newPos = targetHRP.Position - delta / dist * 2.5
-        local newCF = CN(newPos, targetHRP.Position)
+        local cf = CN(newPos, targetHRP.Position)
         pcall(function()
-            hrp.CFrame = newCF
+            hrp.CFrame = cf
             hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
             hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
         end)
     end
 end
-local function activatePunch()
-    local char = Cache.char
-    if not char then return end
-    local tool = char:FindFirstChildOfClass("Tool")
+local function punch()
+    local c = Cache.char; if not c then return end
+    local tool = c:FindFirstChildOfClass("Tool")
     if tool then pcall(function() tool:Activate() end) end
 end
-
--- ★ 全图杀戮：好友白名单生效
 local function selectKillTarget()
-    local myStrength = getMyStrength()
-    local threshold = State.killThreshold or 5
-    local list = GetPlayers(Players)
-    for i = 1, #list do
-        local plr = list[i]
-        if plr ~= LocalPlayer then
-            local blocked = false
-            if State.friendWhitelist and isFriend(plr) then blocked = true end
-            if not blocked then
-                local hrp = getCharacterHRP(plr)
-                if hrp then
-                    local dur = getPlayerDurability(plr)
-                    if dur == nil then return plr end
-                    if myStrength > 0 and myStrength * threshold >= dur then return plr end
-                end
+    local s = myStrength()
+    local t = State.killThreshold or 5
+    for _, plr in ipairs(GetPlayers(Players)) do
+        if plr ~= LocalPlayer and not (State.friendWhitelist and isFriend(plr)) then
+            local hrp = getCharHRP(plr)
+            if hrp then
+                local dur = stat(plr, "Durability")
+                if dur == 0 or (s > 0 and s * t >= dur) then return plr end
             end
         end
     end
     return nil
 end
-local function runKillTick(dt)
+local function runKillTick()
     if State.time - State.killScanAt >= 0.5 then
         State.killScanAt = State.time
-        local cur = State.killTarget
-        -- 目标变好友时也要立即换
-        if cur and State.friendWhitelist and isFriend(cur) then
+        if State.killTarget and State.friendWhitelist and isFriend(State.killTarget) then
             State.killTarget = nil
         end
-        local valid = State.killTarget and getCharacterHRP(State.killTarget)
+        local valid = State.killTarget and getCharHRP(State.killTarget)
         if not valid then
             State.killTarget = selectKillTarget()
         else
-            local myStrength = getMyStrength()
-            local dur = getPlayerDurability(State.killTarget)
-            if dur and myStrength > 0 and myStrength * (State.killThreshold or 5) < dur then
+            local s = myStrength()
+            local dur = stat(State.killTarget, "Durability")
+            if dur > 0 and s > 0 and s * (State.killThreshold or 5) < dur then
                 State.killTarget = selectKillTarget()
             end
         end
         State.toolOwnedByKill = State.killTarget ~= nil
     end
-    local target = State.killTarget
-    if not target then State.toolOwnedByKill = false return end
-    local targetHRP = getCharacterHRP(target)
-    if not targetHRP then
-        State.killTarget = nil
-        State.toolOwnedByKill = false
-        return
-    end
-    applyKillMovement(targetHRP)
+    local t = State.killTarget; if not t then return end
+    local hrp = getCharHRP(t); if not hrp then State.killTarget = nil; return end
+    applyKillMove(hrp)
     local dual = State.dualEnabled and (State.autoTrain or State.fastTrain)
     if not dual then
         if State.time - State.killLastAttack >= 0.05 then
             State.killLastAttack = State.time
-            if not isEquipped(TOOL_KEYWORDS.punch) then
-                tryEquip(TOOL_KEYWORDS.punch)
-            end
-            activatePunch()
+            if not isEquipped(TOOL_KW.punch) then tryEquip(TOOL_KW.punch) end
+            punch()
         end
     end
 end
-
--- ★ 肌肉之王竞争：好友白名单生效
-local function runKingKillTick(dt)
+local function runKingKillTick()
     if State.time - State.lastKingCheck >= 0.5 then
         State.lastKingCheck = State.time
         local king = getMuscleKing()
-        if not king or king == LocalPlayer then
-            State.kingKillTarget = nil
-            State.kingKillActive = false
-            return
+        if not king or king == LocalPlayer or (State.friendWhitelist and isFriend(king)) then
+            State.kingKillTarget = nil; State.kingKillActive = false; return
         end
-        -- 好友是王，不打
-        if State.friendWhitelist and isFriend(king) then
-            State.kingKillTarget = nil
-            State.kingKillActive = false
-            return
-        end
-        local hrp = getCharacterHRP(king)
-        if not hrp then
-            State.kingKillTarget = nil
-            State.kingKillActive = false
-            return
-        end
-        local myStrength = getMyStrength()
-        local targetDur = getPlayerDurability(king)
-        local threshold = State.kingKillThreshold or 20
-        if targetDur and myStrength > 0 and targetDur >= myStrength * threshold then
-            State.kingKillTarget = nil
-            State.kingKillActive = false
-            return
+        local hrp = getCharHRP(king)
+        if not hrp then State.kingKillTarget = nil; State.kingKillActive = false; return end
+        local s = myStrength()
+        local dur = stat(king, "Durability")
+        if dur > 0 and s > 0 and dur >= s * (State.kingKillThreshold or 20) then
+            State.kingKillTarget = nil; State.kingKillActive = false; return
         end
         State.kingKillTarget = king
     end
-    local target = State.kingKillTarget
-    if not target then State.kingKillActive = false return end
-    if State.friendWhitelist and isFriend(target) then
-        State.kingKillTarget = nil
-        State.kingKillActive = false
-        return
+    local t = State.kingKillTarget; if not t then State.kingKillActive = false; return end
+    if State.friendWhitelist and isFriend(t) then
+        State.kingKillTarget = nil; State.kingKillActive = false; return
     end
-    local targetHRP = getCharacterHRP(target)
-    if not targetHRP then
-        State.kingKillTarget = nil
-        State.kingKillActive = false
-        return
-    end
+    local hrp = getCharHRP(t)
+    if not hrp then State.kingKillTarget = nil; State.kingKillActive = false; return end
     State.kingKillActive = true
-    applyKillMovement(targetHRP)
+    applyKillMove(hrp)
     if State.time - State.kingKillLastAttack >= 0.05 then
         State.kingKillLastAttack = State.time
-        if not isEquipped(TOOL_KEYWORDS.punch) then
-            tryEquip(TOOL_KEYWORDS.punch)
-        end
-        activatePunch()
+        if not isEquipped(TOOL_KW.punch) then tryEquip(TOOL_KW.punch) end
+        punch()
     end
 end
-
-local function findPreferredTrainTool()
-    if State.toolPushups then
-        local t = findAnyTool(TOOL_KEYWORDS.pushups); if t then return t end
-    end
-    if State.toolHandstands then
-        local t = findAnyTool(TOOL_KEYWORDS.handstands); if t then return t end
-    end
-    if State.toolSitups then
-        local t = findAnyTool(TOOL_KEYWORDS.situps); if t then return t end
-    end
-    if State.toolDumbbell then
-        local t = findAnyTool(TOOL_KEYWORDS.dumbbell); if t then return t end
-    end
+local function findPreferredTool()
+    if State.toolPushups then local t = findTool(TOOL_KW.pushups); if t then return t end end
+    if State.toolHandstands then local t = findTool(TOOL_KW.handstands); if t then return t end end
+    if State.toolSitups then local t = findTool(TOOL_KW.situps); if t then return t end end
+    if State.toolDumbbell then local t = findTool(TOOL_KW.dumbbell); if t then return t end end
     return nil
 end
 local function updateDualTool()
-    if not State.dualEnabled then return end
-    if not State.killEnabled or not State.killTarget then return end
+    if not State.dualEnabled or not State.killEnabled or not State.killTarget then return end
     if not (State.autoTrain or State.fastTrain) then return end
-    local hum = Cache.hum
-    if not hum then return end
+    local hum = Cache.hum; if not hum then return end
     if State.time - State.dualLastSwitch < 0.06 then return end
     State.dualLastSwitch = State.time
     if State.dualCurrentMode == "punch" then
-        local t = findPreferredTrainTool()
+        local t = findPreferredTool()
         if t then
             pcall(function() hum:EquipTool(t) end)
             State.dualCurrentMode = "train"
-            task.defer(function()
-                if not State.destroyed then pcall(function() t:Activate() end) end
-            end)
-        else
-            State.dualCurrentMode = "punch"
-        end
+            task.defer(function() if not State.destroyed then pcall(function() t:Activate() end) end end)
+        else State.dualCurrentMode = "punch" end
     else
-        local t = findAnyTool(TOOL_KEYWORDS.punch)
+        local t = findTool(TOOL_KW.punch)
         if t then
             pcall(function() hum:EquipTool(t) end)
             State.dualCurrentMode = "punch"
-            task.defer(function()
-                if not State.destroyed then pcall(function() t:Activate() end) end
+            task.defer(function() if not State.destroyed then pcall(function() t:Activate() end) end end)
+        else State.dualCurrentMode = "train" end
+    end
+end
+
+-- ============================================================
+-- 宠物商店
+-- ============================================================
+local FALLBACK_PETS = {
+    "不稳定幻影", "以太仙灵小兔", "伏特爪", "冰波传奇企鹅", "反应堆兽",
+    "地狱火", "地狱火龙", "大超新星", "幻影创世龙", "星界电光",
+    "暗星猎人", "核心小狗", "橙色刺猬", "橙色飞马", "永恒巨型攻击",
+    "永恒打击利维坦", "熵爆炸", "电光", "白色凤凰", "白色飞马",
+    "等离子掠夺者", "紫色光环", "紫色新环", "紫色猎鹰", "紫色龙",
+    "红色光环", "红色小猫", "红色火龙", "红色释火者", "终极超新星飞马",
+    "绿色光环", "绿色蝴蝶", "绿色释火者", "肌肉之王", "肌肉老师",
+    "能量闪电", "蓝色光环", "蓝色凤凰", "顶峰霸主", "魔法蝴蝶",
+    "黄色光环", "黄色蝴蝶", "黄金维金人", "黑暗德古拉", "黑暗电光",
+    "黑暗蝎尾怪传奇", "黑暗闪电", "黑暗风暴", "黑暗魔像",
+}
+local function getPetShopRemote()
+    local r = ReplicatedStorage:FindFirstChild("rEvents")
+    return r and r:FindFirstChild("cPetShopRemote")
+end
+local function getPetShopFolder()
+    local s = ReplicatedStorage:FindFirstChild("shared")
+    local rt = s and s:FindFirstChild("runtime")
+    return rt and rt:FindFirstChild("cPetShopFolder")
+end
+local function getPetShopList()
+    local names = {}
+    pcall(function()
+        local f = getPetShopFolder()
+        if f then for _, item in ipairs(f:GetChildren()) do table.insert(names, item.Name) end end
+    end)
+    if #names == 0 then names = FALLBACK_PETS end
+    table.sort(names)
+    return names
+end
+local function buyPet(name)
+    local remote = getPetShopRemote()
+    local folder = getPetShopFolder()
+    if not (remote and folder) then return false, "未找到宠物商店" end
+    if not name or name == "" then return false, "请先选择宠物" end
+    local pet = folder:FindFirstChild(name)
+    if not pet then return false, "商店里没有: " .. name end
+    local ok, err = pcall(function()
+        if remote:IsA("RemoteFunction") then remote:InvokeServer(pet)
+        else remote:FireServer(pet) end
+    end)
+    if ok then return true, "已购买: " .. name end
+    return false, tostring(err)
+end
+
+-- ============================================================
+-- 自动轮盘
+-- ============================================================
+local function runWheel()
+    pcall(function()
+        local r = ReplicatedStorage:FindFirstChild("rEvents")
+        local remote = r and r:FindFirstChild("openFortuneWheelRemote")
+        local s = ReplicatedStorage:FindFirstChild("shared")
+        local catalogs = s and s:FindFirstChild("catalogs")
+        local wc = catalogs and catalogs:FindFirstChild("fortuneWheelChances")
+        local wheel = wc and wc:FindFirstChild("Fortune Wheel")
+        if remote and wheel then
+            if remote:IsA("RemoteFunction") then remote:InvokeServer("openFortuneWheel", wheel)
+            else remote:FireServer("openFortuneWheel", wheel) end
+        end
+    end)
+end
+
+-- ============================================================
+-- Boss 战
+-- ============================================================
+local BOSS_NAMES = { "Boss1", "Boss2", "Boss3", "Boss4", "Boss5" }
+local BOSS_IDLE_POS = V3n(1, 44, -1251)
+local PUNCH_ANIMS = { left = "rbxassetid://3638729053", right = "rbxassetid://3638767427" }
+local bossHoverConn = nil
+local bossPunchThread, bossScanThread, bossChestThread
+local bossCurrent = "Boss1"
+
+local function findBossModel(name)
+    local events = Workspace:FindFirstChild("Events")
+    local arena = events and events:FindFirstChild("BossArena")
+    local holder = arena and arena:FindFirstChild(name or bossCurrent)
+    return holder and holder:FindFirstChild("Boss")
+end
+local function isBossAlive(name)
+    local b = findBossModel(name); if not b then return false end
+    if b:IsA("Model") then
+        local h = b:FindFirstChildOfClass("Humanoid")
+        return h ~= nil and h.Health > 0
+    end
+    return b:IsA("BasePart") and b.Transparency < 1
+end
+local function getBossPos()
+    local b = findBossModel(); if not b then return nil end
+    if b:IsA("Model") then return b:GetPivot().Position end
+    return b.Position
+end
+local function destroyPortals()
+    pcall(function()
+        for _, obj in ipairs(game:GetDescendants()) do
+            if obj.Name == "RobloxForwardPortals" then obj:Destroy() end
+        end
+    end)
+end
+local function startBossHover()
+    bossHoverConn = RS_RS:Connect(function()
+        if not State.autoBoss then return end
+        local hrp = Cache.hrp; if not hrp then return end
+        local bp = getBossPos(); if not bp then return end
+        local hoverPos = bp + V3n(0, State.bossHeight, 0)
+        local flat = V3n(bp.X - hoverPos.X, 0, bp.Z - hoverPos.Z)
+        if flat.Magnitude < 0.1 then flat = V3n(0, 0, -1) end
+        hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+        hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
+        hrp.CFrame = CFrame.lookAt(hoverPos, hoverPos + (flat.Unit + V3n(0, -1, 0)).Unit)
+    end)
+end
+local function bossPunchLoop()
+    local useLeft, trackL, trackR = true, nil, nil
+    local counter = 0
+    while State.autoBoss do
+        if getBossPos() then
+            counter = counter + 1
+            if counter % 4 == 0 then
+                pcall(function()
+                    local bp = LocalPlayer:FindFirstChild("Backpack")
+                    local pt = bp and bp:FindFirstChild("Punch")
+                    local cd = pt and pt:FindFirstChildOfClass("NumberValue")
+                    if cd then cd.Value = 0.01 end
+                end)
+            end
+            pcall(function()
+                local char = Cache.char
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                if not hum then return end
+                local bp = LocalPlayer:FindFirstChild("Backpack")
+                local pt = (char and char:FindFirstChild("Punch")) or (bp and bp:FindFirstChild("Punch"))
+                if pt and pt.Parent ~= char then hum:EquipTool(pt) end
+                local ev = getMuscleEvent()
+                if ev then ev:FireServer("punch", useLeft and "leftHand" or "rightHand") end
+                local animator = hum:FindFirstChildOfClass("Animator") or Instance.new("Animator", hum)
+                local track = useLeft and trackL or trackR
+                if not track then
+                    local anim = Instance.new("Animation")
+                    anim.AnimationId = useLeft and PUNCH_ANIMS.left or PUNCH_ANIMS.right
+                    track = animator:LoadAnimation(anim)
+                    if useLeft then trackL = track else trackR = track end
+                end
+                if track then track:Stop(0); track:Play(0.1) end
+                useLeft = not useLeft
             end)
         else
-            State.dualCurrentMode = "train"
+            task.wait(0.5)
+        end
+        task.wait(0.05)
+    end
+end
+local function bossScanLoop()
+    while State.autoBoss do
+        task.wait(2)
+        if State.autoBoss then
+            local found = false
+            for _, n in ipairs(BOSS_NAMES) do
+                if isBossAlive(n) then
+                    found = true
+                    if n ~= bossCurrent then bossCurrent = n end
+                    break
+                end
+            end
+            if not found then
+                local hrp = Cache.hrp
+                if hrp then hrp.CFrame = CN(BOSS_IDLE_POS) end
+            end
+        end
+    end
+end
+local function bossChestLoop()
+    while State.autoBoss do
+        task.wait(0.4)
+        if State.autoBoss then
+            local hrp = Cache.hrp
+            local chest = Workspace:FindFirstChild("BossChest")
+            if hrp and chest then
+                for _, obj in ipairs(chest:GetDescendants()) do
+                    pcall(function()
+                        if obj:IsA("ProximityPrompt") and obj.Enabled then fireproximityprompt(obj)
+                        elseif obj:IsA("ClickDetector") then fireclickdetector(obj)
+                        elseif obj:IsA("BasePart") and obj.CanTouch and obj.Transparency < 1 then
+                            firetouchinterest(obj, hrp, 0); task.wait(0.05); firetouchinterest(obj, hrp, 1)
+                        end
+                    end)
+                end
+            end
         end
     end
 end
 
-local function applyRateToUI(rate)
-    if State.ui.rateBox then State.ui.rateBox.Text = tostring(rate) end
+-- ============================================================
+-- 换包重生 / 吃蛋 / 送蛋
+-- ============================================================
+local PETS_DATA = {
+    ["Omega Overlord"] = { repSpeed = 20 },
+    ["Swift Samurai"]  = { repSpeed = 15 },
+    ["Powercore Hound"]= { strength = 25, durability = 15 },
+    ["Titanium Hydra"] = { rebirth = 2 },
+    ["Tribal Overlord"]= { rebirth = 2 },
+    ["Inferno Unicorn"]= { strength = 25, durability = 25 },
+    ["Common Boss Pet"]= { repSpeed = 5 },
+    ["Rare Boss Pet"]  = { repSpeed = 7 },
+    ["Epic Boss Pet"]  = { repSpeed = 10 },
+    ["Rainbow Boss Pet"]= { repSpeed = 10, strength = 7 },
+    ["Legendary Boss Pet"] = { repSpeed = 10, strength = 10 },
+    ["Mythic Boss Pet"] = { repSpeed = 10, strength = 20 },
+    ["Inferno Drake"]  = { repSpeed = 40 },
+}
+local MAX_SLOTS = 12
+local TARGET_REP = 100
+local function unequipAllPets()
+    local r = ReplicatedStorage:FindFirstChild("rEvents")
+    local ev = r and r:FindFirstChild("equipPetEvent")
+    if not ev then return end
+    local pf = LocalPlayer:FindFirstChild("petsFolder"); if not pf then return end
+    for _, folder in ipairs(pf:GetChildren()) do
+        if folder:IsA("Folder") then
+            for _, pet in ipairs(folder:GetChildren()) do
+                pcall(function() ev:FireServer("unequipPet", pet) end)
+            end
+        end
+    end
+    task.wait(0.1)
+end
+local function equipOne(pet)
+    local r = ReplicatedStorage:FindFirstChild("rEvents")
+    local ev = r and r:FindFirstChild("equipPetEvent")
+    if ev then pcall(function() ev:FireServer("equipPet", pet) end) end
+end
+local function getOwnedPets()
+    local out = {}
+    local pf = LocalPlayer:FindFirstChild("petsFolder"); if not pf then return out end
+    for _, folder in ipairs(pf:GetChildren()) do
+        if folder:IsA("Folder") then
+            for _, pet in ipairs(folder:GetChildren()) do
+                local cfg = PETS_DATA[pet.Name]
+                if cfg then
+                    table.insert(out, { instance = pet, name = pet.Name,
+                        repSpeed = cfg.repSpeed or 0, strength = cfg.strength or 0,
+                        durability = cfg.durability or 0, rebirth = cfg.rebirth or 0 })
+                end
+            end
+        end
+    end
+    return out
+end
+local function equipFarmingPets()
+    unequipAllPets()
+    local pets = getOwnedPets()
+    table.sort(pets, function(a, b) return a.repSpeed > b.repSpeed end)
+    local equipped, count, rep = {}, 0, 0
+    for _, p in ipairs(pets) do
+        if count >= MAX_SLOTS or rep >= TARGET_REP then break end
+        if p.repSpeed > 0 then equipOne(p.instance); equipped[p.instance] = true; count = count + 1; rep = rep + p.repSpeed end
+    end
+    local rest = {}
+    for _, p in ipairs(pets) do if not equipped[p.instance] then table.insert(rest, p) end end
+    table.sort(rest, function(a, b) return (a.strength + a.durability) > (b.strength + b.durability) end)
+    for _, p in ipairs(rest) do
+        if count >= MAX_SLOTS then break end
+        if p.strength > 0 or p.durability > 0 then equipOne(p.instance); count = count + 1 end
+    end
+end
+local function equipRebirthPets()
+    unequipAllPets()
+    local pets = getOwnedPets()
+    table.sort(pets, function(a, b) return a.rebirth > b.rebirth end)
+    local count = 0
+    for _, p in ipairs(pets) do
+        if count >= MAX_SLOTS then break end
+        if p.rebirth > 0 then equipOne(p.instance); count = count + 1 end
+    end
+end
+local function performPackRebirth()
+    local ev = getMuscleEvent(); if not ev then return end
+    local ls = LocalPlayer:FindFirstChild("leaderstats")
+    local strStat = ls and ls:FindFirstChild("Strength")
+    local rebStat = ls and ls:FindFirstChild("Rebirths")
+    if not (strStat and rebStat) then return end
+    local target = 5000 + rebStat.Value * 2550
+    local lastStr = strStat.Value
+    local stall = 0
+    while strStat.Value < target and State.autoPackRebirth do
+        pcall(function()
+            local burst = math.clamp(math.floor(State.trainRate / 10), 5, 50)
+            for _ = 1, burst do ev:FireServer("rep") end
+        end)
+        task.wait(0.01)
+        local cur = strStat.Value
+        if cur > lastStr then stall = 0; State.trainRate = math.min(2400, State.trainRate + 40)
+        else stall = stall + 1; if stall >= 3 then State.trainRate = math.max(600, State.trainRate - 80); stall = 0 end end
+        lastStr = cur
+    end
+    equipRebirthPets()
+    task.wait(0.25)
+    local before = rebStat.Value
+    local tries = 0
+    repeat
+        fireRebirth()
+        task.wait(0.05)
+        tries = tries + 1
+    until rebStat.Value > before or tries > 20
+end
+local function packRebirthLoop()
+    while State.autoPackRebirth do
+        equipFarmingPets()
+        performPackRebirth()
+        task.wait(0.5)
+    end
+end
+local function adaptiveTrainLoop()
+    local ev = getMuscleEvent(); if not ev then return end
+    local ls = LocalPlayer:FindFirstChild("leaderstats")
+    local strStat = ls and ls:FindFirstChild("Strength")
+    local lastStr = strStat and strStat.Value or 0
+    local stall = 0
+    while State.fastTrain do
+        pcall(function()
+            local burst = math.clamp(math.floor(State.trainRate / 10), 5, 50)
+            for _ = 1, burst do ev:FireServer("rep") end
+        end)
+        if strStat then
+            local cur = strStat.Value
+            if cur > lastStr then stall = 0; State.trainRate = math.min(2400, State.trainRate + 40)
+            else stall = stall + 1; if stall >= 3 then State.trainRate = math.max(600, State.trainRate - 80); stall = 0 end end
+            lastStr = cur
+        end
+        task.wait(0.04)
+    end
+end
+local function findProteinEgg()
+    local c = Cache.char
+    local bp = LocalPlayer:FindFirstChild("Backpack")
+    return (c and c:FindFirstChild("Protein Egg")) or (bp and bp:FindFirstChild("Protein Egg"))
+end
+local function eatEggLoop()
+    local ev = getMuscleEvent()
+    while State.autoEatEgg do
+        pcall(function()
+            local egg = findProteinEgg()
+            if egg and ev then
+                for _ = 1, 10 do ev:FireServer("proteinEgg", egg) end
+            end
+        end)
+        task.wait(0.5)
+    end
+end
+local function giftEggsTo(target, amount)
+    local r = ReplicatedStorage:FindFirstChild("rEvents")
+    local giftRemote = r and r:FindFirstChild("giftRemote")
+    local folder = LocalPlayer:FindFirstChild("consumablesFolder")
+    if not (giftRemote and folder and target) then return 0 end
+    local sent = 0
+    for _ = 1, amount do
+        local egg = folder:FindFirstChild("Protein Egg")
+        if not egg then break end
+        local ok = pcall(function() giftRemote:InvokeServer("giftRequest", target, egg) end)
+        if ok then sent = sent + 1 end
+        task.wait(0.1)
+    end
+    return sent
+end
+
+-- ============================================================
+-- 自适应 / 降级
+-- ============================================================
+local function cleanupTrainingState()
+    State.trainAccum = 0; State.degradeLevel = 0
+    State.fpsWinTime = 0; State.fpsWinFrames = 0
+    State.adaptiveStableCount = 0; State.adaptiveStep = 100
 end
 local function runAdaptive()
     if not State.adaptiveEnabled or not State.fastTrain then return end
     if State.time - State.lastAdaptiveAt < 1 then return end
     State.lastAdaptiveAt = State.time
     local fps = State.avgFps
-    local threshold = State.adaptiveThreshold or 30
-    if fps < threshold then
-        local ratio = fps / threshold
-        local newRate
-        if ratio < 0.4 then newRate = math.max(1, math.floor(State.fastRate * 0.4))
-        elseif ratio < 0.7 then newRate = math.max(1, math.floor(State.fastRate * 0.7))
-        else newRate = math.max(1, math.floor(State.fastRate * 0.9)) end
-        if newRate ~= State.fastRate then
-            State.fastRate = newRate
-            State.adaptiveStep = 100
-            State.adaptiveStableCount = 0
-            applyRateToUI(newRate)
+    local th = State.adaptiveThreshold or 30
+    if fps < th then
+        local r = fps / th
+        local new = math.max(1, math.floor(State.fastRate * (r < 0.4 and 0.4 or r < 0.7 and 0.7 or 0.9)))
+        if new ~= State.fastRate then
+            State.fastRate = new; State.adaptiveStep = 100; State.adaptiveStableCount = 0
+            if State.ui.rateBox then State.ui.rateBox.Text = tostring(new) end
         end
     else
-        if fps > threshold * 1.15 then
+        if fps > th * 1.15 then
             State.adaptiveStableCount = State.adaptiveStableCount + 1
             if State.adaptiveStableCount >= 2 then
                 State.fastRate = math.min(50000, State.fastRate + State.adaptiveStep)
                 State.adaptiveStep = math.min(2000, State.adaptiveStep * 2)
                 State.adaptiveStableCount = 0
-                applyRateToUI(State.fastRate)
+                if State.ui.rateBox then State.ui.rateBox.Text = tostring(State.fastRate) end
             end
-        else
-            State.adaptiveStableCount = 0
-        end
+        else State.adaptiveStableCount = 0 end
     end
 end
 local function handleDegradation()
     if State.time - State.lastDegradeAt < 3 then return end
     State.lastDegradeAt = State.time
     if State.degradeLevel == 0 then
-        State.degradeLevel = 1; State.fastRate = 500; applyRateToUI(500)
-        notify("检测到严重卡顿，已降至 500 次/秒", 3)
+        State.degradeLevel = 1; State.fastRate = 500
+        if State.ui.rateBox then State.ui.rateBox.Text = "500" end
+        notify("卡顿已降至 500 次/秒", 3)
     elseif State.degradeLevel == 1 then
-        State.degradeLevel = 2; State.fastRate = 100; applyRateToUI(100)
-        notify("仍然卡顿，已降至 100 次/秒", 3)
+        State.degradeLevel = 2; State.fastRate = 100
+        if State.ui.rateBox then State.ui.rateBox.Text = "100" end
+        notify("仍卡顿，降至 100 次/秒", 3)
     elseif State.degradeLevel == 2 then
         State.degradeLevel = 3; State.fastTrain = false; State.autoTrain = false
         if State.ui.fastToggle then State.ui.fastToggle.set(false) end
         if State.ui.trainToggle then State.ui.trainToggle.set(false) end
         cleanupTrainingState()
-        notify("孩子，你的设备这么差就别玩游戏了", 6)
-    end
-end
-
-local function updateUIScale()
-    local cam = Workspace.CurrentCamera
-    if not cam then return end
-    local vp = cam.ViewportSize
-    if State.ui.mainScale then
-        local scale = (vp.Y * (State.uiHeightRatio or 0.4)) / 460
-        scale = math.clamp(scale, 0.5, 3)
-        if isMobile then scale = scale * 1.15 end
-        State.ui.mainScale.Scale = scale
-    end
-    if State.ui.infoScale then
-        local scale = (vp.Y * (State.infoHeightRatio or 0.28)) / 400
-        scale = math.clamp(scale, 0.5, 3)
-        if isMobile then scale = scale * 1.15 end
-        State.ui.infoScale.Scale = scale
-    end
-end
-
--- ============================================================
--- 信息悬浮窗
--- ============================================================
-local Info = {
-    viewingPlayer = nil, listOpen = false, lastRefresh = 0,
-    minimized = false, rows = {}, frames = {},
-}
-local function buildInfoWindow()
-    local screen = create("ScreenGui", {
-        Name = "MuscleKingInfoUI", ResetOnSpawn = false,
-        ZIndexBehavior = E_ZIdx, DisplayOrder = 99998,
-    }, PlayerGui)
-    State.ui.infoGui = screen
-    screen.Enabled = false
-
-    local uiScale = create("UIScale", { Scale = 1 }, screen)
-    State.ui.infoScale = uiScale
-
-    local frame = create("Frame", {
-        Name = "InfoFrame", AnchorPoint = V2n(0, 0),
-        Position = DEFAULT.infoPos, Size = UD2o(280, 400),
-        BackgroundColor3 = Theme.Background,
-        BorderSizePixel = 0, ClipsDescendants = true, Active = true,
-    }, screen)
-    Info.frames.frame = frame
-    corner(frame, 12)
-    stroke(frame, Theme.Border, 1)
-
-    local titleBar = create("Frame", {
-        Size = UD2n(1, 0, 0, 32), BackgroundColor3 = Theme.Surface,
-        BorderSizePixel = 0, Active = true,
-    }, frame)
-    corner(titleBar, 12)
-    create("TextLabel", {
-        BackgroundTransparency = 1, Position = UD2o(12, 0),
-        Size = UD2n(1, -90, 1, 0),
-        Font = Font.GothamBold, Text = "实时信息",
-        TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
-    }, titleBar)
-    local minBtn = create("TextButton", {
-        Size = UD2o(24, 24), Position = UD2n(1, -54, 0, 4),
-        BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
-        Font = Font.GothamBold, Text = "—",
-        TextColor3 = Theme.TextDim, TextSize = 14,
-    }, titleBar)
-    corner(minBtn, 6)
-    local closeBtn = create("TextButton", {
-        Size = UD2o(24, 24), Position = UD2n(1, -28, 0, 4),
-        BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
-        Font = Font.GothamBold, Text = "×",
-        TextColor3 = Theme.TextDim, TextSize = 16,
-    }, titleBar)
-    corner(closeBtn, 6)
-
-    local playerBtn = create("TextButton", {
-        Position = UD2o(10, 40), Size = UD2n(1, -20, 0, 30),
-        BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
-        Font = Font.GothamMedium, Text = "查看：自己 ▼",
-        TextColor3 = Theme.Text, TextSize = 13,
-    }, frame)
-    corner(playerBtn, 8)
-    stroke(playerBtn, Theme.Border, 1)
-    Info.frames.playerBtn = playerBtn
-
-    local listFrame = create("ScrollingFrame", {
-        Position = UD2o(10, 72), Size = UD2n(1, -20, 0, 150),
-        BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
-        ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.Accent,
-        CanvasSize = UD2n(0, 0, 0, 0), AutomaticCanvasSize = E_AS_Y,
-        ScrollingDirection = E_ScrollY, Visible = false, ZIndex = 5,
-    }, frame)
-    corner(listFrame, 8)
-    stroke(listFrame, Theme.Border, 1)
-    create("UIListLayout", { Padding = UDim.new(0, 2), SortOrder = E_SortL }, listFrame)
-    create("UIPadding", {
-        PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4),
-        PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4),
-    }, listFrame)
-    Info.frames.listFrame = listFrame
-
-    local dataFrame = create("Frame", {
-        Position = UD2o(0, 108), Size = UD2n(1, 0, 1, -108),
-        BackgroundTransparency = 1,
-    }, frame)
-    create("UIPadding", {
-        PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6),
-        PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
-    }, dataFrame)
-    create("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = E_SortL }, dataFrame)
-    Info.frames.dataFrame = dataFrame
-
-    local function createRow(label, order)
-        local row = create("Frame", {
-            Size = UD2n(1, 0, 0, 22), BackgroundTransparency = 1,
-            LayoutOrder = order,
-        }, dataFrame)
-        create("TextLabel", {
-            BackgroundTransparency = 1, Size = UD2n(0.55, 0, 1, 0),
-            Font = Font.GothamMedium, Text = label,
-            TextColor3 = Theme.TextDim, TextSize = 12, TextXAlignment = E_TxtXL,
-        }, row)
-        local val = create("TextLabel", {
-            BackgroundTransparency = 1, Position = UD2n(0.55, 0, 0, 0),
-            Size = UD2n(0.45, 0, 1, 0),
-            Font = Font.GothamBold, Text = "-",
-            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXR,
-        }, row)
-        return val
-    end
-    Info.rows.strength   = createRow("力量", 1)
-    Info.rows.strengthDelta = createRow("力量增量", 2)
-    Info.rows.gems       = createRow("宝石", 3)
-    Info.rows.durability = createRow("耐力", 4)
-    Info.rows.agility    = createRow("敏捷", 5)
-    Info.rows.rebirths   = createRow("重生", 6)
-    Info.rows.petRep     = createRow("宠物反复%", 7)
-    Info.rows.ultRep     = createRow("终极反复%", 8)
-    Info.rows.passRep    = createRow("通行证", 9)
-    Info.rows.speedMul   = createRow("综合速度", 10)
-    Info.rows.perHour    = createRow("每小时预计", 11)
-    Info.rows.perDay     = createRow("每天预计", 12)
-    Info.rows.pingRow    = createRow("网络延迟", 13)
-    Info.rows.friendRow  = createRow("好友白名单", 14)
-
-    local dragging, dragStart, startPos = false, nil, nil
-    track(titleBar.InputBegan:Connect(function(input)
-        if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
-        local ap = closeBtn.AbsolutePosition; local as = closeBtn.AbsoluteSize
-        if input.Position.X >= ap.X and input.Position.X <= ap.X + as.X
-        and input.Position.Y >= ap.Y and input.Position.Y <= ap.Y + as.Y then return end
-        local mp = minBtn.AbsolutePosition; local ms = minBtn.AbsoluteSize
-        if input.Position.X >= mp.X and input.Position.X <= mp.X + ms.X
-        and input.Position.Y >= mp.Y and input.Position.Y <= mp.Y + ms.Y then return end
-        dragging = true; dragStart = input.Position; startPos = frame.Position
-    end))
-    track(UIS_IC:Connect(function(input)
-        if not dragging then return end
-        if input.UserInputType ~= E_UI_MMove and input.UserInputType ~= E_UI_Touch then return end
-        local d = input.Position - dragStart
-        frame.Position = UD2n(startPos.X.Scale, startPos.X.Offset + d.X,
-                               startPos.Y.Scale, startPos.Y.Offset + d.Y)
-    end))
-    track(UIS_IE:Connect(function(input)
-        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then
-            dragging = false
-        end
-    end))
-
-    track(minBtn.MouseButton1Click:Connect(function()
-        Info.minimized = not Info.minimized
-        if Info.minimized then
-            playerBtn.Visible = false
-            listFrame.Visible = false
-            dataFrame.Visible = false
-            frame.Size = UD2o(280, 32)
-            minBtn.Text = "+"
-        else
-            playerBtn.Visible = true
-            dataFrame.Visible = true
-            frame.Size = UD2o(280, 400)
-            minBtn.Text = "—"
-        end
-    end))
-
-    track(closeBtn.MouseButton1Click:Connect(function()
-        State.infoWindowEnabled = false
-        screen.Enabled = false
-        Info.listOpen = false
-        listFrame.Visible = false
-        if State.ui.infoToggle then State.ui.infoToggle.set(false) end
-    end))
-
-    track(playerBtn.MouseButton1Click:Connect(function()
-        Info.listOpen = not Info.listOpen
-        listFrame.Visible = Info.listOpen
-        if Info.listOpen then
-            for _, c in ipairs(listFrame:GetChildren()) do
-                if c:IsA("TextButton") then c:Destroy() end
-            end
-            local ord = 0
-            local function addRow(plr)
-                ord = ord + 1
-                local nm = plr == LocalPlayer and (plr.Name .. " (自己)") or plr.Name
-                if State.friendWhitelist and plr ~= LocalPlayer and isFriend(plr) then
-                    nm = nm .. " [友]"
-                end
-                local btn = create("TextButton", {
-                    Size = UD2n(1, 0, 0, 24),
-                    BackgroundColor3 = Theme.SurfaceAlt,
-                    BorderSizePixel = 0, Font = Font.GothamMedium,
-                    Text = nm, TextColor3 = Theme.Text,
-                    TextSize = 12, LayoutOrder = ord,
-                }, listFrame)
-                corner(btn, 6)
-                track(btn.MouseButton1Click:Connect(function()
-                    Info.viewingPlayer = plr
-                    playerBtn.Text = "查看：" .. (plr == LocalPlayer and "自己" or plr.Name) .. " ▼"
-                    Info.listOpen = false
-                    listFrame.Visible = false
-                    Info.lastRefresh = 0
-                end))
-            end
-            addRow(LocalPlayer)
-            for _, plr in ipairs(GetPlayers(Players)) do
-                if plr ~= LocalPlayer then addRow(plr) end
-            end
-        end
-    end))
-
-    track(UIS_IB:Connect(function(input)
-        if not Info.listOpen then return end
-        if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
-        local lp = listFrame.AbsolutePosition; local ls = listFrame.AbsoluteSize
-        local pb = playerBtn.AbsolutePosition; local ps = playerBtn.AbsoluteSize
-        local ip = input.Position
-        local inList = ip.X >= lp.X and ip.X <= lp.X + ls.X and ip.Y >= lp.Y and ip.Y <= lp.Y + ls.Y
-        local inBtn = ip.X >= pb.X and ip.X <= pb.X + ps.X and ip.Y >= pb.Y and ip.Y <= pb.Y + ps.Y
-        if not inList and not inBtn then
-            Info.listOpen = false
-            listFrame.Visible = false
-        end
-    end))
-
-    Info.viewingPlayer = LocalPlayer
-end
-
-local function refreshInfoWindow()
-    if not Info.frames.frame or not State.ui.infoGui then return end
-    if not State.ui.infoGui.Enabled then return end
-    if Info.minimized then return end
-    local plr = Info.viewingPlayer
-    if not plr or not plr.Parent then
-        Info.viewingPlayer = LocalPlayer; plr = LocalPlayer
-        if Info.frames.playerBtn then Info.frames.playerBtn.Text = "查看：自己 ▼" end
-    end
-    local strength   = getStatValue(plr, "Strength")
-    local gems       = getStatValue(plr, "Gems")
-    local durability = getStatValue(plr, "Durability")
-    local agility    = getStatValue(plr, "Agility")
-    local rebirths   = getStatValue(plr, "Rebirths")
-    Info.rows.strength.Text   = formatNumber(strength)
-    Info.rows.gems.Text       = formatNumber(gems)
-    Info.rows.durability.Text = formatNumber(durability)
-    Info.rows.agility.Text    = formatNumber(agility)
-    Info.rows.rebirths.Text   = formatNumber(rebirths)
-    if plr == LocalPlayer then
-        if State.sessionStartStrength then
-            local delta = strength - State.sessionStartStrength
-            local sign = delta >= 0 and "+" or ""
-            Info.rows.strengthDelta.Text = sign .. formatNumber(delta)
-            Info.rows.strengthDelta.TextColor3 = delta >= 0 and Theme.Success or Theme.Danger
-        end
-        Info.rows.petRep.Text = string.format("%d%%", RepCache.pet)
-        Info.rows.petRep.TextColor3 = RepCache.pet >= 100 and Theme.Success or Theme.Text
-        Info.rows.ultRep.Text = string.format("%d%%", RepCache.ult)
-        Info.rows.ultRep.TextColor3 = RepCache.ult > 0 and Theme.Success or Theme.TextDim
-        Info.rows.passRep.Text = RepCache.x2 and "×2 已拥有" or "无"
-        Info.rows.passRep.TextColor3 = RepCache.x2 and Theme.Success or Theme.TextDim
-        Info.rows.speedMul.Text = string.format("%.2fx", RepCache.speedMul)
-        Info.rows.speedMul.TextColor3 = RepCache.speedMul >= 2 and Theme.Success or Theme.Text
-        Info.rows.perHour.Text = formatNumber(State.strengthPerSec * 3600)
-        Info.rows.perDay.Text  = formatNumber(State.strengthPerSec * 86400)
-        local pingVal = State.ping
-        Info.rows.pingRow.Text = pingVal > 0 and (math.floor(pingVal) .. " ms") or "-"
-        if pingVal > 0 then
-            if pingVal < 80 then Info.rows.pingRow.TextColor3 = Theme.Success
-            elseif pingVal < 200 then Info.rows.pingRow.TextColor3 = Theme.Warning
-            else Info.rows.pingRow.TextColor3 = Theme.Danger end
-        end
-        -- 好友白名单状态
-        if State.friendWhitelist then
-            if FriendWhitelist.loaded then
-                Info.rows.friendRow.Text = string.format("已加载 %d 人", FriendWhitelist.count)
-                Info.rows.friendRow.TextColor3 = Theme.Success
-            else
-                Info.rows.friendRow.Text = "加载中..."
-                Info.rows.friendRow.TextColor3 = Theme.Warning
-            end
-        else
-            Info.rows.friendRow.Text = "关闭"
-            Info.rows.friendRow.TextColor3 = Theme.TextDim
-        end
-    else
-        Info.rows.strengthDelta.Text = "-"
-        Info.rows.petRep.Text = "-"
-        Info.rows.ultRep.Text = "-"
-        Info.rows.passRep.Text = "-"
-        Info.rows.speedMul.Text = "-"
-        Info.rows.perHour.Text = "-"
-        Info.rows.perDay.Text = "-"
-        Info.rows.pingRow.Text = "-"
-        Info.rows.friendRow.Text = "-"
-    end
-end
-
--- ============================================================
--- 复位
--- ============================================================
-local ResetBtnState = { pressAt = 0, holding = false, lastStep = 0 }
-local function doResetAll()
-    State.uiHeightRatio = DEFAULT.uiHeightRatio
-    State.infoHeightRatio = DEFAULT.infoHeightRatio
-    if State.ui.main then State.ui.main.Position = DEFAULT.mainPos end
-    if Info.frames.frame then
-        Info.frames.frame.Position = DEFAULT.infoPos
-        Info.minimized = false
-        Info.frames.frame.Size = UD2o(280, 400)
-        if Info.frames.playerBtn then Info.frames.playerBtn.Visible = true end
-        if Info.frames.dataFrame then Info.frames.dataFrame.Visible = true end
-    end
-    updateUIScale()
-    pcall(saveConfig)
-    notify("已复位所有位置和大小", 3)
-end
-local function buildResetButton()
-    local screen = State.ui.screen
-    if not screen then return end
-    local btn = create("TextButton", {
-        Name = "ResetBtn", AnchorPoint = V2n(0, 1),
-        Position = UD2n(0, 20, 1, -20), Size = UD2o(56, 56),
-        BackgroundColor3 = Theme.Surface, BackgroundTransparency = 0.25,
-        BorderSizePixel = 0, Text = "复位",
-        Font = Font.GothamBold, TextColor3 = Theme.TextDim, TextSize = 12,
-        ZIndex = 150,
-    }, screen)
-    corner(btn, 28)
-    stroke(btn, Theme.Border, 1)
-    State.ui.resetBtn = btn
-    track(btn.InputBegan:Connect(function(input)
-        if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
-        ResetBtnState.pressAt = tick()
-        ResetBtnState.holding = true
-        ResetBtnState.lastStep = 0
-    end))
-    track(btn.InputEnded:Connect(function(input)
-        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then
-            ResetBtnState.holding = false
-            ResetBtnState.pressAt = 0
-            btn.BackgroundColor3 = Theme.Surface
-            btn.TextColor3 = Theme.TextDim
-            btn.Text = "复位"
-        end
-    end))
-end
-local function tickResetButton()
-    if not ResetBtnState.holding then return end
-    local btn = State.ui.resetBtn
-    if not btn then return end
-    local elapsed = tick() - ResetBtnState.pressAt
-    local step = math.floor(elapsed)
-    if step ~= ResetBtnState.lastStep and step <= 3 then
-        ResetBtnState.lastStep = step
-        btn.Text = tostring(3 - step) .. "s"
-        if step == 1 then
-            btn.BackgroundColor3 = Theme.Warning
-            btn.TextColor3 = C3(20, 20, 20)
-        elseif step == 2 then
-            btn.BackgroundColor3 = C3(255, 150, 60)
-            btn.TextColor3 = C3(20, 20, 20)
-        end
-    end
-    if elapsed >= 3 then
-        ResetBtnState.holding = false
-        ResetBtnState.pressAt = 0
-        btn.BackgroundColor3 = Theme.Success
-        btn.Text = "✓"
-        btn.TextColor3 = C3(20, 20, 20)
-        doResetAll()
-        task.delay(1, function()
-            if btn and btn.Parent then
-                btn.BackgroundColor3 = Theme.Surface
-                btn.TextColor3 = Theme.TextDim
-                btn.Text = "复位"
-            end
-        end)
+        notify("设备太弱，已关闭锻炼", 6)
     end
 end
 
@@ -1628,46 +1368,50 @@ end
 -- ============================================================
 local TaskPriority = {
     AFK = 200, KING_KILL = 160, KILL = 150, DUAL = 140, REBIRTH = 120,
-    TELEPORT = 100, CAMERA = 90, INFO = 85, TOOL = 80, TRAIN = 60,
-    RESET = 55, ANTILAG = 40, CULL = 35, HIDER = 30, TEX = 25,
-    FRIEND_REFRESH = 22, SWEEP = 20, SAVE = 10,
+    WHEEL = 110, TELEPORT = 100, BOSS = 95, CAMERA = 90, INFO = 85,
+    PETBUY = 82, TOOL = 80, TRAIN = 60, EGG = 58, RESET = 55,
+    ANTILAG = 40, CULL = 35, HIDER = 30, TEX = 25, FRIEND = 22,
+    SWEEP = 20, SAVE = 10,
 }
-
 local TaskChain = {}
-local function registerTask(task)
-    table.insert(TaskChain, task)
+local function register(t)
+    table.insert(TaskChain, t)
     table.sort(TaskChain, function(a, b) return a.priority > b.priority end)
 end
 
-registerTask({ id = "afk", priority = TaskPriority.AFK,
+register({ id = "afk", priority = TaskPriority.AFK,
     enabled = function() return true end,
     tick = function()
         if State.time - State.lastAFKClick >= 60 then
             State.lastAFKClick = State.time
-            performAFKClick()
+            local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or V2n(1920, 1080)
+            local x, y = vp.X - 8, vp.Y - 8
+            local ox, oy = 0, 0
+            local ok, ml = pcall(UIS_GML, UserInputService)
+            if ok and ml then ox, oy = ml.X, ml.Y end
+            if type(mousemoveabs) == "function" then
+                pcall(function() mousemoveabs(x, y); mouse1click(); mousemoveabs(ox, oy) end)
+            end
+            pcall(function()
+                VirtualUser:Button2Down(V2n(0, 0), Workspace.CurrentCamera.CFrame)
+                task.wait(0.05)
+                VirtualUser:Button2Up(V2n(0, 0), Workspace.CurrentCamera.CFrame)
+            end)
         end
     end,
 })
-
-registerTask({ id = "kingKill", priority = TaskPriority.KING_KILL,
+register({ id = "kingKill", priority = TaskPriority.KING_KILL,
     enabled = function() return State.autoKingKill end,
-    onDisable = function()
-        State.kingKillTarget = nil
-        State.kingKillActive = false
-    end,
+    onDisable = function() State.kingKillTarget = nil; State.kingKillActive = false end,
     tick = runKingKillTick,
 })
-
-registerTask({ id = "kill", priority = TaskPriority.KILL,
+register({ id = "kill", priority = TaskPriority.KILL,
     enabled = function() return State.killEnabled and not State.kingKillActive end,
     onEnable = function()
         State.killSavedState = { autoTeleport = State.autoTeleport }
         State.autoTeleport = false
         if State.ui.teleToggle then State.ui.teleToggle.set(false) end
-        State.killTarget = nil
-        State.killScanAt = 0
-        State.dualCurrentMode = "punch"
-        notify("已进入全图杀戮模式", 3)
+        State.killTarget = nil; State.killScanAt = 0; State.dualCurrentMode = "punch"
     end,
     onDisable = function()
         if State.killSavedState then
@@ -1675,24 +1419,19 @@ registerTask({ id = "kill", priority = TaskPriority.KILL,
             if State.ui.teleToggle then State.ui.teleToggle.set(State.autoTeleport) end
             State.killSavedState = nil
         end
-        State.killTarget = nil
-        State.toolOwnedByKill = false
-        State.dualCurrentMode = "punch"
+        State.killTarget = nil; State.toolOwnedByKill = false; State.dualCurrentMode = "punch"
     end,
     tick = runKillTick,
 })
-
-registerTask({ id = "dual", priority = TaskPriority.DUAL,
+register({ id = "dual", priority = TaskPriority.DUAL,
     enabled = function()
-        return State.dualEnabled and State.killEnabled
-            and State.killTarget ~= nil and (State.autoTrain or State.fastTrain)
-            and not State.kingKillActive
+        return State.dualEnabled and State.killEnabled and State.killTarget ~= nil
+            and (State.autoTrain or State.fastTrain) and not State.kingKillActive
     end,
     onDisable = function() State.dualCurrentMode = "punch" end,
-    tick = function() updateDualTool() end,
+    tick = updateDualTool,
 })
-
-registerTask({ id = "rebirth", priority = TaskPriority.REBIRTH,
+register({ id = "rebirth", priority = TaskPriority.REBIRTH,
     enabled = function() return State.autoRebirth end,
     tick = function()
         local interval = 1 / math.max(1, State.rebirthRate)
@@ -1702,49 +1441,70 @@ registerTask({ id = "rebirth", priority = TaskPriority.REBIRTH,
         end
     end,
 })
-
-registerTask({ id = "teleport", priority = TaskPriority.TELEPORT,
-    enabled = function()
-        return State.autoTeleport and not State.killEnabled and not State.kingKillActive
-    end,
+register({ id = "wheel", priority = TaskPriority.WHEEL,
+    enabled = function() return State.autoWheel end,
+    onEnable = function() task.spawn(function() while State.autoWheel do runWheel(); task.wait(1) end end) end,
+    tick = function() end,
+})
+register({ id = "teleport", priority = TaskPriority.TELEPORT,
+    enabled = function() return State.autoTeleport and not State.killEnabled and not State.kingKillActive end,
     tick = function()
         if State.time - State.lastTeleportAt >= 0.05 then
             State.lastTeleportAt = State.time
-            doTeleport()
+            teleportMuscleKing()
         end
     end,
 })
-
-registerTask({ id = "camera", priority = TaskPriority.CAMERA,
+register({ id = "boss", priority = TaskPriority.BOSS,
+    enabled = function() return State.autoBoss end,
+    onEnable = function()
+        if not bossPunchThread or coroutine.status(bossPunchThread) == "dead" then
+            destroyPortals(); startBossHover()
+            bossPunchThread = task.spawn(bossPunchLoop)
+            bossScanThread = task.spawn(bossScanLoop)
+            bossChestThread = task.spawn(bossChestLoop)
+        end
+    end,
+    onDisable = function()
+        if bossHoverConn then pcall(function() bossHoverConn:Disconnect() end); bossHoverConn = nil end
+        if bossPunchThread then pcall(function() task.cancel(bossPunchThread) end); bossPunchThread = nil end
+        if bossScanThread then pcall(function() task.cancel(bossScanThread) end); bossScanThread = nil end
+        if bossChestThread then pcall(function() task.cancel(bossChestThread) end); bossChestThread = nil end
+    end,
+    tick = function() end,
+})
+register({ id = "camera", priority = TaskPriority.CAMERA,
     enabled = function() return State.killEnabled or State.autoTeleport or State.kingKillActive end,
     tick = function()
         if State.time - State.lastCameraFix >= 0.5 then
             State.lastCameraFix = State.time
-            fixCamera()
+            local cam = Workspace.CurrentCamera
+            local hum = Cache.hum
+            if cam and hum and hum.Parent then
+                pcall(function()
+                    if cam.CameraSubject ~= hum then cam.CameraSubject = hum end
+                    if cam.CameraType ~= E_CamCustom then cam.CameraType = E_CamCustom end
+                end)
+            end
         end
     end,
 })
-
-registerTask({ id = "info", priority = TaskPriority.INFO,
+register({ id = "info", priority = TaskPriority.INFO,
     enabled = function() return State.infoWindowEnabled end,
     tick = function()
         if State.time - State.strengthCheckAt >= 1 then
             State.strengthCheckAt = State.time
-            local s = getMyStrength()
+            local s = myStrength()
             if State.sessionStartStrength == nil then
-                State.sessionStartStrength = s
-                State.lastStrengthSnapshot = s
+                State.sessionStartStrength = s; State.lastStrengthSnapshot = s
             else
                 local d = s - State.lastStrengthSnapshot
-                if d >= 0 then
-                    State.strengthPerSec = State.strengthPerSec * 0.7 + d * 0.3
-                end
+                if d >= 0 then State.strengthPerSec = State.strengthPerSec * 0.7 + d * 0.3 end
                 State.lastStrengthSnapshot = s
             end
         end
         if State.time - RepCache.lastRefresh >= 1 then
-            RepCache.lastRefresh = State.time
-            refreshRepSpeed()
+            RepCache.lastRefresh = State.time; refreshRepSpeed()
         end
         if State.time - State.lastPingCheck >= 1 then
             State.lastPingCheck = State.time
@@ -1752,166 +1512,148 @@ registerTask({ id = "info", priority = TaskPriority.INFO,
                 State.ping = math.floor(game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue())
             end)
         end
-        if State.time - Info.lastRefresh >= 0.2 then
-            Info.lastRefresh = State.time
+        if State.time - State.infoLastRefresh >= 0.2 then
+            State.infoLastRefresh = State.time
             refreshInfoWindow()
         end
     end,
 })
-
-registerTask({ id = "tool", priority = TaskPriority.TOOL,
+register({ id = "petbuy", priority = TaskPriority.PETBUY,
+    enabled = function() return State.autoPetBuy and State.selectedPet ~= "" end,
+    tick = function()
+        if State.time - (State._petBuyLast or 0) >= 0.5 then
+            State._petBuyLast = State.time
+            buyPet(State.selectedPet)
+        end
+    end,
+})
+register({ id = "tool", priority = TaskPriority.TOOL,
     enabled = function()
-        local isTraining = State.autoTrain or State.fastTrain
-        return isTraining and not State.toolCooldown and not State.toolOwnedByKill
-            and not State.kingKillActive
+        return (State.autoTrain or State.fastTrain) and not State.toolCooldown
+            and not State.toolOwnedByKill and not State.kingKillActive
     end,
     tick = function()
         if State.time - State.lastToolCheck < 0.1 then return end
         State.lastToolCheck = State.time
-        local selected = {}
-        if State.toolPushups then table.insert(selected, TOOL_KEYWORDS.pushups) end
-        if State.toolHandstands then table.insert(selected, TOOL_KEYWORDS.handstands) end
-        if State.toolSitups then table.insert(selected, TOOL_KEYWORDS.situps) end
-        local ok1 = false
-        for _, kw in ipairs(selected) do
-            if tryEquip(kw) then ok1 = true break end
+        -- 收集用户主动选中的工具
+        local sel = {}
+        if State.toolPushups then table.insert(sel, TOOL_KW.pushups) end
+        if State.toolHandstands then table.insert(sel, TOOL_KW.handstands) end
+        if State.toolSitups then table.insert(sel, TOOL_KW.situps) end
+        if State.toolDumbbell then table.insert(sel, TOOL_KW.dumbbell) end
+        if #sel == 0 then return end -- 一个都没选，什么都不做
+
+        -- 优先特殊工具，兜底哑铃
+        local equipped = false
+        for _, kw in ipairs(sel) do
+            if tryEquip(kw) then equipped = true; break end
         end
-        local ok2 = false
-        if not ok1 and State.toolDumbbell then ok2 = tryEquip(TOOL_KEYWORDS.dumbbell) end
-        if not ok1 and not ok2 then
-            local anyExists = false
-            for _, kw in ipairs(selected) do
-                if toolExists(kw) then anyExists = true break end
+
+        -- 所有选中的工具是否都不存在
+        if not equipped then
+            local anyExist = false
+            for _, kw in ipairs(sel) do
+                if toolExists(kw) then anyExist = true; break end
             end
-            if not anyExists and State.toolDumbbell and toolExists(TOOL_KEYWORDS.dumbbell) then
-                anyExists = true
-            end
-            if not anyExists then
-                local hasAny = State.toolDumbbell or #selected > 0
-                if hasAny then
-                    State.toolCooldown = true
-                    suicide()
-                    task.delay(15, function()
-                        if not State.destroyed then State.toolCooldown = false end
-                    end)
+            if not anyExist then
+                -- 所有选中工具都不存在，尝试自杀重生（有次数限制避免循环自杀）
+                if State.time - State._lastSuicide > 60 then
+                    State._lastSuicide = State.time
+                    State._suicideCount = (State._suicideCount or 0) + 1
+                    if State._suicideCount <= 3 then
+                        State.toolCooldown = true
+                        notify(string.format("未找到训练工具，第 %d 次自杀重生", State._suicideCount), 4)
+                        suicide()
+                        task.delay(15, function() if not State.destroyed then State.toolCooldown = false end end)
+                    else
+                        notify("连续找不到工具，已停止自动切换，请检查背包", 6)
+                    end
                 end
             end
         end
     end,
 })
-
-registerTask({ id = "train", priority = TaskPriority.TRAIN,
-    enabled = function()
-        return (State.autoTrain or State.fastTrain) and not State.kingKillActive
-    end,
+register({ id = "train", priority = TaskPriority.TRAIN,
+    enabled = function() return (State.autoTrain or State.fastTrain) and not State.kingKillActive and not State.autoPackRebirth end,
     tick = function(dt)
-        local rate = 0
-        if State.fastTrain then rate = State.fastRate
-        elseif State.autoTrain then rate = 10 end
+        local rate = State.fastTrain and State.fastRate or (State.autoTrain and 10 or 0)
         if rate <= 0 then return end
         State.trainAccum = State.trainAccum + rate * dt
         local count = math.floor(State.trainAccum)
-        if count > 0 then
-            State.trainAccum = State.trainAccum - count
-            if count > 3000 then count = 3000 end
-            local ev = getMuscleEvent()
-            if ev then
-                pcall(function()
-                    for _ = 1, count do
-                        ev:FireServer("rep")
-                    end
-                end)
-            end
+        if count <= 0 then return end
+        State.trainAccum = State.trainAccum - count
+        if count > 3000 then count = 3000 end
+        local ev = getMuscleEvent()
+        if ev then
+            pcall(function()
+                for _ = 1, count do ev:FireServer("rep") end
+            end)
         end
     end,
 })
-
-registerTask({ id = "reset", priority = TaskPriority.RESET,
-    enabled = function() return ResetBtnState.holding end,
-    tick = function() tickResetButton() end,
+register({ id = "packrebirth", priority = 56,
+    enabled = function() return State.autoPackRebirth end,
+    onEnable = function() task.spawn(packRebirthLoop) end,
+    tick = function() end,
 })
-
-registerTask({ id = "antilag", priority = TaskPriority.ANTILAG,
+register({ id = "fasttrain", priority = 57,
+    enabled = function() return State.fastTrain end,
+    onEnable = function() task.spawn(adaptiveTrainLoop) end,
+    tick = function() end,
+})
+register({ id = "egg", priority = TaskPriority.EGG,
+    enabled = function() return State.autoEatEgg end,
+    onEnable = function() task.spawn(eatEggLoop) end,
+    tick = function() end,
+})
+register({ id = "antilag", priority = TaskPriority.ANTILAG,
     enabled = function() return State.antiLagEnabled end,
     onEnable = function() pcall(enableAntiLag) end,
     onDisable = function() pcall(disableAntiLag) end,
-    tick = function()
-        if AntiLag.enabled and State.time >= AntiLag.rescanAt then rescanAntiLag() end
-    end,
+    tick = function() if AntiLag.enabled and State.time >= AntiLag.rescanAt then rescanAntiLag() end end,
 })
-
-registerTask({ id = "cull", priority = TaskPriority.CULL,
+register({ id = "cull", priority = TaskPriority.CULL,
     enabled = function() return State.renderCullEnabled end,
     onEnable = function() RenderCull.rescanAt = 0 end,
     onDisable = function() pcall(disableRenderCull) end,
-    tick = function()
-        if State.time >= RenderCull.rescanAt then scanRenderCull() end
-    end,
+    tick = function() if State.time >= RenderCull.rescanAt then scanRenderCull() end end,
 })
-
-registerTask({ id = "hider", priority = TaskPriority.HIDER,
-    enabled = function()
-        return State.hideOwnPets or State.hideAllPets or State.hideMachines
-    end,
+register({ id = "hider", priority = TaskPriority.HIDER,
+    enabled = function() return State.hideOwnPets or State.hideAllPets or State.hideMachines end,
     onEnable = function() PetHider.rescanAt = 0 end,
-    onDisable = function()
-        pcall(restoreHiddenPets)
-        pcall(restoreHiddenMachines)
-    end,
+    onDisable = function() pcall(restoreHiddenPets); pcall(restoreHiddenMachines) end,
     tick = function()
         if State.time >= PetHider.rescanAt then
-            pcall(restoreHiddenPets)
-            pcall(restoreHiddenMachines)
-            scanHidePets()
-            scanHideMachines()
+            pcall(restoreHiddenPets); pcall(restoreHiddenMachines)
+            scanHidePets(); scanHideMachines()
         end
     end,
 })
-
-registerTask({ id = "tex", priority = TaskPriority.TEX,
+register({ id = "tex", priority = TaskPriority.TEX,
     enabled = function() return State.textureRemoverEnabled end,
-    onEnable = function() pcall(enableTextureRemover) end,
-    onDisable = function() pcall(disableTextureRemover) end,
-    tick = function()
-        if TextureRemover.enabled and State.time >= TextureRemover.rescanAt then
-            rescanTextureRemover()
-        end
-    end,
+    onEnable = function() pcall(enableTex) end,
+    onDisable = function() pcall(disableTex) end,
+    tick = function() if TexRem.enabled and State.time >= TexRem.rescanAt then rescanTex() end end,
 })
-
-registerTask({ id = "friendrefresh", priority = TaskPriority.FRIEND_REFRESH,
+register({ id = "friend", priority = TaskPriority.FRIEND,
     enabled = function() return State.friendWhitelist end,
-    onEnable = function()
-        if not FriendWhitelist.loaded then refreshFriendList() end
-    end,
+    onEnable = function() if not FriendWhitelist.loaded then refreshFriendList() end end,
     tick = function()
         if FriendWhitelist.refreshing then return end
-        local now = tick()
-        if not FriendWhitelist.loaded then
-            refreshFriendList()
-        elseif now - FriendWhitelist.lastRefresh >= FriendWhitelist.refreshInterval then
-            refreshFriendList()
-        end
+        if not FriendWhitelist.loaded then refreshFriendList()
+        elseif tick() - FriendWhitelist.lastRefresh >= 300 then refreshFriendList() end
     end,
 })
-
-registerTask({ id = "sweep", priority = TaskPriority.SWEEP,
+register({ id = "sweep", priority = TaskPriority.SWEEP,
     enabled = function() return true end,
     tick = function()
-        if State.time - State.lastSweepAt >= 30 then
-            State.lastSweepAt = State.time
-            pcall(sweepOverflow)
-        end
+        if State.time - State.lastSweepAt >= 30 then State.lastSweepAt = State.time; pcall(sweepOverflow) end
     end,
 })
-
-registerTask({ id = "save", priority = TaskPriority.SAVE,
+register({ id = "save", priority = TaskPriority.SAVE,
     enabled = function() return true end,
     tick = function()
-        if State.time - State.lastSaveAt >= 2 then
-            State.lastSaveAt = State.time
-            task.spawn(saveConfig)
-        end
+        if State.time - State.lastSaveAt >= 2 then State.lastSaveAt = State.time; task.spawn(saveConfig) end
     end,
 })
 
@@ -1928,15 +1670,14 @@ local function updateGlobal(dt)
     State.fpsWinFrames = State.fpsWinFrames + 1
     if State.fpsWinTime >= 0.5 then
         State.avgFps = State.fpsWinFrames / State.fpsWinTime
-        State.fpsWinTime = 0
-        State.fpsWinFrames = 0
+        State.fpsWinTime = 0; State.fpsWinFrames = 0
         if State.fastTrain then
             if State.adaptiveEnabled then runAdaptive()
             elseif State.avgFps < 5 then handleDegradation() end
         end
     end
     if State.sessionStartStrength == nil then
-        State.sessionStartStrength = getMyStrength()
+        State.sessionStartStrength = myStrength()
         State.lastStrengthSnapshot = State.sessionStartStrength
     end
 end
@@ -1969,151 +1710,518 @@ local function onHeartbeat(dt)
     end
 end
 
-track(LocalPlayer.CharacterAdded:Connect(function()
-    Cache.char = nil; Cache.hum = nil; Cache.hrp = nil
-    State.killTarget = nil
-    State.kingKillTarget = nil
-    State.kingKillActive = false
-    State.toolCooldown = false
-    State.toolOwnedByKill = false
-    State.dualCurrentMode = "punch"
-    State.muscleEventRef = nil
-    State.rebirthEventRef = nil
-    PortalCache = nil
-    PortalCacheAt = 0
-    table.clear(RenderCull.hidden)
-    table.clear(PetHider.own)
-    table.clear(PetHider.all)
-    table.clear(PetHider.machines)
-end))
+local function destroy()
+    if State.destroyed then return end
+    pcall(saveConfig)
+    State.destroyed = true
+    for _, c in ipairs(State.conns) do pcall(function() c:Disconnect() end) end
+    table.clear(State.conns)
+    pcall(function() Workspace.Gravity = State.originalGravity end)
+    pcall(disableAntiLag); pcall(disableRenderCull)
+    pcall(restoreHiddenPets); pcall(restoreHiddenMachines)
+    pcall(disableTex); pcall(restoreHiddenUI)
+    if bossHoverConn then pcall(function() bossHoverConn:Disconnect() end) end
+    if State.ui.screen then pcall(function() State.ui.screen:Destroy() end); State.ui.screen = nil end
+    if State.ui.infoGui then pcall(function() State.ui.infoGui:Destroy() end); State.ui.infoGui = nil end
+    if _G[SCRIPT_ID] and _G[SCRIPT_ID].version == VERSION then _G[SCRIPT_ID] = nil end
+end
 
 -- ============================================================
--- 主 UI
+-- 复位
 -- ============================================================
-local function buildUI()
+local ResetBtnState = { pressAt = 0, holding = false, lastStep = 0 }
+local function doResetAll()
+    State.uiWidthPct = DEFAULT.uiWidthPct
+    State.uiHeightPct = DEFAULT.uiHeightPct
+    if State.ui.main then State.ui.main.Position = DEFAULT.mainPos end
+    if Info.frames.frame then
+        Info.frames.frame.Position = DEFAULT.infoPos
+        Info.minimized = false
+        Info.frames.frame.Size = UD2o(300, 420)
+        if Info.frames.playerBtn then Info.frames.playerBtn.Visible = true end
+        if Info.frames.dataFrame then Info.frames.dataFrame.Visible = true end
+    end
+    applyUISize()
+    pcall(saveConfig)
+    notify("已复位", 3)
+end
+local function buildResetButton()
+    local screen = State.ui.screen; if not screen then return end
+    local btn = create("TextButton", {
+        Name = "ResetBtn", AnchorPoint = V2n(0, 1),
+        Position = UD2n(0, 16, 1, -16), Size = UD2o(44, 44),
+        BackgroundColor3 = Theme.Surface, BackgroundTransparency = 0.15,
+        BorderSizePixel = 0, Text = "复位",
+        Font = Font.GothamBold, TextColor3 = Theme.TextDim, TextSize = 11,
+        ZIndex = 150,
+    }, screen)
+    corner(btn, 22); stroke(btn, Theme.Border, 1, 0.5)
+    State.ui.resetBtn = btn
+    track(btn.InputBegan:Connect(function(input)
+        if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
+        ResetBtnState.pressAt = tick(); ResetBtnState.holding = true; ResetBtnState.lastStep = 0
+    end))
+    track(btn.InputEnded:Connect(function(input)
+        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then
+            ResetBtnState.holding = false; ResetBtnState.pressAt = 0
+            btn.BackgroundColor3 = Theme.Surface; btn.TextColor3 = Theme.TextDim; btn.Text = "复位"
+        end
+    end))
+end
+local function tickResetButton()
+    if not ResetBtnState.holding then return end
+    local btn = State.ui.resetBtn; if not btn then return end
+    local elapsed = tick() - ResetBtnState.pressAt
+    local step = math.floor(elapsed)
+    if step ~= ResetBtnState.lastStep and step <= 3 then
+        ResetBtnState.lastStep = step
+        btn.Text = tostring(3 - step) .. "s"
+        if step == 1 then btn.BackgroundColor3 = Theme.Warning; btn.TextColor3 = C3(20, 20, 20)
+        elseif step == 2 then btn.BackgroundColor3 = C3(240, 130, 60); btn.TextColor3 = C3(20, 20, 20) end
+    end
+    if elapsed >= 3 then
+        ResetBtnState.holding = false; ResetBtnState.pressAt = 0
+        btn.BackgroundColor3 = Theme.Success; btn.Text = "OK"; btn.TextColor3 = C3(20, 20, 20)
+        doResetAll()
+        task.delay(1, function()
+            if btn and btn.Parent then
+                btn.BackgroundColor3 = Theme.Surface; btn.TextColor3 = Theme.TextDim; btn.Text = "复位"
+            end
+        end)
+    end
+end
+
+-- ============================================================
+-- 信息悬浮窗
+-- ============================================================
+local Info = { viewingPlayer = nil, listOpen = false, minimized = false, rows = {}, frames = {} }
+local function buildInfoWindow()
+    local screen = create("ScreenGui", {
+        Name = "MuscleKingInfoUI", ResetOnSpawn = false,
+        ZIndexBehavior = E_ZIdx, DisplayOrder = 99998,
+    }, PlayerGui)
+    State.ui.infoGui = screen
+    screen.Enabled = false
+
+    local us = create("UIScale", { Scale = 1 }, screen)
+    State.ui.infoScale = us
+
+    local frame = create("Frame", {
+        Name = "InfoFrame", AnchorPoint = V2n(0, 0),
+        Position = DEFAULT.infoPos, Size = UD2o(280, 420),
+        BackgroundColor3 = Theme.Bg, BorderSizePixel = 0,
+        ClipsDescendants = true, Active = true,
+    }, screen)
+    Info.frames.frame = frame
+    corner(frame, 12); stroke(frame, Theme.Border, 1)
+
+    local tb = create("Frame", {
+        Size = UD2n(1, 0, 0, 32), BackgroundColor3 = Theme.Surface,
+        BorderSizePixel = 0, Active = true,
+    }, frame)
+    corner(tb, 12)
+    create("TextLabel", {
+        BackgroundTransparency = 1, Position = UD2o(12, 0),
+        Size = UD2n(1, -80, 1, 0),
+        Font = Font.GothamBold, Text = "实时信息",
+        TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
+    }, tb)
+    local minBtn = create("TextButton", {
+        Size = UD2o(22, 22), Position = UD2n(1, -50, 0, 5),
+        BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
+        Font = Font.GothamBold, Text = "-", TextColor3 = Theme.TextDim, TextSize = 14,
+    }, tb); corner(minBtn, 6)
+    local closeBtn = create("TextButton", {
+        Size = UD2o(22, 22), Position = UD2n(1, -26, 0, 5),
+        BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
+        Font = Font.GothamBold, Text = "x", TextColor3 = Theme.TextDim, TextSize = 14,
+    }, tb); corner(closeBtn, 6)
+
+    local playerBtn = create("TextButton", {
+        Position = UD2o(10, 40), Size = UD2n(1, -20, 0, 30),
+        BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
+        Font = Font.GothamMedium, Text = "查看：自己 v",
+        TextColor3 = Theme.Text, TextSize = 12,
+    }, frame)
+    corner(playerBtn, 8); stroke(playerBtn, Theme.Border, 1, 0.5)
+    Info.frames.playerBtn = playerBtn
+
+    local listFrame = create("ScrollingFrame", {
+        Position = UD2o(10, 74), Size = UD2n(1, -20, 0, 150),
+        BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
+        ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.Accent,
+        CanvasSize = UD2n(0, 0, 0, 0), AutomaticCanvasSize = E_AS_Y,
+        ScrollingDirection = E_ScrollY, Visible = false, ZIndex = 5,
+    }, frame)
+    corner(listFrame, 8); stroke(listFrame, Theme.Border, 1)
+    listLayout(listFrame, 2); padding(listFrame, 4, 4, 4, 4)
+    Info.frames.listFrame = listFrame
+
+    local dataFrame = create("Frame", {
+        Position = UD2o(0, 112), Size = UD2n(1, 0, 1, -112),
+        BackgroundTransparency = 1,
+    }, frame)
+    padding(dataFrame, 6, 6, 10, 10)
+    listLayout(dataFrame, 4)
+    Info.frames.dataFrame = dataFrame
+
+    local function createRow(label, order)
+        local row = create("Frame", {
+            Size = UD2n(1, 0, 0, 22), BackgroundTransparency = 1, LayoutOrder = order,
+        }, dataFrame)
+        create("TextLabel", {
+            BackgroundTransparency = 1, Size = UD2n(0.55, 0, 1, 0),
+            Font = Font.GothamMedium, Text = label,
+            TextColor3 = Theme.TextDim, TextSize = 12, TextXAlignment = E_TxtXL,
+        }, row)
+        local val = create("TextLabel", {
+            BackgroundTransparency = 1, Position = UD2n(0.55, 0, 0, 0),
+            Size = UD2n(0.45, 0, 1, 0),
+            Font = Font.GothamBold, Text = "-",
+            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXR,
+        }, row)
+        return val
+    end
+    Info.rows.strength   = createRow("力量", 1)
+    Info.rows.strengthDelta = createRow("力量增量", 2)
+    Info.rows.gems       = createRow("宝石", 3)
+    Info.rows.durability = createRow("耐力", 4)
+    Info.rows.agility    = createRow("敏捷", 5)
+    Info.rows.rebirths   = createRow("重生", 6)
+    Info.rows.petRep     = createRow("宠物反复%", 7)
+    Info.rows.ultRep     = createRow("终极反复%", 8)
+    Info.rows.passRep    = createRow("通行证", 9)
+    Info.rows.speedMul   = createRow("综合速度", 10)
+    Info.rows.perHour    = createRow("每小时预计", 11)
+    Info.rows.perDay     = createRow("每天预计", 12)
+    Info.rows.pingRow    = createRow("网络延迟", 13)
+    Info.rows.friendRow  = createRow("好友白名单", 14)
+
+    local dragging, dragStart, startPos = false, nil, nil
+    track(tb.InputBegan:Connect(function(input)
+        if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
+        local ap = closeBtn.AbsolutePosition; local as = closeBtn.AbsoluteSize
+        if input.Position.X >= ap.X and input.Position.X <= ap.X + as.X
+        and input.Position.Y >= ap.Y and input.Position.Y <= ap.Y + as.Y then return end
+        local mp = minBtn.AbsolutePosition; local ms = minBtn.AbsoluteSize
+        if input.Position.X >= mp.X and input.Position.X <= mp.X + ms.X
+        and input.Position.Y >= mp.Y and input.Position.Y <= mp.Y + ms.Y then return end
+        dragging = true; dragStart = input.Position; startPos = frame.Position
+    end))
+    track(UIS_IC:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType ~= E_UI_MMove and input.UserInputType ~= E_UI_Touch then return end
+        local d = input.Position - dragStart
+        frame.Position = UD2n(startPos.X.Scale, startPos.X.Offset + d.X,
+                               startPos.Y.Scale, startPos.Y.Offset + d.Y)
+    end))
+    track(UIS_IE:Connect(function(input)
+        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then dragging = false end
+    end))
+
+    track(minBtn.MouseButton1Click:Connect(function()
+        Info.minimized = not Info.minimized
+        if Info.minimized then
+            playerBtn.Visible = false; listFrame.Visible = false; dataFrame.Visible = false
+            frame.Size = UD2o(280, 32); minBtn.Text = "+"
+        else
+            playerBtn.Visible = true; dataFrame.Visible = true
+            frame.Size = UD2o(280, 420); minBtn.Text = "-"
+        end
+    end))
+    track(closeBtn.MouseButton1Click:Connect(function()
+        State.infoWindowEnabled = false; screen.Enabled = false
+        Info.listOpen = false; listFrame.Visible = false
+        if State.ui.infoToggle then State.ui.infoToggle.set(false) end
+    end))
+    track(playerBtn.MouseButton1Click:Connect(function()
+        Info.listOpen = not Info.listOpen
+        listFrame.Visible = Info.listOpen
+        if Info.listOpen then
+            for _, c in ipairs(listFrame:GetChildren()) do if c:IsA("TextButton") then c:Destroy() end end
+            local ord = 0
+            local function addRow(plr)
+                ord = ord + 1
+                local nm = plr == LocalPlayer and (plr.Name .. " (自己)") or plr.Name
+                if State.friendWhitelist and plr ~= LocalPlayer and isFriend(plr) then nm = nm .. " [友]" end
+                local b = create("TextButton", {
+                    Size = UD2n(1, 0, 0, 24), BackgroundColor3 = Theme.SurfaceAlt,
+                    BorderSizePixel = 0, Font = Font.GothamMedium,
+                    Text = nm, TextColor3 = Theme.Text, TextSize = 12, LayoutOrder = ord,
+                }, listFrame)
+                corner(b, 6)
+                track(b.MouseButton1Click:Connect(function()
+                    Info.viewingPlayer = plr
+                    playerBtn.Text = "查看：" .. (plr == LocalPlayer and "自己" or plr.Name) .. " v"
+                    Info.listOpen = false; listFrame.Visible = false
+                end))
+            end
+            addRow(LocalPlayer)
+            for _, plr in ipairs(GetPlayers(Players)) do
+                if plr ~= LocalPlayer then addRow(plr) end
+            end
+        end
+    end))
+    track(UIS_IB:Connect(function(input)
+        if not Info.listOpen then return end
+        if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
+        local lp = listFrame.AbsolutePosition; local ls = listFrame.AbsoluteSize
+        local pb = playerBtn.AbsolutePosition; local ps = playerBtn.AbsoluteSize
+        local ip = input.Position
+        local inL = ip.X >= lp.X and ip.X <= lp.X + ls.X and ip.Y >= lp.Y and ip.Y <= lp.Y + ls.Y
+        local inB = ip.X >= pb.X and ip.X <= pb.X + ps.X and ip.Y >= pb.Y and ip.Y <= pb.Y + ps.Y
+        if not inL and not inB then Info.listOpen = false; listFrame.Visible = false end
+    end))
+    Info.viewingPlayer = LocalPlayer
+end
+
+function refreshInfoWindow()
+    if not Info.frames or not Info.frames.frame or not State.ui.infoGui then return end
+    if not State.ui.infoGui.Enabled or Info.minimized then return end
+    local plr = Info.viewingPlayer
+    if not plr or not plr.Parent then
+        Info.viewingPlayer = LocalPlayer; plr = LocalPlayer
+        if Info.frames.playerBtn then Info.frames.playerBtn.Text = "查看：自己 v" end
+    end
+    Info.rows.strength.Text = formatNumber(stat(plr, "Strength"))
+    Info.rows.gems.Text = formatNumber(stat(plr, "Gems"))
+    Info.rows.durability.Text = formatNumber(stat(plr, "Durability"))
+    Info.rows.agility.Text = formatNumber(stat(plr, "Agility"))
+    Info.rows.rebirths.Text = formatNumber(stat(plr, "Rebirths"))
+    if plr == LocalPlayer then
+        if State.sessionStartStrength then
+            local d = stat(plr, "Strength") - State.sessionStartStrength
+            Info.rows.strengthDelta.Text = (d >= 0 and "+" or "") .. formatNumber(d)
+            Info.rows.strengthDelta.TextColor3 = d >= 0 and Theme.Success or Theme.Danger
+        end
+        Info.rows.petRep.Text = string.format("%d%%", RepCache.pet)
+        Info.rows.petRep.TextColor3 = RepCache.pet >= 100 and Theme.Success or Theme.Text
+        Info.rows.ultRep.Text = string.format("%d%%", RepCache.ult)
+        Info.rows.ultRep.TextColor3 = RepCache.ult > 0 and Theme.Success or Theme.TextDim
+        Info.rows.passRep.Text = RepCache.x2 and "x2" or "无"
+        Info.rows.passRep.TextColor3 = RepCache.x2 and Theme.Success or Theme.TextDim
+        Info.rows.speedMul.Text = string.format("%.2fx", RepCache.speedMul)
+        Info.rows.speedMul.TextColor3 = RepCache.speedMul >= 2 and Theme.Success or Theme.Text
+        Info.rows.perHour.Text = formatNumber(State.strengthPerSec * 3600)
+        Info.rows.perDay.Text = formatNumber(State.strengthPerSec * 86400)
+        local p = State.ping
+        Info.rows.pingRow.Text = p > 0 and (math.floor(p) .. " ms") or "-"
+        if p > 0 then
+            Info.rows.pingRow.TextColor3 = p < 80 and Theme.Success or (p < 200 and Theme.Warning or Theme.Danger)
+        end
+        if State.friendWhitelist then
+            if FriendWhitelist.loaded then
+                Info.rows.friendRow.Text = string.format("已加载 %d 人", State.friendCount)
+                Info.rows.friendRow.TextColor3 = Theme.Success
+            else
+                Info.rows.friendRow.Text = "加载中"
+                Info.rows.friendRow.TextColor3 = Theme.Warning
+            end
+        else
+            Info.rows.friendRow.Text = "关闭"
+            Info.rows.friendRow.TextColor3 = Theme.TextDim
+        end
+    else
+        for _, k in ipairs({"strengthDelta","petRep","ultRep","passRep","speedMul","perHour","perDay","pingRow","friendRow"}) do
+            Info.rows[k].Text = "-"
+        end
+    end
+end
+
+-- ============================================================
+-- 窗口大小自适应
+-- ============================================================
+function applyUISize()
+    if not State.ui.main then return end
+    local cam = Workspace.CurrentCamera; if not cam then return end
+    local vp = cam.ViewportSize
+    local w = math.max(360, vp.X * State.uiWidthPct / 100)
+    local h = math.max(260, vp.Y * State.uiHeightPct / 100)
+    State.ui.main.Size = UD2o(w, h)
+    if State.ui.contentArea then
+        State.ui.contentArea.Size = UD2n(1, 0, 1, -(44 + 36))
+    end
+    if State.ui.infoScale then
+        local s = math.clamp(vp.Y / 900, 0.7, 1.6)
+        State.ui.infoScale.Scale = s
+    end
+end
+
+-- ============================================================
+-- 主 UI（顶栏 + 横向 Tab，紧凑专业风）
+-- ============================================================
+local buildUI -- 前向声明
+
+buildUI = function()
     local screen = create("ScreenGui", {
         Name = "MuscleKingAutoUI", ResetOnSpawn = false,
         ZIndexBehavior = E_ZIdx, DisplayOrder = 99999,
     }, PlayerGui)
     State.ui.screen = screen
 
-    local uiScale = create("UIScale", { Scale = 1 }, screen)
-    State.ui.mainScale = uiScale
-
-    local WIN_W, WIN_H = 350, 480
-    local TITLE_H, TAB_H = 40, 40
-
     local main = create("Frame", {
         Name = "Main", AnchorPoint = V2n(0, 0),
-        Position = DEFAULT.mainPos, Size = UD2o(WIN_W, WIN_H),
-        BackgroundColor3 = Theme.Background,
-        BorderSizePixel = 0, ClipsDescendants = true, Active = true,
+        Position = DEFAULT.mainPos,
+        Size = UD2o(520, 380),
+        BackgroundColor3 = Theme.Bg, BorderSizePixel = 0,
+        ClipsDescendants = true, Active = true,
     }, screen)
     State.ui.main = main
-    corner(main, 14)
-    stroke(main, Theme.Border, 1)
+    corner(main, 12); stroke(main, Theme.Border, 1)
 
+    -- 标题栏 44px
     local titleBar = create("Frame", {
-        Name = "TitleBar", Size = UD2n(1, 0, 0, TITLE_H),
+        Name = "TitleBar", Size = UD2n(1, 0, 0, 44),
         Position = UD2o(0, 0), BackgroundColor3 = Theme.Surface,
         BorderSizePixel = 0, Active = true,
     }, main)
-    corner(titleBar, 14)
+    corner(titleBar, 12)
+    create("Frame", {
+        Size = UD2n(1, 0, 0, 12), Position = UD2n(0, 0, 1, -12),
+        BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
+    }, titleBar)
+
     create("TextLabel", {
-        BackgroundTransparency = 1, Position = UD2o(14, 0),
+        BackgroundTransparency = 1, Position = UD2o(16, 0),
         Size = UD2n(1, -110, 1, 0),
         Font = Font.GothamBold, Text = "肌肉之王自动化",
         TextColor3 = Theme.Text, TextSize = 15, TextXAlignment = E_TxtXL,
     }, titleBar)
+    create("TextLabel", {
+        BackgroundTransparency = 1, Position = UD2n(1, -220, 0, 0),
+        Size = UD2n(0, 100, 1, 0),
+        Font = Font.GothamMedium, Text = string.format("v%d", math.floor(VERSION/100)),
+        TextColor3 = Theme.TextMuted, TextSize = 11, TextXAlignment = E_TxtXR,
+    }, titleBar)
+
     local minBtn = create("TextButton", {
-        Name = "Minimize", Size = UD2o(28, 26),
-        Position = UD2n(1, -68, 0, 7),
+        Size = UD2o(28, 26), Position = UD2n(1, -96, 0, 9),
         BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
-        Font = Font.GothamBold, Text = "—",
-        TextColor3 = Theme.TextDim, TextSize = 16,
-    }, titleBar)
-    corner(minBtn, 8)
+        Font = Font.GothamBold, Text = "-", TextColor3 = Theme.TextDim, TextSize = 16,
+    }, titleBar); corner(minBtn, 6)
+    local hideBtn = create("TextButton", {
+        Size = UD2o(28, 26), Position = UD2n(1, -64, 0, 9),
+        BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
+        Font = Font.GothamBold, Text = "_", TextColor3 = Theme.TextDim, TextSize = 14,
+    }, titleBar); corner(hideBtn, 6)
     local closeBtn = create("TextButton", {
-        Name = "Close", Size = UD2o(28, 26),
-        Position = UD2n(1, -36, 0, 7),
+        Size = UD2o(28, 26), Position = UD2n(1, -32, 0, 9),
         BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
-        Font = Font.GothamBold, Text = "×",
-        TextColor3 = Theme.TextDim, TextSize = 18,
-    }, titleBar)
-    corner(closeBtn, 8)
+        Font = Font.GothamBold, Text = "x", TextColor3 = Theme.TextDim, TextSize = 14,
+    }, titleBar); corner(closeBtn, 6)
 
+    -- Tab 栏 36px
     local tabBar = create("Frame", {
-        Name = "TabBar", Position = UD2o(0, TITLE_H),
-        Size = UD2n(1, 0, 0, TAB_H), BackgroundTransparency = 1,
+        Name = "TabBar", Size = UD2n(1, 0, 0, 36),
+        Position = UD2o(0, 44), BackgroundColor3 = Theme.SurfaceAlt,
+        BorderSizePixel = 0,
     }, main)
-    local TAB_W = 1/5
-    local function makeTab(id, text, order)
+    create("Frame", {
+        Size = UD2n(1, 0, 0, 1), Position = UD2n(0, 0, 1, -1),
+        BackgroundColor3 = Theme.Border, BorderSizePixel = 0,
+    }, tabBar)
+
+    -- 内容区
+    local contentArea = create("Frame", {
+        Name = "ContentArea", Size = UD2n(1, 0, 1, -80),
+        Position = UD2o(0, 80), BackgroundTransparency = 1,
+    }, main)
+    State.ui.contentArea = contentArea
+
+    local TABS = {
+        { id = "train", label = "锻炼" },
+        { id = "tele",  label = "传送" },
+        { id = "reb",   label = "重生" },
+        { id = "kill",  label = "杀戮" },
+        { id = "pet",   label = "宠物" },
+        { id = "boss",  label = "Boss" },
+        { id = "set",   label = "设置" },
+    }
+
+    local tabButtons = {}
+    local tabIndicator = create("Frame", {
+        Size = UD2n(1/#TABS, 0, 0, 2),
+        BackgroundColor3 = Theme.Accent, BorderSizePixel = 0, ZIndex = 3,
+        Position = UD2o(0, 34),
+    }, tabBar)
+    gradient(tabIndicator, Theme.Accent, Theme.Accent, 0)
+
+    for i, tab in ipairs(TABS) do
         local btn = create("TextButton", {
-            Name = "Tab_" .. id,
-            Size = UD2n(TAB_W, -5, 1, -10),
-            Position = UD2n((order - 1) * TAB_W, 2, 0, 5),
-            BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
-            Font = Font.GothamMedium, Text = text,
-            TextColor3 = Theme.TextDim, TextSize = 11,
+            Name = "Tab_" .. tab.id,
+            Size = UD2n(1/#TABS, 0, 1, 0),
+            Position = UD2n((i-1)/#TABS, 0, 0, 0),
+            BackgroundTransparency = 1, BorderSizePixel = 0,
+            Font = Font.GothamMedium, Text = tab.label,
+            TextColor3 = Theme.TextDim, TextSize = 12, ZIndex = 2,
+            AutoButtonColor = false,
         }, tabBar)
-        corner(btn, 8)
-        return btn
+        tabButtons[i] = btn
     end
-    local tabTrain = makeTab("train", "锻炼", 1)
-    local tabTele  = makeTab("tele",  "传送", 2)
-    local tabReb   = makeTab("reb",   "重生", 3)
-    local tabKill  = makeTab("kill",  "杀戮", 4)
-    local tabSet   = makeTab("set",   "设置", 5)
 
-    local content = create("Frame", {
-        Name = "Content", Position = UD2o(0, TITLE_H + TAB_H),
-        Size = UD2n(1, 0, 1, -(TITLE_H + TAB_H)),
-        BackgroundTransparency = 1,
-    }, main)
-
+    -- 内容页
     local function newPage(name)
         local page = create("ScrollingFrame", {
             Name = name, Size = UD2n(1, 0, 1, 0),
             BackgroundTransparency = 1, BorderSizePixel = 0,
-            ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.Accent,
+            ScrollBarThickness = 5, ScrollBarImageColor3 = Theme.Accent,
             CanvasSize = UD2n(0, 0, 0, 0), AutomaticCanvasSize = E_AS_Y,
-            ScrollingDirection = E_ScrollY, Visible = false, ClipsDescendants = true,
-        }, content)
-        create("UIPadding", {
-            PaddingTop = UDim.new(0, 8), PaddingBottom = UDim.new(0, 8),
-            PaddingLeft = UDim.new(0, 10), PaddingRight = UDim.new(0, 10),
-        }, page)
-        create("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = E_SortL }, page)
+            ScrollingDirection = E_ScrollY, Visible = false,
+            ClipsDescendants = true,
+        }, contentArea)
+        padding(page, 12, 12, 12, 12)
+        listLayout(page, 6)
         return page
     end
-    local function addDivider(parent, text)
+
+    -- 通用控件
+    local function sectionLabel(parent, text)
         return create("TextLabel", {
-            Size = UD2n(1, -6, 0, 22), BackgroundTransparency = 1,
+            Size = UD2n(1, 0, 0, 18), BackgroundTransparency = 1,
             Font = Font.GothamBold, Text = text,
-            TextColor3 = Theme.TextDim, TextSize = 11, TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.TextMuted, TextSize = 11,
+            TextXAlignment = E_TxtXL,
         }, parent)
     end
-    local function addRowToggle(parent, label, default, onChange)
+
+    local function divider(parent)
+        local d = create("Frame", {
+            Size = UD2n(1, 0, 0, 1), BackgroundColor3 = Theme.Border,
+            BorderSizePixel = 0,
+        }, parent)
+        return d
+    end
+
+    local function addToggle(parent, label, default, onChange, hint)
         local row = create("Frame", {
-            Size = UD2n(1, -6, 0, 42),
+            Size = UD2n(1, 0, 0, hint and 52 or 40),
             BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
         }, parent)
-        corner(row, 10); stroke(row, Theme.Border, 1)
+        corner(row, 8); stroke(row, Theme.Border, 1, 0.5)
         create("TextLabel", {
-            BackgroundTransparency = 1, Position = UD2o(12, 0),
-            Size = UD2n(1, -76, 1, 0),
+            BackgroundTransparency = 1, Position = UD2o(12, hint and 6 or 0),
+            Size = UD2n(1, -80, 0, hint and 22 or 40),
             Font = Font.GothamMedium, Text = label,
-            TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXL,
         }, row)
+        if hint then
+            create("TextLabel", {
+                BackgroundTransparency = 1, Position = UD2o(12, 26),
+                Size = UD2n(1, -80, 0, 20),
+                Font = Font.Gotham, Text = hint,
+                TextColor3 = Theme.TextMuted, TextSize = 10, TextXAlignment = E_TxtXL,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+            }, row)
+        end
         local tb = create("Frame", {
-            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -12, 0.5, 0),
-            Size = UD2o(42, 22), BackgroundColor3 = Theme.SurfaceAlt,
+            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -10, 0.5, 0),
+            Size = UD2o(40, 22), BackgroundColor3 = Theme.SurfaceAlt,
             BorderSizePixel = 0,
         }, row)
         corner(tb, 11)
         local knob = create("Frame", {
             AnchorPoint = V2n(0, 0.5), Position = UD2n(0, 3, 0.5, 0),
-            Size = UD2o(16, 16), BackgroundColor3 = Theme.TextDim,
+            Size = UD2o(16, 16), BackgroundColor3 = Theme.TextMuted,
             BorderSizePixel = 0, ZIndex = 2,
         }, tb)
         corner(knob, 8)
@@ -2125,7 +2233,7 @@ local function buildUI()
             else
                 tb.BackgroundColor3 = Theme.SurfaceAlt
                 knob.Position = UD2n(0, 3, 0.5, 0)
-                knob.BackgroundColor3 = Theme.TextDim
+                knob.BackgroundColor3 = Theme.TextMuted
             end
         end
         render(default)
@@ -2138,250 +2246,468 @@ local function buildUI()
             render(value)
             if onChange then onChange(value) end
         end))
-        return { set = function(v) value = v render(v) end, get = function() return value end }
+        return { set = function(v) value = v; render(v) end, get = function() return value end }
     end
-    local function addInput(parent, label, default, minVal, maxVal, onChange)
+
+    local function addInput(parent, label, default, minV, maxV, onChange, hint)
         local row = create("Frame", {
-            Size = UD2n(1, -6, 0, 42),
+            Size = UD2n(1, 0, 0, hint and 52 or 40),
             BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
         }, parent)
-        corner(row, 10); stroke(row, Theme.Border, 1)
+        corner(row, 8); stroke(row, Theme.Border, 1, 0.5)
         create("TextLabel", {
-            BackgroundTransparency = 1, Position = UD2o(12, 0),
-            Size = UD2n(1, -132, 1, 0),
+            BackgroundTransparency = 1, Position = UD2o(12, hint and 6 or 0),
+            Size = UD2n(1, -120, 0, hint and 22 or 40),
             Font = Font.GothamMedium, Text = label,
-            TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXL,
         }, row)
+        if hint then
+            create("TextLabel", {
+                BackgroundTransparency = 1, Position = UD2o(12, 26),
+                Size = UD2n(1, -120, 0, 20),
+                Font = Font.Gotham, Text = hint,
+                TextColor3 = Theme.TextMuted, TextSize = 10, TextXAlignment = E_TxtXL,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+            }, row)
+        end
         local box = create("TextBox", {
-            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -12, 0.5, 0),
-            Size = UD2o(105, 28), BackgroundColor3 = Theme.SurfaceAlt,
+            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -10, 0.5, 0),
+            Size = UD2o(90, 26), BackgroundColor3 = Theme.Bg,
             BorderSizePixel = 0, Font = Font.GothamMedium,
-            Text = tostring(default), TextColor3 = Theme.Text, TextSize = 13,
-            PlaceholderText = string.format("%d-%d", minVal, maxVal),
-            ClearTextOnFocus = false,
+            Text = tostring(default), TextColor3 = Theme.Text, TextSize = 12,
+            PlaceholderText = string.format("%d-%d", minV, maxV),
+            PlaceholderColor3 = Theme.TextMuted, ClearTextOnFocus = false,
         }, row)
-        corner(box, 8); stroke(box, Theme.Border, 1)
+        corner(box, 6); stroke(box, Theme.Border, 1)
         track(box.FocusLost:Connect(function()
             local n = tonumber(box.Text)
-            if not n then box.Text = tostring(default) return end
-            n = math.floor(n); n = math.clamp(n, minVal, maxVal)
+            if not n then box.Text = tostring(default); return end
+            n = math.floor(n); n = math.clamp(n, minV, maxV)
             box.Text = tostring(n)
             if onChange then onChange(n) end
         end))
         return box
     end
-    local function addActionButton(parent, label, onClick)
+
+    local function addButton(parent, label, onClick, color)
         local btn = create("TextButton", {
-            Size = UD2n(1, -6, 0, 38),
-            BackgroundColor3 = Theme.AccentDim, BorderSizePixel = 0,
-            Font = Font.GothamBold, Text = label,
-            TextColor3 = Theme.Text, TextSize = 14,
+            Size = UD2n(1, 0, 0, 34),
+            BackgroundColor3 = color or Theme.SurfaceAlt,
+            BorderSizePixel = 0, Font = Font.GothamBold,
+            Text = label, TextColor3 = Theme.Text, TextSize = 12,
+            AutoButtonColor = true,
         }, parent)
-        corner(btn, 10); stroke(btn, Theme.Accent, 1)
+        corner(btn, 8); stroke(btn, Theme.Border, 1, 0.5)
         track(btn.MouseButton1Click:Connect(onClick))
         return btn
     end
-    local function addHint(parent, text)
-        create("TextLabel", {
-            Size = UD2n(1, -6, 0, 32), BackgroundTransparency = 1,
-            Font = Font.Gotham, Text = text,
-            TextColor3 = Theme.TextDim, TextSize = 11,
-            TextWrapped = true, TextXAlignment = E_TxtXL, TextYAlignment = E_TxtYT,
+
+    local function addSlider(parent, label, minV, maxV, default, onChange)
+        local row = create("Frame", {
+            Size = UD2n(1, 0, 0, 44),
+            BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
         }, parent)
+        corner(row, 8); stroke(row, Theme.Border, 1, 0.5)
+        create("TextLabel", {
+            BackgroundTransparency = 1, Position = UD2o(12, 4),
+            Size = UD2n(1, -100, 0, 16),
+            Font = Font.GothamMedium, Text = label,
+            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXL,
+        }, row)
+        local vl = create("TextLabel", {
+            BackgroundTransparency = 1, AnchorPoint = V2n(1, 0),
+            Position = UD2n(1, -12, 0, 4),
+            Size = UD2o(80, 16),
+            Font = Font.GothamBold, Text = tostring(default),
+            TextColor3 = Theme.Accent, TextSize = 12, TextXAlignment = E_TxtXR,
+        }, row)
+        local trackBar = create("Frame", {
+            Position = UD2o(12, 26), Size = UD2n(1, -24, 0, 6),
+            BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
+        }, row)
+        corner(trackBar, 3)
+        local fill = create("Frame", {
+            Size = UD2n((default - minV) / math.max(1, maxV - minV), 0, 1, 0),
+            BackgroundColor3 = Theme.Accent, BorderSizePixel = 0,
+        }, trackBar)
+        corner(fill, 3)
+        local sb = create("TextButton", {
+            Size = UD2n(1, 0, 1, 16), Position = UD2o(0, -5),
+            BackgroundTransparency = 1, Text = "",
+        }, trackBar)
+        local active = false
+        local function upd(mx)
+            local ap = trackBar.AbsolutePosition
+            local as = trackBar.AbsoluteSize
+            local r = math.clamp((mx - ap.X) / math.max(1, as.X), 0, 1)
+            local v = math.floor(minV + (maxV - minV) * r + 0.5)
+            vl.Text = tostring(v)
+            fill.Size = UD2n((v - minV) / math.max(1, maxV - minV), 0, 1, 0)
+            if onChange then onChange(v) end
+        end
+        track(sb.InputBegan:Connect(function(i)
+            if i.UserInputType == E_UI_MB1 or i.UserInputType == E_UI_Touch then active = true; upd(i.Position.X) end
+        end))
+        track(sb.InputEnded:Connect(function(i)
+            if i.UserInputType == E_UI_MB1 or i.UserInputType == E_UI_Touch then active = false end
+        end))
+        track(UIS_IC:Connect(function(i)
+            if not active then return end
+            if i.UserInputType == E_UI_MMove or i.UserInputType == E_UI_Touch then upd(i.Position.X) end
+        end))
+        return { set = function(v) vl.Text = tostring(v); fill.Size = UD2n((v - minV) / math.max(1, maxV - minV), 0, 1, 0) end }
     end
 
-    -- 锻炼
-    local trainPage = newPage("TrainPage")
-    local trainToggle, fastToggle
-    trainToggle = addRowToggle(trainPage, "自动锻炼（固定 10 次/秒）", State.autoTrain, function(v)
-        State.autoTrain = v
-        if v and State.fastTrain then State.fastTrain = false fastToggle.set(false) end
-        if v then cleanupTrainingState() end
-    end)
-    fastToggle = addRowToggle(trainPage, "快速锻炼（自定义频率）", State.fastTrain, function(v)
-        State.fastTrain = v
-        if v and State.autoTrain then
-            State.autoTrain = false trainToggle.set(false)
-        end
-        if v then
-            cleanupTrainingState()
-            refreshRepSpeed()
-            if RepCache.pet < 100 then
-                notify(string.format("宠物反复不足：%d%% （综合 %.2fx）", RepCache.pet, RepCache.speedMul), 5)
+    local function addDropdown(parent, label, values, default, onChange)
+        local row = create("Frame", {
+            Size = UD2n(1, 0, 0, 40),
+            BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
+        }, parent)
+        corner(row, 8); stroke(row, Theme.Border, 1, 0.5)
+        create("TextLabel", {
+            BackgroundTransparency = 1, Position = UD2o(12, 0),
+            Size = UD2n(0.4, 0, 1, 0),
+            Font = Font.GothamMedium, Text = label,
+            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXL,
+        }, row)
+        local dropBtn = create("TextButton", {
+            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -10, 0.5, 0),
+            Size = UD2o(160, 28), BackgroundColor3 = Theme.Bg,
+            BorderSizePixel = 0, Font = Font.GothamMedium,
+            Text = tostring(default or "请选择"),
+            TextColor3 = Theme.Text, TextSize = 11,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        }, row)
+        corner(dropBtn, 6); stroke(dropBtn, Theme.Border, 1)
+
+        local modal = create("Frame", {
+            AnchorPoint = V2n(1, 0), Position = UD2n(1, -10, 1, 4),
+            Size = UD2o(160, 200), BackgroundColor3 = Theme.Surface,
+            BorderSizePixel = 0, Visible = false, ZIndex = 100,
+        }, row)
+        corner(modal, 8); stroke(modal, Theme.Accent, 1.5, 0.3)
+        local list = create("ScrollingFrame", {
+            Size = UD2n(1, 0, 1, 0), BackgroundTransparency = 1,
+            BorderSizePixel = 0, ScrollBarThickness = 4,
+            ScrollBarImageColor3 = Theme.Accent,
+            CanvasSize = UD2n(0, 0, 0, 0), AutomaticCanvasSize = E_AS_Y,
+            ScrollingDirection = E_ScrollY,
+        }, modal)
+        padding(list, 4, 4, 4, 4)
+        listLayout(list, 2)
+        local function draw()
+            for _, c in ipairs(list:GetChildren()) do
+                if c:IsA("TextButton") then c:Destroy() end
             end
-        else
-            cleanupTrainingState()
-            pcall(sweepOverflow)
+            for i, v in ipairs(values) do
+                local opt = create("TextButton", {
+                    Size = UD2n(1, 0, 0, 24), BackgroundColor3 = Theme.SurfaceAlt,
+                    BorderSizePixel = 0, Font = Font.GothamMedium,
+                    Text = tostring(v), TextColor3 = Theme.Text,
+                    TextSize = 11, LayoutOrder = i,
+                    TextXAlignment = E_TxtXL,
+                }, list)
+                corner(opt, 5); padding(opt, 0, 0, 8, 0)
+                track(opt.MouseButton1Click:Connect(function()
+                    dropBtn.Text = tostring(v)
+                    modal.Visible = false
+                    if onChange then onChange(v) end
+                end))
+            end
         end
-    end)
-    State.ui.rateBox = addInput(trainPage, "频率（次/秒）", State.fastRate, 1, 50000, function(n)
+        draw()
+        track(dropBtn.MouseButton1Click:Connect(function()
+            modal.Visible = not modal.Visible
+        end))
+        return {
+            refresh = function(newV, clear)
+                values = newV
+                if clear then dropBtn.Text = "请选择"; if onChange then onChange(nil) end end
+                draw()
+            end,
+        }
+    end
+
+    local function addActionRow(parent, actions)
+        local row = create("Frame", {
+            Size = UD2n(1, 0, 0, 34), BackgroundTransparency = 1,
+        }, parent)
+        listLayout(row, 6, true)
+        for _, a in ipairs(actions) do
+            local btn = create("TextButton", {
+                Size = UD2n(1/#actions, -4, 1, 0),
+                BackgroundColor3 = a.color or Theme.SurfaceAlt,
+                BorderSizePixel = 0, Font = Font.GothamBold,
+                Text = a.label, TextColor3 = Theme.Text, TextSize = 12,
+            }, row)
+            corner(btn, 8); stroke(btn, Theme.Border, 1, 0.5)
+            track(btn.MouseButton1Click:Connect(a.onClick))
+        end
+        return row
+    end
+
+    -- ============================================================
+    -- 各页
+    -- ============================================================
+    local pages = {}
+    for _, tab in ipairs(TABS) do pages[tab.id] = newPage("Page_" .. tab.id) end
+
+    -- 锻炼
+    local pTr = pages.train
+    sectionLabel(pTr, "基本锻炼")
+    local trainToggle, fastToggle
+    trainToggle = addToggle(pTr, "自动锻炼", State.autoTrain, function(v)
+        State.autoTrain = v
+        if v and State.fastTrain then State.fastTrain = false; fastToggle.set(false) end
+        if v then cleanupTrainingState() end
+    end, "固定 10 次/秒")
+    fastToggle = addToggle(pTr, "快速锻炼", State.fastTrain, function(v)
+        State.fastTrain = v
+        if v and State.autoTrain then State.autoTrain = false; trainToggle.set(false) end
+        if v then
+            cleanupTrainingState(); refreshRepSpeed()
+            if RepCache.pet < 100 then
+                notify(string.format("宠物反复不足 %d%%（综合 %.2fx）", RepCache.pet, RepCache.speedMul), 5)
+            end
+        else cleanupTrainingState() end
+    end, "自定义频率 + 自适应")
+    State.ui.rateBox = addInput(pTr, "频率（次/秒）", State.fastRate, 1, 50000, function(n)
         if State.adaptiveEnabled then
             if State.ui.rateBox then State.ui.rateBox.Text = tostring(State.fastRate) end
             return
         end
-        State.fastRate = n
-        State.degradeLevel = 0
+        State.fastRate = n; State.degradeLevel = 0
     end)
-    addDivider(trainPage, "── 防卡顿 ──")
-    addRowToggle(trainPage, "快速锻炼卡顿自调节", State.adaptiveEnabled, function(v)
+    divider(pTr)
+    sectionLabel(pTr, "卡顿自调节")
+    addToggle(pTr, "根据帧率自动调节频率", State.adaptiveEnabled, function(v)
         State.adaptiveEnabled = v
         if State.ui.rateBox then
             State.ui.rateBox.TextEditable = not v
             State.ui.rateBox.TextColor3 = v and Theme.TextDim or Theme.Text
         end
-        State.adaptiveStep = 100
-        State.adaptiveStableCount = 0
+        State.adaptiveStep = 100; State.adaptiveStableCount = 0
     end)
-    addInput(trainPage, "目标帧率阈值", State.adaptiveThreshold, 10, 120, function(n)
-        State.adaptiveThreshold = n
-    end)
-    addDivider(trainPage, "── 工具自动切换 ──")
-    local toolPushToggle, toolHandToggle, toolSitToggle
-    addRowToggle(trainPage, "自动切换哑铃（兜底）", State.toolDumbbell, function(v) State.toolDumbbell = v end)
-    toolPushToggle = addRowToggle(trainPage, "自动切换俯卧撑", State.toolPushups, function(v)
+    addSlider(pTr, "目标帧率阈值", 10, 120, State.adaptiveThreshold, function(v) State.adaptiveThreshold = v end)
+    divider(pTr)
+    sectionLabel(pTr, "工具自动切换")
+    local tP, tH, tS
+    addToggle(pTr, "自动切换哑铃", State.toolDumbbell, function(v) State.toolDumbbell = v end)
+    tP = addToggle(pTr, "自动切换俯卧撑", State.toolPushups, function(v)
         State.toolPushups = v
-        if v then
-            State.toolHandstands = false State.toolSitups = false
-            if toolHandToggle then toolHandToggle.set(false) end
-            if toolSitToggle then toolSitToggle.set(false) end
-        end
+        if v then State.toolHandstands = false; State.toolSitups = false
+            if tH then tH.set(false) end; if tS then tS.set(false) end end
     end)
-    toolHandToggle = addRowToggle(trainPage, "自动切换倒立", State.toolHandstands, function(v)
+    tH = addToggle(pTr, "自动切换倒立", State.toolHandstands, function(v)
         State.toolHandstands = v
-        if v then
-            State.toolPushups = false State.toolSitups = false
-            if toolPushToggle then toolPushToggle.set(false) end
-            if toolSitToggle then toolSitToggle.set(false) end
-        end
+        if v then State.toolPushups = false; State.toolSitups = false
+            if tP then tP.set(false) end; if tS then tS.set(false) end end
     end)
-    toolSitToggle = addRowToggle(trainPage, "自动切换仰卧起坐", State.toolSitups, function(v)
+    tS = addToggle(pTr, "自动切换仰卧起坐", State.toolSitups, function(v)
         State.toolSitups = v
-        if v then
-            State.toolPushups = false State.toolHandstands = false
-            if toolPushToggle then toolPushToggle.set(false) end
-            if toolHandToggle then toolHandToggle.set(false) end
-        end
+        if v then State.toolPushups = false; State.toolHandstands = false
+            if tP then tP.set(false) end; if tH then tH.set(false) end end
     end)
 
     -- 传送
-    local telePage = newPage("TelePage")
-    State.ui.teleToggle = addRowToggle(telePage, "自动前往肌肉之王", State.autoTeleport, function(v)
-        State.autoTeleport = v
+    local pTe = pages.tele
+    sectionLabel(pTe, "自动传送")
+    State.ui.teleToggle = addToggle(pTe, "循环前往肌肉之王", State.autoTeleport, function(v) State.autoTeleport = v end,
+        "每 0.05 秒传送一次，禁用重力")
+    addButton(pTe, "强制传送肌肉之王", function()
+        teleportMuscleKing(true); notify("已传送", 2)
     end)
-    addActionButton(telePage, "强制单次传送", function() doTeleport(true) end)
-    addHint(telePage, "使用传送门坐标。强制单次传送会刷新缓存。")
+    divider(pTe)
+    sectionLabel(pTe, "地图传送点")
+    local grid = create("Frame", {
+        Size = UD2n(1, 0, 0, 0), BackgroundTransparency = 1,
+        AutomaticSize = Enum.AutomaticSize.Y,
+    }, pTe)
+    create("UIGridLayout", {
+        CellSize = UDim2.new(0.5, -4, 0, 32),
+        CellPadding = UDim2.new(0, 8, 0, 6),
+        SortOrder = E_SortL,
+    }, grid)
+    for i, tp in ipairs(TELEPORTS) do
+        local btn = create("TextButton", {
+            LayoutOrder = i, BackgroundColor3 = Theme.SurfaceAlt,
+            BorderSizePixel = 0, Font = Font.GothamMedium,
+            Text = tp.name, TextColor3 = Theme.Text,
+            TextSize = 11, TextTruncate = Enum.TextTruncate.AtEnd,
+        }, grid)
+        corner(btn, 6); stroke(btn, Theme.Border, 1, 0.4)
+        padding(btn, 0, 0, 8, 8)
+        track(btn.MouseButton1Click:Connect(function()
+            if teleportTo(tp.pos) then notify("已传送：" .. tp.name, 2)
+            else notify("传送失败", 2) end
+        end))
+    end
 
     -- 重生
-    local rebPage = newPage("RebPage")
-    addRowToggle(rebPage, "自动重生", State.autoRebirth, function(v) State.autoRebirth = v end)
-    addInput(rebPage, "频率（次/秒）", State.rebirthRate, 1, 100, function(n) State.rebirthRate = n end)
+    local pRe = pages.reb
+    sectionLabel(pRe, "自动重生")
+    addToggle(pRe, "自动重生", State.autoRebirth, function(v) State.autoRebirth = v end)
+    addInput(pRe, "频率（次/秒）", State.rebirthRate, 1, 100, function(n) State.rebirthRate = n end)
+    divider(pRe)
+    sectionLabel(pRe, "换包重生")
+    addToggle(pRe, "换包重生（练速装→重生装）", State.autoPackRebirth, function(v) State.autoPackRebirth = v end,
+        "自动换宠并自动重生")
+    addSlider(pRe, "训练速率", 600, 2400, State.trainRate, function(v) State.trainRate = v end)
 
     -- 杀戮
-    local killPage = newPage("KillPage")
-    addRowToggle(killPage, "全图杀戮", State.killEnabled, function(v) State.killEnabled = v end)
-    addInput(killPage, "力量/耐久 阈值", State.killThreshold, 1, 100, function(n) State.killThreshold = n end)
-    addDivider(killPage, "── 好友白名单 ──")
-    addRowToggle(killPage, "好友白名单（不打好友）", State.friendWhitelist, function(v)
+    local pKi = pages.kill
+    sectionLabel(pKi, "全图杀戮")
+    addToggle(pKi, "开启全图杀戮", State.killEnabled, function(v) State.killEnabled = v end)
+    addInput(pKi, "力量/耐久 阈值", State.killThreshold, 1, 100, function(n) State.killThreshold = n end,
+        "自己力量 × 阈值 ≥ 目标耐久才击杀")
+    divider(pKi)
+    sectionLabel(pKi, "好友白名单")
+    addToggle(pKi, "不打好友（含好友王）", State.friendWhitelist, function(v)
         State.friendWhitelist = v
-        if v and not FriendWhitelist.loaded then
-            refreshFriendList()
-        end
+        if v and not FriendWhitelist.loaded then refreshFriendList() end
+    end, "跳过好友，不抢好友的王")
+    addButton(pKi, "刷新好友列表", function()
+        refreshFriendList(); notify("正在刷新好友列表", 2)
     end)
-    addActionButton(killPage, "手动刷新好友列表", function()
-        if FriendWhitelist.refreshing then
-            notify("好友列表刷新中...", 2)
-        else
-            refreshFriendList()
-            notify("正在刷新好友列表...", 2)
-        end
-    end)
-    addHint(killPage, "开启后：杀戮不会打好友，也不会抢好友的肌肉之王。好友列表自动每 5 分钟刷新一次。")
-
-    addDivider(killPage, "── 双工具 ──")
-    addRowToggle(killPage, "杀戮+锻炼 双工具切换", State.dualEnabled, function(v) State.dualEnabled = v end)
-
-    addDivider(killPage, "── 肌肉之王竞争 ──")
-    addRowToggle(killPage, "自动击杀其他肌肉之王", State.autoKingKill, function(v)
+    divider(pKi)
+    sectionLabel(pKi, "双工具 / 肌肉之王竞争")
+    addToggle(pKi, "杀戮时切换训练工具", State.dualEnabled, function(v) State.dualEnabled = v end, "边打边练")
+    addToggle(pKi, "自动击杀其他肌肉之王", State.autoKingKill, function(v)
         State.autoKingKill = v
-        if not v then
-            State.kingKillTarget = nil
-            State.kingKillActive = false
+        if not v then State.kingKillTarget = nil; State.kingKillActive = false end
+    end)
+    addInput(pKi, "对方耐久/我力量 上限", State.kingKillThreshold, 1, 1000, function(n) State.kingKillThreshold = n end,
+        "超过倍数视为打不过")
+
+    -- 宠物
+    local pPe = pages.pet
+    sectionLabel(pPe, "宠物商店")
+    local petList = getPetShopList()
+    local petDrop = addDropdown(pPe, "选择宠物", petList, State.selectedPet, function(v) State.selectedPet = v or "" end)
+    addActionRow(pPe, {
+        { label = "刷新", onClick = function()
+            local l = getPetShopList(); petDrop.refresh(l, false)
+            notify(string.format("已刷新，共 %d 项", #l), 2)
+        end },
+        { label = "购买一次", color = Theme.AccentDim, onClick = function()
+            local _, msg = buyPet(State.selectedPet); notify(msg, 3)
+        end },
+    })
+    addToggle(pPe, "自动购买", State.autoPetBuy, function(v) State.autoPetBuy = v end, "每 0.5 秒购买一次")
+    divider(pPe)
+    sectionLabel(pPe, "自动轮盘")
+    addToggle(pPe, "自动轮盘", State.autoWheel, function(v) State.autoWheel = v end, "每秒抽一次")
+    divider(pPe)
+    sectionLabel(pPe, "蛋白蛋")
+    addToggle(pPe, "自动吃蛋", State.autoEatEgg, function(v) State.autoEatEgg = v end, "每 0.5 秒吃 10 发蛋")
+    local names = {}
+    for _, p in ipairs(GetPlayers(Players)) do
+        if p ~= LocalPlayer then table.insert(names, p.Name) end
+    end
+    local eggDrop = addDropdown(pPe, "送蛋目标", names, State.selectedEggTarget, function(v) State.selectedEggTarget = v or "" end)
+    addInput(pPe, "送蛋数量（0=全部）", State.giftAmount, 0, 9999, function(n) State.giftAmount = n end)
+    addActionRow(pPe, {
+        { label = "赠送蛋白蛋", color = Theme.Success, onClick = function()
+            local target = Players:FindFirstChild(State.selectedEggTarget)
+            if not target then notify("请先选择玩家", 3); return end
+            local folder = LocalPlayer:FindFirstChild("consumablesFolder")
+            local have = folder and #folder:GetChildren() or 0
+            if have == 0 then notify("仓库里没有蛋", 3); return end
+            local amt = State.giftAmount > 0 and State.giftAmount or 9999
+            task.spawn(function()
+                local sent = giftEggsTo(target, amt)
+                notify(string.format("已送 %d 个蛋", sent), 3)
+            end)
+        end },
+        { label = "刷新玩家", onClick = function()
+            local l = {}
+            for _, p in ipairs(GetPlayers(Players)) do
+                if p ~= LocalPlayer then table.insert(l, p.Name) end
+            end
+            eggDrop.refresh(l, false); notify("已刷新玩家列表", 2)
+        end },
+    })
+
+    -- Boss
+    local pBo = pages.boss
+    sectionLabel(pBo, "自动打 Boss")
+    addToggle(pBo, "自动打 Boss", State.autoBoss, function(v)
+        State.autoBoss = v
+        if not v and bossHoverConn then
+            pcall(function() bossHoverConn:Disconnect() end); bossHoverConn = nil
         end
-    end)
-    addInput(killPage, "对方耐久 / 我力量 上限", State.kingKillThreshold, 1, 1000, function(n)
-        State.kingKillThreshold = n
-    end)
-    addHint(killPage, "别人是肌肉之王时，会尝试击杀他。如果对方耐久 ≥ 我力量 × 上限，跳过等待。")
+    end, "自动扫描 + 悬停连拳 + 自动开箱")
+    addSlider(pBo, "悬停高度", 0, 200, State.bossHeight, function(v) State.bossHeight = v end)
 
     -- 设置
-    local setPage = newPage("SetPage")
-    addDivider(setPage, "── 性能 ──")
-    addRowToggle(setPage, "深度防卡顿", State.antiLagEnabled, function(v) State.antiLagEnabled = v end)
-    addRowToggle(setPage, "渲染剔除（远处不显示）", State.renderCullEnabled, function(v) State.renderCullEnabled = v end)
-    addInput(setPage, "剔除距离（studs）", State.renderCullDist, 100, 5000, function(n)
-        State.renderCullDist = n
-        pcall(forceRescanRenderCull)
+    local pSe = pages.set
+    sectionLabel(pSe, "窗口外观")
+    addSlider(pSe, "窗口宽度比例(%)", 30, 90, State.uiWidthPct, function(v)
+        State.uiWidthPct = v; applyUISize()
     end)
-    addRowToggle(setPage, "深度移除纹理", State.textureRemoverEnabled, function(v) State.textureRemoverEnabled = v end)
-
-    addDivider(setPage, "── 隐藏 ──")
-    addRowToggle(setPage, "隐藏自己的宠物", State.hideOwnPets, function(v) State.hideOwnPets = v end)
-    addRowToggle(setPage, "隐藏所有玩家宠物", State.hideAllPets, function(v) State.hideAllPets = v end)
-    addRowToggle(setPage, "隐藏器械", State.hideMachines, function(v) State.hideMachines = v end)
-    addRowToggle(setPage, "隐藏其他 UI", State.hideUIEnabled, function(v)
+    addSlider(pSe, "窗口高度比例(%)", 30, 90, State.uiHeightPct, function(v)
+        State.uiHeightPct = v; applyUISize()
+    end)
+    addActionRow(pSe, {
+        { label = "重置窗口位置", onClick = function()
+            if State.ui.main then State.ui.main.Position = DEFAULT.mainPos end
+            applyUISize(); notify("已重置窗口位置", 2)
+        end },
+    })
+    divider(pSe)
+    sectionLabel(pSe, "信息悬浮窗")
+    State.ui.infoToggle = addToggle(pSe, "显示实时信息", State.infoWindowEnabled, function(v)
+        State.infoWindowEnabled = v
+        if State.ui.infoGui then State.ui.infoGui.Enabled = v end
+    end)
+    addToggle(pSe, "数字格式化显示", State.formatEnabled, function(v) State.formatEnabled = v end)
+    divider(pSe)
+    sectionLabel(pSe, "性能优化")
+    addToggle(pSe, "深度防卡顿", State.antiLagEnabled, function(v) State.antiLagEnabled = v end, "关闭粒子/阴影/后处理/声音")
+    addToggle(pSe, "渲染剔除", State.renderCullEnabled, function(v) State.renderCullEnabled = v end, "远处模型透明")
+    addSlider(pSe, "剔除距离", 100, 5000, State.renderCullDist, function(v)
+        State.renderCullDist = v
+        for m in pairs(RenderCull.hidden) do uncullModel(m) end
+        table.clear(RenderCull.hidden); RenderCull.rescanAt = 0
+    end)
+    addToggle(pSe, "移除纹理", State.textureRemoverEnabled, function(v) State.textureRemoverEnabled = v end)
+    divider(pSe)
+    sectionLabel(pSe, "隐藏")
+    addToggle(pSe, "隐藏自己的宠物", State.hideOwnPets, function(v) State.hideOwnPets = v end)
+    addToggle(pSe, "隐藏所有宠物", State.hideAllPets, function(v) State.hideAllPets = v end)
+    addToggle(pSe, "隐藏器械", State.hideMachines, function(v) State.hideMachines = v end)
+    addToggle(pSe, "隐藏其他 UI", State.hideUIEnabled, function(v)
         State.hideUIEnabled = v
         if v then pcall(hideAllUI) else pcall(restoreHiddenUI) end
     end)
 
-    addDivider(setPage, "── 显示 ──")
-    State.ui.infoToggle = addRowToggle(setPage, "信息小悬浮窗", State.infoWindowEnabled, function(v)
-        State.infoWindowEnabled = v
-        if State.ui.infoGui then State.ui.infoGui.Enabled = v end
-    end)
-    addRowToggle(setPage, "数字格式化显示", State.formatEnabled, function(v) State.formatEnabled = v end)
-
-    addDivider(setPage, "── UI 大小 ──")
-    addInput(setPage, "主窗口高度比例(%)", math.floor(State.uiHeightRatio * 100), 20, 90, function(n)
-        State.uiHeightRatio = n / 100; updateUIScale()
-    end)
-    addInput(setPage, "信息窗高度比例(%)", math.floor(State.infoHeightRatio * 100), 15, 70, function(n)
-        State.infoHeightRatio = n / 100; updateUIScale()
-    end)
-    addHint(setPage, "长按屏幕左下角复位按钮 3 秒可重置所有位置和大小。")
-
+    -- Tab 切换
+    local currentTab = "train"
     local function switchTab(id)
-        trainPage.Visible = (id == "train")
-        telePage.Visible = (id == "tele")
-        rebPage.Visible = (id == "reb")
-        killPage.Visible = (id == "kill")
-        setPage.Visible = (id == "set")
-        local function tint(btn, on)
-            btn.BackgroundColor3 = on and Theme.Accent or Theme.SurfaceAlt
-            btn.TextColor3 = on and C3(255, 255, 255) or Theme.TextDim
+        currentTab = id
+        for tid, p in pairs(pages) do p.Visible = (tid == id) end
+        for i, tab in ipairs(TABS) do
+            local on = (tab.id == id)
+            tabButtons[i].TextColor3 = on and C3(255, 255, 255) or Theme.TextDim
+            if on then
+                tabIndicator.Position = UD2n((i-1)/#TABS, 0, 0, 34)
+            end
         end
-        tint(tabTrain, id == "train")
-        tint(tabTele, id == "tele")
-        tint(tabReb, id == "reb")
-        tint(tabKill, id == "kill")
-        tint(tabSet, id == "set")
     end
-
-    track(tabTrain.MouseButton1Click:Connect(function() switchTab("train") end))
-    track(tabTele.MouseButton1Click:Connect(function() switchTab("tele") end))
-    track(tabReb.MouseButton1Click:Connect(function() switchTab("reb") end))
-    track(tabKill.MouseButton1Click:Connect(function() switchTab("kill") end))
-    track(tabSet.MouseButton1Click:Connect(function() switchTab("set") end))
+    for i, btn in ipairs(tabButtons) do
+        track(btn.MouseButton1Click:Connect(function() switchTab(TABS[i].id) end))
+    end
     switchTab("train")
 
+    -- 拖动
     local dragging, dragStart, dragStartPos = false, nil, nil
     local function posIn(btn, pos)
         local ap = btn.AbsolutePosition; local as = btn.AbsoluteSize
-        return pos.X >= ap.X and pos.X <= ap.X + as.X
-           and pos.Y >= ap.Y and pos.Y <= ap.Y + as.Y
+        return pos.X >= ap.X and pos.X <= ap.X + as.X and pos.Y >= ap.Y and pos.Y <= ap.Y + as.Y
     end
     track(titleBar.InputBegan:Connect(function(input)
         if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
-        if posIn(minBtn, input.Position) or posIn(closeBtn, input.Position) then return end
+        if posIn(minBtn, input.Position) or posIn(hideBtn, input.Position) or posIn(closeBtn, input.Position) then return end
         dragging = true; dragStart = input.Position; dragStartPos = main.Position
     end))
     track(UIS_IC:Connect(function(input)
@@ -2392,29 +2718,46 @@ local function buildUI()
                              dragStartPos.Y.Scale, dragStartPos.Y.Offset + d.Y)
     end))
     track(UIS_IE:Connect(function(input)
-        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then
-            dragging = false
-        end
+        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then dragging = false end
     end))
 
+    -- 最小化 / 隐藏 / 关闭
     local minimized = false
     track(minBtn.MouseButton1Click:Connect(function()
         minimized = not minimized
         if minimized then
-            tabBar.Visible = false; content.Visible = false
-            main.Size = UD2o(WIN_W, TITLE_H)
+            tabBar.Visible = false; contentArea.Visible = false
+            main.Size = UD2o(main.Size.X.Offset, 44)
             minBtn.Text = "+"
         else
-            tabBar.Visible = true; content.Visible = true
-            main.Size = UD2o(WIN_W, WIN_H)
-            minBtn.Text = "—"
+            tabBar.Visible = true; contentArea.Visible = true
+            applyUISize()
+            minBtn.Text = "-"
         end
     end))
 
+    track(hideBtn.MouseButton1Click:Connect(function()
+        main.Visible = false
+        if State.ui.restoreBtn then State.ui.restoreBtn.Visible = true end
+    end))
     track(closeBtn.MouseButton1Click:Connect(destroy))
 
-    State.ui.trainToggle = trainToggle
-    State.ui.fastToggle = fastToggle
+    -- 恢复悬浮按钮
+    local restore = create("TextButton", {
+        Name = "RestoreBtn", AnchorPoint = V2n(0.5, 0.5),
+        Position = UD2s(0.5, 0.5), Size = UD2o(130, 40),
+        BackgroundColor3 = Theme.Accent, BorderSizePixel = 0,
+        Font = Font.GothamBold, Text = "显示主界面",
+        TextColor3 = C3(255, 255, 255), TextSize = 13,
+        Visible = false, ZIndex = 999,
+    }, screen)
+    corner(restore, 10); stroke(restore, Theme.Accent, 1.5, 0.2)
+    State.ui.restoreBtn = restore
+    track(restore.MouseButton1Click:Connect(function()
+        main.Visible = true; restore.Visible = false
+    end))
+
+    applyUISize()
 end
 
 -- ============================================================
@@ -2424,26 +2767,34 @@ loadConfig()
 buildUI()
 buildInfoWindow()
 buildResetButton()
-updateUIScale()
+applyUISize()
 
 if State.ui.rateBox then
     State.ui.rateBox.TextEditable = not State.adaptiveEnabled
     State.ui.rateBox.TextColor3 = State.adaptiveEnabled and Theme.TextDim or Theme.Text
 end
 if State.antiLagEnabled then pcall(enableAntiLag) end
-if State.textureRemoverEnabled then pcall(enableTextureRemover) end
+if State.textureRemoverEnabled then pcall(enableTex) end
 if State.hideUIEnabled then pcall(hideAllUI) end
 if State.infoWindowEnabled and State.ui.infoGui then State.ui.infoGui.Enabled = true end
-
--- 好友白名单：启动时拉取
-if State.friendWhitelist then
-    task.delay(2, function() refreshFriendList() end)
-end
+if State.friendWhitelist then task.delay(2, function() refreshFriendList() end) end
 
 local cam = Workspace.CurrentCamera
 if cam then
-    track(cam:GetPropertyChangedSignal("ViewportSize"):Connect(updateUIScale))
+    track(cam:GetPropertyChangedSignal("ViewportSize"):Connect(applyUISize))
 end
+
+track(LocalPlayer.CharacterAdded:Connect(function()
+    Cache.char = nil; Cache.hum = nil; Cache.hrp = nil
+    State.killTarget = nil; State.kingKillTarget = nil; State.kingKillActive = false
+    State.toolCooldown = false; State.toolOwnedByKill = false
+    State.dualCurrentMode = "punch"
+    State.muscleEventRef = nil; State.rebirthEventRef = nil
+    PortalCache = nil; PortalCacheAt = 0
+    State._lastSuicide = 0; State._suicideCount = 0
+    table.clear(RenderCull.hidden)
+    table.clear(PetHider.own); table.clear(PetHider.all); table.clear(PetHider.machines)
+end))
 
 track(RS_HB:Connect(onHeartbeat))
 
