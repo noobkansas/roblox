@@ -1,9 +1,9 @@
 --!nonstrict
--- 肌肉之王自动化 v19
--- 反复速度乘法计算修复 / 网络优化（轻度+重度）
+-- 肌肉之王自动化 v20
+-- 新增：并行多包训练模式（可选）
 
 local SCRIPT_ID   = "__MUSCLE_KING_AUTO__"
-local VERSION     = 1900
+local VERSION     = 2000
 local CONFIG_FILE = "muscle_king_auto_config.json"
 
 do
@@ -105,8 +105,17 @@ local State = {
     infoWindowEnabled = false,
     formatEnabled = true,
 
-    -- 网络优化：0=关, 1=轻度, 2=重度
     netOptMode = 0,
+
+    -- ★ v20：并行多包
+    parallelPackets = false,   -- 开关
+    parallelThreads = 4,       -- 并行线程数（1~16）
+    parallelBurst = 32,        -- 每线程每帧最多发多少个包（1~500）
+    parallelStats = {          -- 实时统计
+        sent = 0,
+        cycles = 0,
+        lastReport = 0,
+    },
 
     petRepBonus = 0, petRepBonusCheckedAt = 0, petRepBonusDetail = {},
 
@@ -124,32 +133,15 @@ local State = {
     sessionStartStrength = nil, strengthCheckAt = 0,
     lastStrengthSnapshot = 0, strengthPerSec = 0,
 
-    -- 网络
     ping = 0,
     lastPingCheck = 0,
 }
 
--- ★ v19：反复速度缓存 —— 乘法模型
---   规则：
---   宠物：每个 +X% 表示 rep 时间 -X%，多个宠物乘法叠加
---        petTimeMul = ∏(1 - pet_i/100)
---        可突破 100%（sum ≥ 100 时速度 → 无限）
---   终极：等级 × 5%，独立乘法
---        ultTimeMul = 1 - ult/100
---   通行证：x2 Rep Time，独立，直接速度翻倍（时间减半）
---        若拥有：passMul = 0.5，否则 passMul = 1
---   综合速度倍率 = 1 / (petTimeMul × ultTimeMul × passMul)
 local RepCache = {
-    pet = 0,        -- 宠物原始加成总和（%）
-    ult = 0,        -- 终极等级 × 5（%）
-    x2 = false,     -- 是否拥有通行证
-    petTimeMul = 1, -- 宠物时间系数
-    ultTimeMul = 1, -- 终极时间系数
-    passMul = 1,    -- 通行证时间系数
-    speedMul = 1,   -- 综合速度倍率
-    detail = {},
-    lastRefresh = 0,
-    lastPassCheck = 0,
+    pet = 0, ult = 0, x2 = false,
+    petTimeMul = 1, ultTimeMul = 1, passMul = 1,
+    speedMul = 1, detail = {},
+    lastRefresh = 0, lastPassCheck = 0,
 }
 local X2_REP_PASS_ID = 6998482
 
@@ -228,6 +220,9 @@ local function saveConfig()
         infoWindowEnabled = State.infoWindowEnabled,
         formatEnabled = State.formatEnabled,
         netOptMode = State.netOptMode,
+        parallelPackets = State.parallelPackets,
+        parallelThreads = State.parallelThreads,
+        parallelBurst = State.parallelBurst,
         uiHeightRatio = State.uiHeightRatio,
         infoHeightRatio = State.infoHeightRatio,
     }
@@ -285,15 +280,16 @@ local function loadConfig()
     State.infoWindowEnabled = bool("infoWindowEnabled", State.infoWindowEnabled)
     State.formatEnabled = bool("formatEnabled", State.formatEnabled)
     State.netOptMode = num("netOptMode", State.netOptMode, 0, 2)
+    State.parallelPackets = bool("parallelPackets", State.parallelPackets)
+    State.parallelThreads = num("parallelThreads", State.parallelThreads, 1, 16)
+    State.parallelBurst = num("parallelBurst", State.parallelBurst, 1, 500)
     State.uiHeightRatio = fnum("uiHeightRatio", State.uiHeightRatio, 0.2, 0.9)
     State.infoHeightRatio = fnum("infoHeightRatio", State.infoHeightRatio, 0.15, 0.7)
 end
 
 -- ============================================================
--- ★ v19 反复速度 —— 乘法模型
+-- 反复速度（乘法模型）
 -- ============================================================
--- 遍历自己 Workspace 文件夹里的宠物，用 equippedSlot 去重
--- 每个宠物的 repTimeBoostPercent 视为独立 -X% 的时间系数
 local function collectPetRepTimes()
     local sumPct = 0
     local timeMul = 1
@@ -314,19 +310,15 @@ local function collectPetRepTimes()
                 local perks = pet:FindFirstChild("perksFolder")
                 if perks then
                     for _, p in ipairs(perks:GetChildren()) do
-                        if p:IsA("ValueBase") then
-                            local lowerName = p.Name:lower()
-                            if lowerName:find("rep") then
-                                local v = tonumber(p.Value) or 0
-                                if v > 0 then
-                                    sumPct = sumPct + v
-                                    -- 每个 +v% 视为 rep 时间 -v%
-                                    local mult = 1 - (v / 100)
-                                    if mult < 0.001 then mult = 0.001 end
-                                    timeMul = timeMul * mult
-                                    table.insert(detail, string.format("%s:%s=%d",
-                                        slotName or pet.Name, p.Name, v))
-                                end
+                        if p:IsA("ValueBase") and p.Name:lower():find("rep") then
+                            local v = tonumber(p.Value) or 0
+                            if v > 0 then
+                                sumPct = sumPct + v
+                                local mult = 1 - (v / 100)
+                                if mult < 0.001 then mult = 0.001 end
+                                timeMul = timeMul * mult
+                                table.insert(detail, string.format("%s:%s=%d",
+                                    slotName or pet.Name, p.Name, v))
                             end
                         end
                     end
@@ -339,18 +331,13 @@ end
 
 local function readUltRepPct()
     local v = LocalPlayer:FindFirstChild("UltimateRepSpeed")
-    if v and v:IsA("ValueBase") then
-        -- UltimateRepSpeed = 等级，每级 +5%
-        return (tonumber(v.Value) or 0) * 5
-    end
+    if v and v:IsA("ValueBase") then return (tonumber(v.Value) or 0) * 5 end
     return 0
 end
 
 local function checkX2RepPass()
     local now = tick()
-    if now - RepCache.lastPassCheck < 60 then
-        return RepCache.x2
-    end
+    if now - RepCache.lastPassCheck < 60 then return RepCache.x2 end
     RepCache.lastPassCheck = now
     local ok, owns = pcall(function()
         return MarketplaceService:UserOwnsGamePassAsync(LocalPlayer.UserId, X2_REP_PASS_ID)
@@ -363,12 +350,9 @@ local function refreshRepSpeed()
     local petPct, petTimeMul, detail = collectPetRepTimes()
     local ultPct = readUltRepPct()
     local x2 = checkX2RepPass()
-
     local ultTimeMul = 1 - (ultPct / 100)
     if ultTimeMul < 0.001 then ultTimeMul = 0.001 end
-
     local passMul = x2 and 0.5 or 1
-
     RepCache.pet = petPct
     RepCache.ult = ultPct
     RepCache.x2 = x2
@@ -376,8 +360,6 @@ local function refreshRepSpeed()
     RepCache.ultTimeMul = ultTimeMul
     RepCache.passMul = passMul
     RepCache.detail = detail
-
-    -- 综合速度倍率 = 1 / 综合时间系数
     local totalTime = petTimeMul * ultTimeMul * passMul
     if totalTime < 0.0001 then totalTime = 0.0001 end
     RepCache.speedMul = 1 / totalTime
@@ -390,46 +372,26 @@ local function refreshPetBonus()
 end
 
 -- ============================================================
--- ★ v19 网络优化
+-- 网络优化
 -- ============================================================
 local NetOpt = {
-    enabled = false,
-    mode = 0,
-    blocked = {},
-    connections = {},
-    lastRescan = 0,
+    enabled = false, mode = 0,
+    blocked = {}, connections = {}, lastRescan = 0,
 }
-
--- 需要屏蔽的关键词（遥测、分析、AB 测试等）
 local TELEMETRY_PATTERNS = {
-    "UserGenerated",
-    "Analytics",
-    "ABTests",
-    "FastFlags",
-    "Telemetry",
-    "ClientKit",
-    "LibMP",
-    "Fps",  -- Analytics.ClientKit.Fps
-    "Accept",
-    "Update",
+    "UserGenerated", "Analytics", "ABTests", "FastFlags",
+    "Telemetry", "ClientKit", "LibMP",
 }
-
 local function shouldBlock(obj)
     local path = obj:GetFullName()
     for _, pat in ipairs(TELEMETRY_PATTERNS) do
         if path:find(pat, 1, true) then
-            -- 只屏蔽 ReplicatedStorage 下的遥测，且必须是 Remote
-            if path:find("ReplicatedStorage", 1, true) then
-                return true
-            end
+            if path:find("ReplicatedStorage", 1, true) then return true end
         end
     end
     return false
 end
-
--- 屏蔽手段：断开 OnClientEvent 连接（阻止接收）+ 尝试 hook FireServer
 local function tryHookOutgoing(ev)
-    -- 尝试 1：使用 hookfunction 覆写 FireServer（部分执行器支持）
     if type(hookfunction) == "function" then
         local ok = pcall(function()
             local old = ev.FireServer
@@ -437,38 +399,27 @@ local function tryHookOutgoing(ev)
         end)
         if ok then return true end
     end
-    -- 尝试 2：尝试直接赋值（大部分情况下会失败）
-    local ok2 = pcall(function()
-        ev.FireServer = function() end
-    end)
-    if ok2 then return true end
-    return false
+    local ok2 = pcall(function() ev.FireServer = function() end end)
+    return ok2
 end
-
 local function applyNetworkOpt()
-    -- 清掉旧连接
-    for _, c in ipairs(NetOpt.connections) do
-        pcall(function() c:Disconnect() end)
-    end
+    for _, c in ipairs(NetOpt.connections) do pcall(function() c:Disconnect() end) end
     table.clear(NetOpt.connections)
     table.clear(NetOpt.blocked)
-
     if NetOpt.mode == 0 then
         NetOpt.enabled = false
         return
     end
-
     local mode = NetOpt.mode
     local hookable = type(hookfunction) == "function"
-
     for _, obj in ipairs(ReplicatedStorage:GetDescendants()) do
         if obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") then
             if shouldBlock(obj) then
                 table.insert(NetOpt.blocked, obj)
-
-                -- 轻度：只断掉 OnClientEvent，阻止接收遥测
                 if obj:IsA("RemoteEvent") then
-                    local ok1, conns = pcall(function() return getconnections and getconnections(obj.OnClientEvent) end)
+                    local ok1, conns = pcall(function()
+                        return getconnections and getconnections(obj.OnClientEvent)
+                    end)
                     if ok1 and conns then
                         for _, c in ipairs(conns) do
                             pcall(function()
@@ -477,39 +428,28 @@ local function applyNetworkOpt()
                         end
                     end
                 end
-
-                -- 重度：额外 hook FireServer，阻止发送遥测
                 if mode >= 2 and hookable then
                     pcall(function() tryHookOutgoing(obj) end)
                 end
             end
         end
     end
-
     NetOpt.enabled = true
     NetOpt.lastRescan = State.time
 end
-
 local function disableNetworkOpt()
-    for _, c in ipairs(NetOpt.connections) do
-        pcall(function() c:Disconnect() end)
-    end
+    for _, c in ipairs(NetOpt.connections) do pcall(function() c:Disconnect() end) end
     table.clear(NetOpt.connections)
     table.clear(NetOpt.blocked)
     NetOpt.enabled = false
 end
-
 local function setNetOptMode(mode)
     NetOpt.mode = math.clamp(mode, 0, 2)
     State.netOptMode = NetOpt.mode
     pcall(applyNetworkOpt)
-    if mode == 0 then
-        notify("网络优化：已关闭", 2)
-    elseif mode == 1 then
-        notify(string.format("网络优化：轻度（屏蔽 %d 个遥测）", #NetOpt.blocked), 3)
-    else
-        notify(string.format("网络优化：重度（屏蔽 %d 个遥测，尝试 hook 出站）", #NetOpt.blocked), 3)
-    end
+    if mode == 0 then notify("网络优化：已关闭", 2)
+    elseif mode == 1 then notify(string.format("网络优化：轻度（%d）", #NetOpt.blocked), 3)
+    else notify(string.format("网络优化：重度（%d）", #NetOpt.blocked), 3) end
 end
 
 -- ============================================================
@@ -529,10 +469,7 @@ local function scanAntiLag()
         local cls = obj.ClassName
         if cls == "ParticleEmitter" or cls == "Trail" or cls == "Beam"
         or cls == "Fire" or cls == "Smoke" or cls == "Sparkles" then
-            if obj.Enabled then
-                obj.Enabled = false
-                table.insert(AntiLag.particles, obj)
-            end
+            if obj.Enabled then obj.Enabled = false; table.insert(AntiLag.particles, obj) end
         elseif cls == "BasePart" and obj.CastShadow then
             table.insert(AntiLag.shadows, { part = obj, value = true })
             obj.CastShadow = false
@@ -540,10 +477,7 @@ local function scanAntiLag()
     end
     for _, obj in ipairs(Lighting:GetChildren()) do
         if POST_CLASSES[obj.ClassName] then
-            if obj.Enabled then
-                obj.Enabled = false
-                table.insert(AntiLag.postEffects, obj)
-            end
+            if obj.Enabled then obj.Enabled = false; table.insert(AntiLag.postEffects, obj) end
         elseif obj.ClassName == "Atmosphere" then
             table.insert(AntiLag.atmospheres, {
                 obj = obj, Density = obj.Density, Haze = obj.Haze, Glare = obj.Glare,
@@ -703,8 +637,7 @@ local function scanHidePets()
         if own then
             for _, pet in ipairs(own:GetChildren()) do
                 if pet:IsA("Model") or pet:IsA("Folder") then
-                    table.insert(PetHider.own, pet)
-                    hideModelParts(pet)
+                    table.insert(PetHider.own, pet); hideModelParts(pet)
                 end
             end
         end
@@ -716,8 +649,7 @@ local function scanHidePets()
                 if f then
                     for _, pet in ipairs(f:GetChildren()) do
                         if pet:IsA("Model") or pet:IsA("Folder") then
-                            table.insert(PetHider.all, pet)
-                            hideModelParts(pet)
+                            table.insert(PetHider.all, pet); hideModelParts(pet)
                         end
                     end
                 end
@@ -737,10 +669,7 @@ local function scanHideMachines()
     local mf = Workspace:FindFirstChild("machinesFolder")
     if mf then
         for _, m in ipairs(mf:GetChildren()) do
-            if m:IsA("Model") then
-                table.insert(PetHider.machines, m)
-                hideModelParts(m)
-            end
+            if m:IsA("Model") then table.insert(PetHider.machines, m); hideModelParts(m) end
         end
     end
     PetHider.rescanAt = State.time + 2
@@ -782,8 +711,7 @@ end
 local function enableTextureRemover()
     if TextureRemover.enabled then return end
     TextureRemover.enabled = true
-    table.clear(TextureRemover.saved)
-    table.clear(TextureRemover.seen)
+    table.clear(TextureRemover.saved); table.clear(TextureRemover.seen)
     scanTextures()
     TextureRemover.rescanAt = State.time + 4
 end
@@ -797,8 +725,7 @@ local function disableTextureRemover()
     for _, item in ipairs(TextureRemover.saved) do
         pcall(function() item.obj[item.prop] = item.value end)
     end
-    table.clear(TextureRemover.saved)
-    table.clear(TextureRemover.seen)
+    table.clear(TextureRemover.saved); table.clear(TextureRemover.seen)
 end
 
 local HiddenUIs = {}
@@ -806,10 +733,7 @@ local function hideAllUI()
     table.clear(HiddenUIs)
     for _, gui in ipairs(PlayerGui:GetChildren()) do
         if gui:IsA("ScreenGui") and gui ~= State.ui.screen and gui ~= State.ui.infoGui then
-            if gui.Enabled then
-                gui.Enabled = false
-                table.insert(HiddenUIs, gui)
-            end
+            if gui.Enabled then gui.Enabled = false; table.insert(HiddenUIs, gui) end
         end
     end
 end
@@ -849,18 +773,10 @@ local function sweepOverflow()
     for obj in pairs(TextureRemover.seen) do
         if not obj.Parent then TextureRemover.seen[obj] = nil end
     end
-    for i = #PetHider.own, 1, -1 do
-        if not PetHider.own[i].Parent then table.remove(PetHider.own, i) end
-    end
-    for i = #PetHider.all, 1, -1 do
-        if not PetHider.all[i].Parent then table.remove(PetHider.all, i) end
-    end
-    for i = #PetHider.machines, 1, -1 do
-        if not PetHider.machines[i].Parent then table.remove(PetHider.machines, i) end
-    end
-    for i = #HiddenUIs, 1, -1 do
-        if not HiddenUIs[i].Parent then table.remove(HiddenUIs, i) end
-    end
+    for i = #PetHider.own, 1, -1 do if not PetHider.own[i].Parent then table.remove(PetHider.own, i) end end
+    for i = #PetHider.all, 1, -1 do if not PetHider.all[i].Parent then table.remove(PetHider.all, i) end end
+    for i = #PetHider.machines, 1, -1 do if not PetHider.machines[i].Parent then table.remove(PetHider.machines, i) end end
+    for i = #HiddenUIs, 1, -1 do if not HiddenUIs[i].Parent then table.remove(HiddenUIs, i) end end
 end
 
 local function cleanupTrainingState()
@@ -1138,8 +1054,7 @@ local function runKillTick(dt)
         State.killScanAt = State.time
         local cur = State.killTarget
         local valid = cur and getCharacterHRP(cur)
-        if not valid then
-            State.killTarget = selectKillTarget()
+        if not valid then State.killTarget = selectKillTarget()
         else
             local myStrength = getMyStrength()
             local dur = getPlayerDurability(cur)
@@ -1175,41 +1090,27 @@ local function runKingKillTick(dt)
         State.lastKingCheck = State.time
         local king = getMuscleKing()
         if not king or king == LocalPlayer then
-            State.kingKillTarget = nil
-            State.kingKillActive = false
-            return
+            State.kingKillTarget = nil; State.kingKillActive = false; return
         end
         local hrp = getCharacterHRP(king)
-        if not hrp then
-            State.kingKillTarget = nil
-            State.kingKillActive = false
-            return
-        end
+        if not hrp then State.kingKillTarget = nil; State.kingKillActive = false; return end
         local myStrength = getMyStrength()
         local targetDur = getPlayerDurability(king)
         local threshold = State.kingKillThreshold or 20
         if targetDur and myStrength > 0 and targetDur >= myStrength * threshold then
-            State.kingKillTarget = nil
-            State.kingKillActive = false
-            return
+            State.kingKillTarget = nil; State.kingKillActive = false; return
         end
         State.kingKillTarget = king
     end
     local target = State.kingKillTarget
     if not target then State.kingKillActive = false return end
     local targetHRP = getCharacterHRP(target)
-    if not targetHRP then
-        State.kingKillTarget = nil
-        State.kingKillActive = false
-        return
-    end
+    if not targetHRP then State.kingKillTarget = nil; State.kingKillActive = false; return end
     State.kingKillActive = true
     applyKillMovement(targetHRP)
     if State.time - State.kingKillLastAttack >= 0.05 then
         State.kingKillLastAttack = State.time
-        if not isEquipped(TOOL_KEYWORDS.punch) then
-            tryEquip(TOOL_KEYWORDS.punch)
-        end
+        if not isEquipped(TOOL_KEYWORDS.punch) then tryEquip(TOOL_KEYWORDS.punch) end
         activatePunch()
     end
 end
@@ -1320,13 +1221,13 @@ local function updateUIScale()
     if not cam then return end
     local vp = cam.ViewportSize
     if State.ui.mainScale then
-        local scale = (vp.Y * (State.uiHeightRatio or 0.4)) / 440
+        local scale = (vp.Y * (State.uiHeightRatio or 0.4)) / 460
         scale = math.clamp(scale, 0.5, 3)
         if isMobile then scale = scale * 1.15 end
         State.ui.mainScale.Scale = scale
     end
     if State.ui.infoScale then
-        local scale = (vp.Y * (State.infoHeightRatio or 0.28)) / 360
+        local scale = (vp.Y * (State.infoHeightRatio or 0.28)) / 380
         scale = math.clamp(scale, 0.5, 3)
         if isMobile then scale = scale * 1.15 end
         State.ui.infoScale.Scale = scale
@@ -1353,7 +1254,7 @@ local function buildInfoWindow()
 
     local frame = create("Frame", {
         Name = "InfoFrame", AnchorPoint = V2n(0, 0),
-        Position = DEFAULT.infoPos, Size = UD2o(280, 380),
+        Position = DEFAULT.infoPos, Size = UD2o(280, 400),
         BackgroundColor3 = Theme.Background,
         BorderSizePixel = 0, ClipsDescendants = true, Active = true,
     }, screen)
@@ -1455,6 +1356,7 @@ local function buildInfoWindow()
     Info.rows.perHour    = createRow("每小时预计", 11)
     Info.rows.perDay     = createRow("每天预计", 12)
     Info.rows.pingRow    = createRow("网络延迟", 13)
+    Info.rows.pktRow     = createRow("发包速率", 14)
 
     local dragging, dragStart, startPos = false, nil, nil
     track(titleBar.InputBegan:Connect(function(input)
@@ -1491,7 +1393,7 @@ local function buildInfoWindow()
         else
             playerBtn.Visible = true
             dataFrame.Visible = true
-            frame.Size = UD2o(280, 380)
+            frame.Size = UD2o(280, 400)
             minBtn.Text = "—"
         end
     end))
@@ -1561,8 +1463,7 @@ local function refreshInfoWindow()
     if Info.minimized then return end
     local plr = Info.viewingPlayer
     if not plr or not plr.Parent then
-        Info.viewingPlayer = LocalPlayer
-        plr = LocalPlayer
+        Info.viewingPlayer = LocalPlayer; plr = LocalPlayer
         if Info.frames.playerBtn then Info.frames.playerBtn.Text = "查看：自己 ▼" end
     end
     local strength   = getStatValue(plr, "Strength")
@@ -1582,7 +1483,6 @@ local function refreshInfoWindow()
             Info.rows.strengthDelta.Text = sign .. formatNumber(delta)
             Info.rows.strengthDelta.TextColor3 = delta >= 0 and Theme.Success or Theme.Danger
         end
-        -- 反复速度三段显示
         Info.rows.petRep.Text = string.format("%d%%", RepCache.pet)
         Info.rows.petRep.TextColor3 = RepCache.pet >= 100 and Theme.Success or Theme.Text
         Info.rows.ultRep.Text = string.format("%d%%", RepCache.ult)
@@ -1591,16 +1491,30 @@ local function refreshInfoWindow()
         Info.rows.passRep.TextColor3 = RepCache.x2 and Theme.Success or Theme.TextDim
         Info.rows.speedMul.Text = string.format("%.2fx", RepCache.speedMul)
         Info.rows.speedMul.TextColor3 = RepCache.speedMul >= 2 and Theme.Success or Theme.Text
-        -- 预计
         Info.rows.perHour.Text = formatNumber(State.strengthPerSec * 3600)
         Info.rows.perDay.Text  = formatNumber(State.strengthPerSec * 86400)
-        -- ping
         local pingVal = State.ping
         Info.rows.pingRow.Text = pingVal > 0 and (math.floor(pingVal) .. " ms") or "-"
         if pingVal > 0 then
             if pingVal < 80 then Info.rows.pingRow.TextColor3 = Theme.Success
             elseif pingVal < 200 then Info.rows.pingRow.TextColor3 = Theme.Warning
             else Info.rows.pingRow.TextColor3 = Theme.Danger end
+        end
+        -- ★ v20：发包速率显示
+        if State.parallelPackets then
+            local elapsed = State.time - State.parallelStats.lastReport
+            if elapsed >= 1 then
+                local rate = State.parallelStats.sent / elapsed
+                State.parallelStats.lastReport = State.time
+                State.parallelStats.sent = 0
+                State.parallelStats._lastRate = rate
+            end
+            local lastRate = State.parallelStats._lastRate or 0
+            Info.rows.pktRow.Text = string.format("%d 包/秒 × %d 线", math.floor(lastRate), State.parallelThreads)
+            Info.rows.pktRow.TextColor3 = Theme.Success
+        else
+            Info.rows.pktRow.Text = "关闭"
+            Info.rows.pktRow.TextColor3 = Theme.TextDim
         end
     else
         Info.rows.strengthDelta.Text = "-"
@@ -1611,11 +1525,12 @@ local function refreshInfoWindow()
         Info.rows.perHour.Text = "-"
         Info.rows.perDay.Text = "-"
         Info.rows.pingRow.Text = "-"
+        Info.rows.pktRow.Text = "-"
     end
 end
 
 -- ============================================================
--- 复位按钮
+-- 复位
 -- ============================================================
 local ResetBtnState = { pressAt = 0, holding = false, lastStep = 0 }
 local function doResetAll()
@@ -1625,7 +1540,7 @@ local function doResetAll()
     if Info.frames.frame then
         Info.frames.frame.Position = DEFAULT.infoPos
         Info.minimized = false
-        Info.frames.frame.Size = UD2o(280, 380)
+        Info.frames.frame.Size = UD2o(280, 400)
         if Info.frames.playerBtn then Info.frames.playerBtn.Visible = true end
         if Info.frames.dataFrame then Info.frames.dataFrame.Visible = true end
     end
@@ -1816,19 +1731,16 @@ registerTask({ id = "info", priority = TaskPriority.INFO,
                 State.lastStrengthSnapshot = s
             end
         end
-        -- 反复速度：1 秒 1 次
         if State.time - RepCache.lastRefresh >= 1 then
             RepCache.lastRefresh = State.time
             refreshRepSpeed()
         end
-        -- ping：1 秒 1 次
         if State.time - State.lastPingCheck >= 1 then
             State.lastPingCheck = State.time
             pcall(function()
                 State.ping = math.floor(game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue())
             end)
         end
-        -- 信息窗：0.2 秒 1 次
         if State.time - Info.lastRefresh >= 0.2 then
             Info.lastRefresh = State.time
             refreshInfoWindow()
@@ -1854,9 +1766,7 @@ registerTask({ id = "tool", priority = TaskPriority.TOOL,
             if tryEquip(kw) then ok1 = true break end
         end
         local ok2 = false
-        if not ok1 and State.toolDumbbell then
-            ok2 = tryEquip(TOOL_KEYWORDS.dumbbell)
-        end
+        if not ok1 and State.toolDumbbell then ok2 = tryEquip(TOOL_KEYWORDS.dumbbell) end
         if not ok1 and not ok2 then
             local anyExists = false
             for _, kw in ipairs(selected) do
@@ -1879,6 +1789,7 @@ registerTask({ id = "tool", priority = TaskPriority.TOOL,
     end,
 })
 
+-- ★★★ v20：训练任务 —— 支持并行多包
 registerTask({ id = "train", priority = TaskPriority.TRAIN,
     enabled = function()
         return (State.autoTrain or State.fastTrain) and not State.kingKillActive
@@ -1888,19 +1799,48 @@ registerTask({ id = "train", priority = TaskPriority.TRAIN,
         if State.fastTrain then rate = State.fastRate
         elseif State.autoTrain then rate = 10 end
         if rate <= 0 then return end
+
         State.trainAccum = State.trainAccum + rate * dt
         local count = math.floor(State.trainAccum)
-        if count > 0 then
-            State.trainAccum = State.trainAccum - count
-            if count > 3000 then count = 3000 end
-            local ev = getMuscleEvent()
-            if ev then
+        if count <= 0 then return end
+        State.trainAccum = State.trainAccum - count
+        if count > 3000 then count = 3000 end
+
+        local ev = getMuscleEvent()
+        if not ev then return end
+
+        -- 并行模式
+        if State.parallelPackets and State.parallelThreads > 1 then
+            local threads = math.min(State.parallelThreads, count)
+            local per = math.floor(count / threads)
+            local rem = count - per * threads
+            if threads <= 1 then
                 pcall(function()
-                    for _ = 1, count do
-                        ev:FireServer("rep")
-                    end
+                    for _ = 1, count do ev:FireServer("rep") end
                 end)
+                State.parallelStats.sent = State.parallelStats.sent + count
+                State.parallelStats.cycles = State.parallelStats.cycles + 1
+            else
+                for i = 1, threads do
+                    local n = per + (i <= rem and 1 or 0)
+                    if n > 0 then
+                        task.spawn(function()
+                            for _ = 1, n do
+                                ev:FireServer("rep")
+                            end
+                        end)
+                    end
+                end
+                State.parallelStats.sent = State.parallelStats.sent + count
+                State.parallelStats.cycles = State.parallelStats.cycles + 1
             end
+        else
+            -- 单线程模式
+            pcall(function()
+                for _ = 1, count do
+                    ev:FireServer("rep")
+                end
+            end)
         end
     end,
 })
@@ -1963,7 +1903,6 @@ registerTask({ id = "netopt", priority = TaskPriority.NETOPT,
     onEnable = function() NetOpt.lastRescan = 0 end,
     onDisable = function() end,
     tick = function()
-        -- 每 30 秒重扫一次，游戏可能会重新生成遥测事件
         if State.time - NetOpt.lastRescan >= 30 then
             pcall(applyNetworkOpt)
         end
@@ -2075,7 +2014,7 @@ local function buildUI()
     local uiScale = create("UIScale", { Scale = 1 }, screen)
     State.ui.mainScale = uiScale
 
-    local WIN_W, WIN_H = 350, 460
+    local WIN_W, WIN_H = 350, 480
     local TITLE_H, TAB_H = 40, 40
 
     local main = create("Frame", {
@@ -2265,7 +2204,7 @@ local function buildUI()
         }, parent)
     end
 
-    -- 锻炼
+    -- 锻炼页
     local trainPage = newPage("TrainPage")
     local trainToggle, fastToggle
     trainToggle = addRowToggle(trainPage, "自动锻炼（固定 10 次/秒）", State.autoTrain, function(v)
@@ -2297,6 +2236,26 @@ local function buildUI()
         State.fastRate = n
         State.degradeLevel = 0
     end)
+
+    -- ★ v20：并行多包
+    addDivider(trainPage, "── 并行多包 ──")
+    addRowToggle(trainPage, "开启并行发包", State.parallelPackets, function(v)
+        State.parallelPackets = v
+        State.parallelStats.sent = 0
+        State.parallelStats.cycles = 0
+        State.parallelStats.lastReport = State.time
+        State.parallelStats._lastRate = 0
+        if v then
+            notify(string.format("并行发包已开启：%d 线", State.parallelThreads), 3)
+        else
+            notify("并行发包已关闭", 2)
+        end
+    end)
+    addInput(trainPage, "并行线程数", State.parallelThreads, 1, 16, function(n)
+        State.parallelThreads = n
+    end)
+    addHint(trainPage, "开启后训练请求会拆分到多个线程并发发送，可能提高高频下的吞吐。并发线程 2~16 之间，越大越猛。")
+
     addDivider(trainPage, "── 防卡顿 ──")
     addRowToggle(trainPage, "快速锻炼卡顿自调节", State.adaptiveEnabled, function(v)
         State.adaptiveEnabled = v
@@ -2310,6 +2269,7 @@ local function buildUI()
     addInput(trainPage, "目标帧率阈值", State.adaptiveThreshold, 10, 120, function(n)
         State.adaptiveThreshold = n
     end)
+
     addDivider(trainPage, "── 工具自动切换 ──")
     local toolPushToggle, toolHandToggle, toolSitToggle
     addRowToggle(trainPage, "自动切换哑铃（兜底）", State.toolDumbbell, function(v) State.toolDumbbell = v end)
@@ -2343,10 +2303,7 @@ local function buildUI()
     State.ui.teleToggle = addRowToggle(telePage, "自动前往肌肉之王", State.autoTeleport, function(v)
         State.autoTeleport = v
     end)
-    addActionButton(telePage, "强制单次传送", function()
-        doTeleport(true)
-    end)
-    addHint(telePage, "使用传送门坐标。强制单次传送会刷新缓存。")
+    addActionButton(telePage, "强制单次传送", function() doTeleport(true) end)
 
     -- 重生
     local rebPage = newPage("RebPage")
@@ -2381,44 +2338,27 @@ local function buildUI()
     }, setPage)
     local function updateNetLabel()
         if NetOpt.mode == 0 then
-            netLabel.Text = "当前模式：关闭"
-            netLabel.TextColor3 = Theme.TextDim
+            netLabel.Text = "当前模式：关闭"; netLabel.TextColor3 = Theme.TextDim
         elseif NetOpt.mode == 1 then
-            netLabel.Text = string.format("当前模式：轻度（已屏蔽 %d）", #NetOpt.blocked)
+            netLabel.Text = string.format("当前模式：轻度（%d）", #NetOpt.blocked)
             netLabel.TextColor3 = Theme.Success
         else
-            netLabel.Text = string.format("当前模式：重度（已屏蔽 %d）", #NetOpt.blocked)
+            netLabel.Text = string.format("当前模式：重度（%d）", #NetOpt.blocked)
             netLabel.TextColor3 = Theme.Warning
         end
     end
-    addActionButton(setPage, "网络优化：关闭", function()
-        setNetOptMode(0)
-        updateNetLabel()
-    end)
-    addActionButton(setPage, "网络优化：轻度", function()
-        setNetOptMode(1)
-        updateNetLabel()
-    end)
-    addActionButton(setPage, "网络优化：重度", function()
-        setNetOptMode(2)
-        updateNetLabel()
-    end)
-    addHint(setPage, "轻度：屏蔽遥测、Analytics、AB测试等无用网络事件。重度：额外 hook 出站遥测请求（需要执行器支持 hookfunction）。")
+    addActionButton(setPage, "网络优化：关闭", function() setNetOptMode(0); updateNetLabel() end)
+    addActionButton(setPage, "网络优化：轻度", function() setNetOptMode(1); updateNetLabel() end)
+    addActionButton(setPage, "网络优化：重度", function() setNetOptMode(2); updateNetLabel() end)
 
     addDivider(setPage, "── 性能 ──")
-    addRowToggle(setPage, "深度防卡顿", State.antiLagEnabled, function(v)
-        State.antiLagEnabled = v
-    end)
-    addRowToggle(setPage, "渲染剔除（远处不显示）", State.renderCullEnabled, function(v)
-        State.renderCullEnabled = v
-    end)
+    addRowToggle(setPage, "深度防卡顿", State.antiLagEnabled, function(v) State.antiLagEnabled = v end)
+    addRowToggle(setPage, "渲染剔除（远处不显示）", State.renderCullEnabled, function(v) State.renderCullEnabled = v end)
     addInput(setPage, "剔除距离（studs）", State.renderCullDist, 100, 5000, function(n)
         State.renderCullDist = n
         pcall(forceRescanRenderCull)
     end)
-    addRowToggle(setPage, "深度移除纹理", State.textureRemoverEnabled, function(v)
-        State.textureRemoverEnabled = v
-    end)
+    addRowToggle(setPage, "深度移除纹理", State.textureRemoverEnabled, function(v) State.textureRemoverEnabled = v end)
 
     addDivider(setPage, "── 隐藏 ──")
     addRowToggle(setPage, "隐藏自己的宠物", State.hideOwnPets, function(v) State.hideOwnPets = v end)
@@ -2438,14 +2378,11 @@ local function buildUI()
 
     addDivider(setPage, "── UI 大小 ──")
     addInput(setPage, "主窗口高度比例(%)", math.floor(State.uiHeightRatio * 100), 20, 90, function(n)
-        State.uiHeightRatio = n / 100
-        updateUIScale()
+        State.uiHeightRatio = n / 100; updateUIScale()
     end)
     addInput(setPage, "信息窗高度比例(%)", math.floor(State.infoHeightRatio * 100), 15, 70, function(n)
-        State.infoHeightRatio = n / 100
-        updateUIScale()
+        State.infoHeightRatio = n / 100; updateUIScale()
     end)
-    addHint(setPage, "长按屏幕左下角复位按钮 3 秒可重置所有位置和大小。")
 
     local function switchTab(id)
         trainPage.Visible = (id == "train")
