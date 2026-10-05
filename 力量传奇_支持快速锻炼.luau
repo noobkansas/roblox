@@ -1,34 +1,12 @@
 --!nonstrict
--- 肌肉之王自动化 v26
---更新内容：修复了91个bug
---by ThxTure & DeepSeek V4.1 Flash
---本项目 @starter:2026/10/5 10:20 last upd：2026/10/5 0:30
---[[
-支持快速锻炼，自动打boss，买水晶，吃蛋送蛋等99.9%的实用功能
-
-核心模块
-
-1. 锻炼自动化
-支持自动锻炼、快速锻炼；快速锻炼依赖 100 只宠物反复执行，可依据帧率自动适配工具切换，兜底最多同时选用 2 种工具，兼容各类器械。
-2. 传送与重生
-传送可循环前往肌肉之王点位，支持全图传送点；提供自动重生、换包重生。
-3. 杀戮战斗系统
-全图自动杀戮，内置力量 / 耐久阈值判断，战力不足时自动停止战斗；支持全体自动击杀，可设置好友白名单；战斗时自动切换训练工具；检测到其他肌肉之王目标可优先击杀，支持自定义触发阈值。
-4. 宠物 & 道具自动化
-自动抽宠、购买宠物；自动转盘、自动拾取 / 投喂弹药，弹药投喂数量自定义。
-5. BOSS 与宝箱
-自动挑战 BOSS，可调节 BOSS 悬停高度；自动开启宝箱，宝箱相关数值可配置。
-6. UI 与信息面板
-UI 尺寸、比例、不透明度均可调节；独立信息小窗，可自定义大小、透明度；实时查看自身与其他玩家信息，数值格式化展示。
-7. 视觉隐藏
-可隐藏自身 / 他人宠物、器械、原生游戏 UI。
-8. 性能优化
-深度防卡顿方案：可关闭粒子、阴影、后处理、音效；远处模型渲染剔除，剔除距离可自定义；支持移除纹理。
-9. 业务逻辑
-内置避让机制；多功能支持交叉运行、互斥锁控制，防止功能冲突，自动化流程稳定可控。]]--
+-- 肌肉之王自动化 v30
+-- v30 修复：
+--  1. 长期运行（5h+）崩溃修复（GC、内存看门狗、清理频率、扫描间隔）
+--  2. Ping 修复（GetNetworkPing + 滑动平均）
+--  保留 v29 所有功能
 
 local SCRIPT_ID   = "__MUSCLE_KING_AUTO__"
-local VERSION     = 2600
+local VERSION     = 3000
 local CONFIG_FILE = "muscle_king_auto_config.json"
 
 do
@@ -38,6 +16,9 @@ do
         if type(existing.cleanup) == "function" then pcall(existing.cleanup) end
     end
 end
+
+-- ★ v30：前向引用，避免 saveConfig 报错
+local _InfoRef = nil
 
 local Players           = game:GetService("Players")
 local RunService        = game:GetService("RunService")
@@ -50,9 +31,28 @@ local SoundService      = game:GetService("SoundService")
 local MarketplaceService= game:GetService("MarketplaceService")
 local VirtualUser       = game:GetService("VirtualUser")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local TeleportService   = game:GetService("TeleportService")
+local Stats             = game:GetService("Stats")
 
+local function waitForGame(timeout)
+    timeout = timeout or 60
+    local start = tick()
+    while tick() - start < timeout do
+        if game:IsLoaded() then
+            local lp = Players.LocalPlayer
+            if lp and lp:FindFirstChild("PlayerGui") then return true end
+        end
+        task.wait(0.5)
+    end
+    return false
+end
+
+if not Players.LocalPlayer then
+    Players.PlayerAdded:Wait()
+end
 local LocalPlayer = Players.LocalPlayer
-local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 60)
+waitForGame(60)
 
 local GetPlayers   = Players.GetPlayers
 local RS_HB        = RunService.Heartbeat
@@ -83,8 +83,6 @@ local E_TxtXL      = Enum.TextXAlignment.Left
 local E_TxtXR      = Enum.TextXAlignment.Right
 local E_CamCustom  = Enum.CameraType.Custom
 
-local isMobile = UIS_Touch and not UIS_Kb
-
 local Theme = {
     Bg         = C3(15, 17, 23),
     Surface    = C3(24, 27, 36),
@@ -105,10 +103,12 @@ local DEFAULT = {
     uiHeightPct = 46,
     mainPos = UD2n(0.5, -260, 0.5, -190),
     infoPos = UD2n(1, -300, 1, -440),
+    infoSize = UD2o(300, 460),
 }
 
 local State = {
     destroyed = false, conns = {}, ui = {},
+    threads = {},
 
     autoTrain = false, fastTrain = false, fastRate = 20,
     toolDumbbell = false, toolPushups = false,
@@ -118,8 +118,11 @@ local State = {
 
     autoTeleport = false, lastTeleportAt = 0, lastCameraFix = 0,
     autoRebirth = false, rebirthRate = 2, lastRebirthAt = 0,
+    rebirthPausedReasons = {},
+    rebirthSavedBySystem = false,
 
     killEnabled = false, killThreshold = 5,
+    killGoodOnly = false, killBadOnly = false,
     killScanAt = 0, killTarget = nil, killLastAttack = 0,
     killSavedState = nil, toolOwnedByKill = false,
     friendWhitelist = false,
@@ -147,17 +150,34 @@ local State = {
 
     autoPetBuy = false, selectedPet = "",
     autoWheel = false,
+
     autoBoss = false, bossHeight = 70,
     autoPackRebirth = false,
     autoEatEgg = false, giftAmount = 0, selectedEggTarget = "",
 
-    -- Boss / 宝箱
     autoChest = true,
     chestDelay = 5,
     chestHoldTime = 2,
     lastBossAliveAt = 0,
     bossWasAlive = false,
     bossKilledAt = 0,
+
+    autoRejoinEnabled = false,
+    rejoinCondition = "any",
+    rejoinEnableMem = true,
+    rejoinEnableFps = true,
+    rejoinEnablePing = true,
+    rejoinServerMode = "same",
+    rejoinPrivateServerId = "",
+    rejoinMemThreshold = 1800,
+    rejoinFpsThreshold = 5,
+    rejoinPingThreshold = 800,
+    rejoinCheckAt = 0,
+    _rejoinTriggered = false,
+
+    savedMainPos = nil,
+    savedInfoPos = nil,
+    savedInfoSize = nil,
 
     petRepBonus = 0, petRepBonusCheckedAt = 0, petRepBonusDetail = {},
     uiWidthPct = DEFAULT.uiWidthPct, uiHeightPct = DEFAULT.uiHeightPct,
@@ -172,13 +192,130 @@ local State = {
     lastStrengthSnapshot = 0, strengthPerSec = 0,
     ping = 0, lastPingCheck = 0,
     friendCount = 0,
+    memMb = 0,
+    _lastBossAlive = false,
+
+    -- ★ v30：长期运行保护
+    startAt = tick(),
+    lastGcAt = 0,
+    lastMemCheckAt = 0,
+    memBaseline = 0,
+    memWarnCount = 0,
+    sessionUptime = 0,
+    peakMem = 0,
+    _notifyCount = 0,
 }
 
-local FriendWhitelist = { ids = {}, loaded = false, refreshing = false, lastRefresh = 0 }
+local function spawnThread(key, fn)
+    if State.threads[key] then
+        pcall(function() task.cancel(State.threads[key]) end)
+    end
+    State.threads[key] = task.spawn(fn)
+    return State.threads[key]
+end
+local function cancelThread(key)
+    if State.threads[key] then
+        pcall(function() task.cancel(State.threads[key]) end)
+        State.threads[key] = nil
+    end
+end
+local function cancelAllThreads()
+    for k in pairs(State.threads) do cancelThread(k) end
+end
+
+-- ★ v30：内存看门狗
+local function runMemoryWatchdog()
+    local now = tick()
+    if now - State.lastMemCheckAt < 30 then return end
+    State.lastMemCheckAt = now
+    local ok, mem = pcall(function() return Stats:GetTotalMemoryUsageMb() end)
+    if not ok or type(mem) ~= "number" then return end
+    State.memMb = math.floor(mem)
+    if State.memMb > State.peakMem then State.peakMem = State.memMb end
+    if State.memBaseline == 0 then State.memBaseline = State.memMb end
+
+    -- 内存增长超过基线 400MB 时触发强制 GC + 清理
+    if State.memMb - State.memBaseline > 400 then
+        State.memWarnCount = State.memWarnCount + 1
+        pcall(function() collectgarbage("collect") end)
+        pcall(sweepOverflow)
+        -- 二次检查
+        task.wait(2)
+        local ok2, mem2 = pcall(function() return Stats:GetTotalMemoryUsageMb() end)
+        if ok2 and type(mem2) == "number" and mem2 > State.memBaseline + 500 then
+            State.memBaseline = math.floor(mem2)
+            if State.memWarnCount % 3 == 0 then
+                pcall(function() collectgarbage("collect") end)
+            end
+        end
+    end
+end
+
+-- ★ v30：定期 GC
+local function runPeriodicGc()
+    local now = tick()
+    if now - State.lastGcAt < 60 then return end
+    State.lastGcAt = now
+    pcall(function() collectgarbage("collect") end)
+end
+
+-- ★ v30：Ping 修复（GetNetworkPing + 滑动平均）
+local pingHistory = {}
+local function readRawPing()
+    -- 优先用 LocalPlayer:GetNetworkPing()（秒，需乘 1000）
+    local ok, v = pcall(function() return LocalPlayer:GetNetworkPing() end)
+    if ok and type(v) == "number" and v > 0 then
+        return v * 1000
+    end
+    -- 回退 Stats
+    local ok2, v2 = pcall(function()
+        return Stats.Network.ServerStatsItem["Data Ping"]:GetValue()
+    end)
+    if ok2 and type(v2) == "number" and v2 > 0 then
+        return v2
+    end
+    return 0
+end
+local function updatePingSmooth()
+    local raw = readRawPing()
+    if raw <= 0 then return State.ping end
+    table.insert(pingHistory, raw)
+    if #pingHistory > 5 then table.remove(pingHistory, 1) end
+    local sum, n = 0, #pingHistory
+    for i = 1, n do sum = sum + pingHistory[i] end
+    if n == 0 then return State.ping end
+    return math.floor(sum / n)
+end
+
+-- 自动重生暂停系统
+local function setRebirthPauseReason(reason, on)
+    local reasons = State.rebirthPausedReasons
+    if on then
+        if reasons[reason] then return end
+        reasons[reason] = true
+        if not State.rebirthSavedBySystem and State.autoRebirth then
+            State.rebirthSavedBySystem = true
+            State.autoRebirth = false
+            if State.ui and State.ui.rebirthToggle then State.ui.rebirthToggle.set(false) end
+        end
+    else
+        if not reasons[reason] then return end
+        reasons[reason] = nil
+        if not next(reasons) and State.rebirthSavedBySystem then
+            State.rebirthSavedBySystem = false
+            State.autoRebirth = true
+            if State.ui and State.ui.rebirthToggle then State.ui.rebirthToggle.set(true) end
+        end
+    end
+end
+
+local FriendWhitelist = { ids = {}, loaded = false, refreshing = false, lastRefresh = 0, lastAttempt = 0 }
 local function refreshFriendList()
     if FriendWhitelist.refreshing then return end
+    if tick() - FriendWhitelist.lastAttempt < 60 then return end
+    FriendWhitelist.lastAttempt = tick()
     FriendWhitelist.refreshing = true
-    task.spawn(function()
+    spawnThread("friendRefresh", function()
         local ids = {}
         pcall(function()
             local pages = LocalPlayer:GetFriendsAsync()
@@ -187,7 +324,7 @@ local function refreshFriendList()
                     if item.Id then ids[item.Id] = true end
                 end
                 if pages.IsFinished then break end
-                pages:AdvanceToNextPageAsync()
+                pcall(function() pages:AdvanceToNextPageAsync() end)
             end
         end)
         pcall(function()
@@ -207,6 +344,41 @@ end
 local function isFriend(plr)
     if not plr or not plr.UserId then return false end
     return FriendWhitelist.ids[plr.UserId] == true
+end
+
+local function getPlayerAlignment(plr)
+    if not plr then return nil end
+    local attrs = {"Alignment", "Karma", "Faction", "Side", "Team"}
+    for _, a in ipairs(attrs) do
+        local v = plr:GetAttribute(a)
+        if type(v) == "string" then
+            local k = v:lower()
+            if k:find("good") or k:find("hero") or k:find("正义") or k:find("好人") then return "good" end
+            if k:find("bad") or k:find("villain") or k:find("evil") or k:find("邪恶") or k:find("坏人") then return "bad" end
+        elseif type(v) == "number" then
+            if v > 0 then return "good" elseif v < 0 then return "bad" end
+        end
+    end
+    local ls = plr:FindFirstChild("leaderstats")
+    if ls then
+        for _, n in ipairs({"Karma", "Alignment", "Good", "Bad", "Goodness", "Badness"}) do
+            local v = ls:FindFirstChild(n)
+            if v and v:IsA("ValueBase") then
+                if n == "Good" and tonumber(v.Value) then
+                    if tonumber(v.Value) > 0 then return "good" end
+                elseif n == "Bad" and tonumber(v.Value) then
+                    if tonumber(v.Value) > 0 then return "bad" end
+                elseif type(v.Value) == "number" then
+                    if v.Value > 0 then return "good" elseif v.Value < 0 then return "bad" end
+                elseif type(v.Value) == "string" then
+                    local k = tostring(v.Value):lower()
+                    if k:find("good") then return "good" end
+                    if k:find("bad") then return "bad" end
+                end
+            end
+        end
+    end
+    return nil
 end
 
 local RepCache = { pet = 0, ult = 0, x2 = false, speedMul = 1, lastRefresh = 0, lastPassCheck = 0 }
@@ -251,9 +423,22 @@ local function listLayout(p, spacing, h)
     }, p)
 end
 
+-- ★ v30：notify 加数量上限
+local activeNotifies = {}
 local function notify(text, duration)
     duration = duration or 3
     if State.destroyed or not State.ui.screen then return end
+    -- 清理已销毁的引用
+    for i = #activeNotifies, 1, -1 do
+        if not activeNotifies[i] or not activeNotifies[i].Parent then
+            table.remove(activeNotifies, i)
+        end
+    end
+    -- 上限：同时最多 5 个，超了移除最旧的
+    if #activeNotifies >= 5 then
+        local old = table.remove(activeNotifies, 1)
+        if old then pcall(function() old:Destroy() end) end
+    end
     local label = create("TextLabel", {
         AnchorPoint = V2n(0.5, 0), Position = UD2n(0.5, 0, 0.04, 0),
         Size = UD2o(420, 42), BackgroundColor3 = Theme.Surface,
@@ -262,6 +447,7 @@ local function notify(text, duration)
         TextSize = 14, TextWrapped = true, ZIndex = 500,
     }, State.ui.screen)
     corner(label, 10); stroke(label, Theme.Accent, 1.5, 0.3)
+    table.insert(activeNotifies, label)
     task.delay(duration, function() pcall(function() label:Destroy() end) end)
 end
 
@@ -278,17 +464,51 @@ local function formatNumber(n)
     return (neg and "-" or "") .. string.format("%.3f%s", n, SUFFIXES[idx])
 end
 
+local function serializePos(pos)
+    if not pos then return nil end
+    return { xs = pos.X.Scale, xo = pos.X.Offset, ys = pos.Y.Scale, yo = pos.Y.Offset }
+end
+local function deserializePos(t, fallback)
+    if type(t) ~= "table" then return fallback end
+    return UD2n(t.xs or 0, t.xo or 0, t.ys or 0, t.yo or 0)
+end
+local function serializeSize(size)
+    if not size then return nil end
+    return { xo = size.X.Offset, yo = size.Y.Offset, xs = size.X.Scale, ys = size.Y.Scale }
+end
+local function deserializeSize(t, fallback)
+    if type(t) ~= "table" then return fallback end
+    return UD2n(t.xs or 0, t.xo or 0, t.ys or 0, t.yo or 0)
+end
+
+-- ★ v30：saveConfig 用 _InfoRef + pcall
 local function saveConfig()
     if State.destroyed or type(writefile) ~= "function" then return end
+    pcall(function()
+        if State.ui and State.ui.main then
+            State.savedMainPos = serializePos(State.ui.main.Position)
+        end
+        local inf = _InfoRef
+        if type(inf) == "table" and inf.frames and inf.frames.frame then
+            State.savedInfoPos = serializePos(inf.frames.frame.Position)
+            State.savedInfoSize = serializeSize(inf.frames.frame.Size)
+        end
+    end)
     local data = {
         autoTrain = State.autoTrain, fastTrain = State.fastTrain, fastRate = State.fastRate,
         toolDumbbell = State.toolDumbbell, toolPushups = State.toolPushups,
         toolHandstands = State.toolHandstands, toolSitups = State.toolSitups,
+        adaptiveEnabled = State.adaptiveEnabled, adaptiveThreshold = State.adaptiveThreshold,
         autoRebirth = State.autoRebirth, rebirthRate = State.rebirthRate,
+        autoPackRebirth = State.autoPackRebirth,
+        autoEatEgg = State.autoEatEgg, giftAmount = State.giftAmount,
+        selectedEggTarget = State.selectedEggTarget,
+        autoTeleport = State.autoTeleport,
+        killEnabled = State.killEnabled,
         killThreshold = State.killThreshold, dualEnabled = State.dualEnabled,
+        killGoodOnly = State.killGoodOnly, killBadOnly = State.killBadOnly,
         friendWhitelist = State.friendWhitelist,
         autoKingKill = State.autoKingKill, kingKillThreshold = State.kingKillThreshold,
-        adaptiveEnabled = State.adaptiveEnabled, adaptiveThreshold = State.adaptiveThreshold,
         antiLagEnabled = State.antiLagEnabled,
         renderCullEnabled = State.renderCullEnabled, renderCullDist = State.renderCullDist,
         hideOwnPets = State.hideOwnPets, hideAllPets = State.hideAllPets, hideMachines = State.hideMachines,
@@ -298,14 +518,27 @@ local function saveConfig()
         formatEnabled = State.formatEnabled,
         uiBgOpacity = State.uiBgOpacity, uiPageOpacity = State.uiPageOpacity,
         infoBgOpacity = State.infoBgOpacity, infoScale = State.infoScale,
-        autoChest = State.autoChest, chestDelay = State.chestDelay, chestHoldTime = State.chestHoldTime,
-        selectedPet = State.selectedPet, bossHeight = State.bossHeight,
-        giftAmount = State.giftAmount,
         uiWidthPct = State.uiWidthPct, uiHeightPct = State.uiHeightPct,
+        savedMainPos = State.savedMainPos,
+        savedInfoPos = State.savedInfoPos,
+        savedInfoSize = State.savedInfoSize,
+        autoBoss = State.autoBoss, bossHeight = State.bossHeight,
+        autoChest = State.autoChest, chestDelay = State.chestDelay, chestHoldTime = State.chestHoldTime,
+        autoRejoinEnabled = State.autoRejoinEnabled,
+        rejoinCondition = State.rejoinCondition,
+        rejoinEnableMem = State.rejoinEnableMem,
+        rejoinEnableFps = State.rejoinEnableFps,
+        rejoinEnablePing = State.rejoinEnablePing,
+        rejoinServerMode = State.rejoinServerMode,
+        rejoinPrivateServerId = State.rejoinPrivateServerId,
+        rejoinMemThreshold = State.rejoinMemThreshold,
+        rejoinFpsThreshold = State.rejoinFpsThreshold,
+        rejoinPingThreshold = State.rejoinPingThreshold,
     }
     local ok, enc = pcall(HttpService.JSONEncode, HttpService, data)
     if ok and enc then pcall(writefile, CONFIG_FILE, enc) end
 end
+
 local function loadConfig()
     if type(isfile) ~= "function" or type(readfile) ~= "function" then return end
     local exists = false
@@ -329,6 +562,8 @@ local function loadConfig()
         if hi then v = math.min(hi, v) end
         return v
     end
+    local function s(k, f) if type(data[k]) == "string" then return data[k] end return f end
+
     State.autoTrain = b("autoTrain", State.autoTrain)
     State.fastTrain = b("fastTrain", State.fastTrain)
     State.fastRate = n("fastRate", State.fastRate, 1, 50000)
@@ -336,15 +571,23 @@ local function loadConfig()
     State.toolPushups = b("toolPushups", State.toolPushups)
     State.toolHandstands = b("toolHandstands", State.toolHandstands)
     State.toolSitups = b("toolSitups", State.toolSitups)
+    State.adaptiveEnabled = b("adaptiveEnabled", State.adaptiveEnabled)
+    State.adaptiveThreshold = n("adaptiveThreshold", State.adaptiveThreshold, 10, 120)
     State.autoRebirth = b("autoRebirth", State.autoRebirth)
     State.rebirthRate = n("rebirthRate", State.rebirthRate, 1, 100)
+    State.autoPackRebirth = b("autoPackRebirth", State.autoPackRebirth)
+    State.autoEatEgg = b("autoEatEgg", State.autoEatEgg)
+    State.giftAmount = n("giftAmount", State.giftAmount, 0, 9999)
+    State.selectedEggTarget = s("selectedEggTarget", State.selectedEggTarget)
+    State.autoTeleport = b("autoTeleport", State.autoTeleport)
+    State.killEnabled = b("killEnabled", State.killEnabled)
     State.killThreshold = n("killThreshold", State.killThreshold, 1, 100)
     State.dualEnabled = b("dualEnabled", State.dualEnabled)
+    State.killGoodOnly = b("killGoodOnly", State.killGoodOnly)
+    State.killBadOnly = b("killBadOnly", State.killBadOnly)
     State.friendWhitelist = b("friendWhitelist", State.friendWhitelist)
     State.autoKingKill = b("autoKingKill", State.autoKingKill)
     State.kingKillThreshold = n("kingKillThreshold", State.kingKillThreshold, 1, 1000)
-    State.adaptiveEnabled = b("adaptiveEnabled", State.adaptiveEnabled)
-    State.adaptiveThreshold = n("adaptiveThreshold", State.adaptiveThreshold, 10, 120)
     State.antiLagEnabled = b("antiLagEnabled", State.antiLagEnabled)
     State.renderCullEnabled = b("renderCullEnabled", State.renderCullEnabled)
     State.renderCullDist = n("renderCullDist", State.renderCullDist, 100, 5000)
@@ -359,14 +602,26 @@ local function loadConfig()
     State.uiPageOpacity = fl("uiPageOpacity", State.uiPageOpacity, 0.3, 1.0)
     State.infoBgOpacity = fl("infoBgOpacity", State.infoBgOpacity, 0.3, 1.0)
     State.infoScale = n("infoScale", State.infoScale, 60, 200)
+    State.uiWidthPct = n("uiWidthPct", State.uiWidthPct, 30, 90)
+    State.uiHeightPct = n("uiHeightPct", State.uiHeightPct, 30, 90)
+    if type(data.savedMainPos) == "table" then State.savedMainPos = data.savedMainPos end
+    if type(data.savedInfoPos) == "table" then State.savedInfoPos = data.savedInfoPos end
+    if type(data.savedInfoSize) == "table" then State.savedInfoSize = data.savedInfoSize end
+    State.autoBoss = b("autoBoss", State.autoBoss)
+    State.bossHeight = n("bossHeight", State.bossHeight, 0, 200)
     State.autoChest = b("autoChest", State.autoChest)
     State.chestDelay = n("chestDelay", State.chestDelay, 0, 30)
     State.chestHoldTime = n("chestHoldTime", State.chestHoldTime, 1, 10)
-    if type(data.selectedPet) == "string" then State.selectedPet = data.selectedPet end
-    State.bossHeight = n("bossHeight", State.bossHeight, 0, 200)
-    State.giftAmount = n("giftAmount", State.giftAmount, 0, 9999)
-    State.uiWidthPct = n("uiWidthPct", State.uiWidthPct, 30, 90)
-    State.uiHeightPct = n("uiHeightPct", State.uiHeightPct, 30, 90)
+    State.autoRejoinEnabled = b("autoRejoinEnabled", State.autoRejoinEnabled)
+    State.rejoinCondition = s("rejoinCondition", State.rejoinCondition)
+    State.rejoinEnableMem = b("rejoinEnableMem", State.rejoinEnableMem)
+    State.rejoinEnableFps = b("rejoinEnableFps", State.rejoinEnableFps)
+    State.rejoinEnablePing = b("rejoinEnablePing", State.rejoinEnablePing)
+    State.rejoinServerMode = s("rejoinServerMode", State.rejoinServerMode)
+    State.rejoinPrivateServerId = s("rejoinPrivateServerId", State.rejoinPrivateServerId)
+    State.rejoinMemThreshold = n("rejoinMemThreshold", State.rejoinMemThreshold, 500, 100000)
+    State.rejoinFpsThreshold = n("rejoinFpsThreshold", State.rejoinFpsThreshold, 1, 60)
+    State.rejoinPingThreshold = n("rejoinPingThreshold", State.rejoinPingThreshold, 100, 5000)
 end
 
 -- 反复速度
@@ -465,12 +720,12 @@ local function enableAntiLag()
     AntiLag.enabled = true
     AntiLag.lighting = { GlobalShadows = Lighting.GlobalShadows, ShadowSoftness = Lighting.ShadowSoftness }
     pcall(function() Lighting.GlobalShadows = false; Lighting.ShadowSoftness = 0 end)
-    scanAntiLag(); AntiLag.rescanAt = State.time + 2
+    scanAntiLag(); AntiLag.rescanAt = tick() + 4  -- ★ v30：2→4 秒
 end
 local function rescanAntiLag()
     if not AntiLag.enabled then return end
     pcall(function() Lighting.GlobalShadows = false; Lighting.ShadowSoftness = 0 end)
-    scanAntiLag(); AntiLag.rescanAt = State.time + 2
+    scanAntiLag(); AntiLag.rescanAt = tick() + 4
 end
 local function disableAntiLag()
     AntiLag.enabled = false
@@ -532,7 +787,7 @@ local function scanRenderCull()
         end
     end
     for m in pairs(RenderCull.hidden) do if not m.Parent then RenderCull.hidden[m] = nil end end
-    RenderCull.rescanAt = State.time + 1
+    RenderCull.rescanAt = tick() + 2  -- ★ v30：1→2 秒
 end
 local function disableRenderCull()
     for m in pairs(RenderCull.hidden) do uncullModel(m) end
@@ -577,7 +832,7 @@ local function scanHidePets()
             end
         end
     end
-    PetHider.rescanAt = State.time + 2
+    PetHider.rescanAt = tick() + 2
 end
 local function restoreHiddenPets()
     for _, m in ipairs(PetHider.own) do showPart(m) end
@@ -593,7 +848,7 @@ local function scanHideMachines()
             if m:IsA("Model") then table.insert(PetHider.machines, m); hidePart(m) end
         end
     end
-    PetHider.rescanAt = State.time + 2
+    PetHider.rescanAt = tick() + 2
 end
 local function restoreHiddenMachines()
     for _, m in ipairs(PetHider.machines) do showPart(m) end
@@ -629,11 +884,11 @@ end
 local function enableTex()
     if TexRem.enabled then return end
     TexRem.enabled = true; table.clear(TexRem.saved); table.clear(TexRem.seen)
-    scanTextures(); TexRem.rescanAt = State.time + 4
+    scanTextures(); TexRem.rescanAt = tick() + 4
 end
 local function rescanTex()
     if not TexRem.enabled then return end
-    scanTextures(); TexRem.rescanAt = State.time + 4
+    scanTextures(); TexRem.rescanAt = tick() + 4
 end
 local function disableTex()
     TexRem.enabled = false
@@ -668,6 +923,12 @@ local function sweepOverflow()
     for i = #PetHider.all, 1, -1 do if not PetHider.all[i].Parent then table.remove(PetHider.all, i) end end
     for i = #PetHider.machines, 1, -1 do if not PetHider.machines[i].Parent then table.remove(PetHider.machines, i) end end
     for i = #HiddenUIs, 1, -1 do if not HiddenUIs[i].Parent then table.remove(HiddenUIs, i) end end
+    -- ★ v30：清理 notify 列表
+    for i = #activeNotifies, 1, -1 do
+        if not activeNotifies[i] or not activeNotifies[i].Parent then table.remove(activeNotifies, i) end
+    end
+    -- ★ v30：清理 ping 历史，避免长期累积
+    while #pingHistory > 10 do table.remove(pingHistory, 1) end
 end
 
 -- 工具
@@ -748,8 +1009,8 @@ end
 local function getRebirthEvent()
     local c = State.rebirthEventRef
     if c and c.Parent then return c end
-    if State.time - State.lastRebirthScan < 3 then return nil end
-    State.lastRebirthScan = State.time
+    if tick() - State.lastRebirthScan < 3 then return nil end
+    State.lastRebirthScan = tick()
     local r = ReplicatedStorage:FindFirstChild("rEvents")
     if r then
         local ev = r:FindFirstChild("rebirthRemote")
@@ -791,10 +1052,10 @@ end
 -- 传送
 local PortalCache, PortalCacheAt = nil, 0
 local function getPortal()
-    if PortalCache and PortalCache.Parent and State.time - PortalCacheAt < 5 then return PortalCache end
+    if PortalCache and PortalCache.Parent and tick() - PortalCacheAt < 5 then return PortalCache end
     local p = Workspace:FindFirstChild("beachToMuscleKing", true)
     PortalCache = (p and p:IsA("BasePart")) and p or nil
-    PortalCacheAt = State.time
+    PortalCacheAt = tick()
     return PortalCache
 end
 local function teleportMuscleKing(force)
@@ -865,10 +1126,6 @@ local function punch()
     if tool then pcall(function() tool:Activate() end) end
 end
 
--- ★ v26：判断目标是否安全（对方不能在我打死他前先打死我）
--- 我打死对方所需攻击次数 = theirDur / myStr
--- 对方打死我所需攻击次数 = myDur / theirStr
--- 如果我的攻击次数 >= 对方的攻击次数 → 对方先打死我 → 不安全
 local function isTargetSafe(plr, myStr, myDur)
     if myDur <= 0 or myStr <= 0 then return true end
     local theirStr = stat(plr, "Strength")
@@ -879,6 +1136,17 @@ local function isTargetSafe(plr, myStr, myDur)
     return myHits < theirHits
 end
 
+local function passAlignmentFilter(plr)
+    local onlyGood = State.killGoodOnly
+    local onlyBad = State.killBadOnly
+    if onlyGood == onlyBad then return true end
+    local align = getPlayerAlignment(plr)
+    if not align then return true end
+    if onlyGood then return align == "good" end
+    if onlyBad then return align == "bad" end
+    return true
+end
+
 local function selectKillTarget()
     local s = myStrength()
     local myDur = myDurability()
@@ -887,12 +1155,12 @@ local function selectKillTarget()
         if plr ~= LocalPlayer and not (State.friendWhitelist and isFriend(plr)) then
             local hrp = getCharHRP(plr)
             if hrp then
-                local dur = stat(plr, "Durability")
-                -- 检查1：我能否打死对方（原逻辑）
-                local canKill = (dur == 0) or (s > 0 and s * t >= dur)
-                -- 检查2：★ 对方能否先把我打死
-                if canKill and isTargetSafe(plr, s, myDur) then
-                    return plr
+                if passAlignmentFilter(plr) then
+                    local dur = stat(plr, "Durability")
+                    local canKill = (dur == 0) or (s > 0 and s * t >= dur)
+                    if canKill and isTargetSafe(plr, s, myDur) then
+                        return plr
+                    end
                 end
             end
         end
@@ -901,9 +1169,12 @@ local function selectKillTarget()
 end
 
 local function runKillTick()
-    if State.time - State.killScanAt >= 0.5 then
-        State.killScanAt = State.time
+    if tick() - State.killScanAt >= 0.5 then
+        State.killScanAt = tick()
         if State.killTarget and State.friendWhitelist and isFriend(State.killTarget) then
+            State.killTarget = nil
+        end
+        if State.killTarget and not passAlignmentFilter(State.killTarget) then
             State.killTarget = nil
         end
         local valid = State.killTarget and getCharHRP(State.killTarget)
@@ -913,7 +1184,6 @@ local function runKillTick()
             local s = myStrength()
             local myDur = myDurability()
             local dur = stat(State.killTarget, "Durability")
-            -- 目标耐久太高 或 对方能反杀 → 换目标
             local failKill = dur > 0 and s > 0 and s * (State.killThreshold or 5) < dur
             local failSafe = not isTargetSafe(State.killTarget, s, myDur)
             if failKill or failSafe then
@@ -927,18 +1197,17 @@ local function runKillTick()
     applyKillMove(hrp)
     local dual = State.dualEnabled and (State.autoTrain or State.fastTrain)
     if not dual then
-        if State.time - State.killLastAttack >= 0.05 then
-            State.killLastAttack = State.time
+        if tick() - State.killLastAttack >= 0.05 then
+            State.killLastAttack = tick()
             if not isEquipped(TOOL_KW.punch) then tryEquip(TOOL_KW.punch) end
             punch()
         end
     end
 end
 
--- ★ v26：肌肉之王 —— 加入反杀判定
 local function runKingKillTick()
-    if State.time - State.lastKingCheck >= 0.5 then
-        State.lastKingCheck = State.time
+    if tick() - State.lastKingCheck >= 0.5 then
+        State.lastKingCheck = tick()
         local king = getMuscleKing()
         if not king or king == LocalPlayer or (State.friendWhitelist and isFriend(king)) then
             State.kingKillTarget = nil; State.kingKillActive = false; return
@@ -948,12 +1217,9 @@ local function runKingKillTick()
         local s = myStrength()
         local myDur = myDurability()
         local theirDur = stat(king, "Durability")
-        local theirStr = stat(king, "Strength")
-        -- 检查1：我能否打死对方（原逻辑）
         if theirDur > 0 and s > 0 and theirDur >= s * (State.kingKillThreshold or 20) then
             State.kingKillTarget = nil; State.kingKillActive = false; return
         end
-        -- 检查2：★ 对方能否先把我打死
         if not isTargetSafe(king, s, myDur) then
             State.kingKillTarget = nil; State.kingKillActive = false; return
         end
@@ -967,8 +1233,8 @@ local function runKingKillTick()
     if not hrp then State.kingKillTarget = nil; State.kingKillActive = false; return end
     State.kingKillActive = true
     applyKillMove(hrp)
-    if State.time - State.kingKillLastAttack >= 0.05 then
-        State.kingKillLastAttack = State.time
+    if tick() - State.kingKillLastAttack >= 0.05 then
+        State.kingKillLastAttack = tick()
         if not isEquipped(TOOL_KW.punch) then tryEquip(TOOL_KW.punch) end
         punch()
     end
@@ -985,8 +1251,12 @@ local function updateDualTool()
     if not State.dualEnabled or not State.killEnabled or not State.killTarget then return end
     if not (State.autoTrain or State.fastTrain) then return end
     local hum = Cache.hum; if not hum then return end
-    if State.time - State.dualLastSwitch < 0.06 then return end
-    State.dualLastSwitch = State.time
+    local switchInterval = 0.06
+    if State.autoBoss and isAnyBossAlive() then
+        switchInterval = 0.4
+    end
+    if tick() - State.dualLastSwitch < switchInterval then return end
+    State.dualLastSwitch = tick()
     if State.dualCurrentMode == "punch" then
         local t = findPreferredTool()
         if t then
@@ -1068,10 +1338,8 @@ end
 
 -- Boss + 宝箱
 local BOSS_NAMES = { "Boss1", "Boss2", "Boss3", "Boss4", "Boss5" }
-local BOSS_IDLE_POS = V3n(1, 44, -1251)
 local PUNCH_ANIMS = { left = "rbxassetid://3638729053", right = "rbxassetid://3638767427" }
 local bossHoverConn = nil
-local bossPunchThread, bossScanThread
 local bossCurrent = "Boss1"
 local _bossAliveCache, _bossAliveCacheAt = false, 0
 
@@ -1090,8 +1358,8 @@ local function isBossAlive(name)
     return b:IsA("BasePart") and b.Transparency < 1
 end
 local function isAnyBossAlive()
-    if State.time - _bossAliveCacheAt < 0.5 then return _bossAliveCache end
-    _bossAliveCacheAt = State.time
+    if tick() - _bossAliveCacheAt < 0.5 then return _bossAliveCache end
+    _bossAliveCacheAt = tick()
     for _, n in ipairs(BOSS_NAMES) do
         if isBossAlive(n) then _bossAliveCache = true; return true end
     end
@@ -1111,6 +1379,7 @@ local function destroyPortals()
     end)
 end
 local function startBossHover()
+    if bossHoverConn then pcall(function() bossHoverConn:Disconnect() end) end
     bossHoverConn = RS_RS:Connect(function()
         if not State.autoBoss then return end
         if not isAnyBossAlive() then return end
@@ -1127,7 +1396,7 @@ end
 local function bossPunchLoop()
     local useLeft, trackL, trackR = true, nil, nil
     local counter = 0
-    while State.autoBoss do
+    while State.autoBoss and not State.destroyed do
         if isAnyBossAlive() and getBossPos() then
             counter = counter + 1
             if counter % 4 == 0 then
@@ -1165,39 +1434,26 @@ local function bossPunchLoop()
     end
 end
 local function bossScanLoop()
-    while State.autoBoss do
+    while State.autoBoss and not State.destroyed do
         task.wait(2)
-        if State.autoBoss then
-            local found = false
+        if State.autoBoss and not State.destroyed then
             for _, n in ipairs(BOSS_NAMES) do
                 if isBossAlive(n) then
-                    found = true
                     if n ~= bossCurrent then bossCurrent = n end
                     break
                 end
-            end
-            if not found and not State.bossWasAlive then
-                -- 什么都不做
             end
         end
     end
 end
 
 local chestTaskActive = false
-local chestTaskAt = 0
 local function isChestVisible()
-    local chest = Workspace:FindFirstChild("BossChest")
-    if not chest then return nil end
-    for _, obj in ipairs(chest:GetDescendants()) do
-        if obj:IsA("BasePart") and obj.Transparency < 0.95 and obj.CanTouch ~= false then
-            return chest, obj
-        end
-    end
     for _, name in ipairs({"BossChest", "Chest", "RewardChest"}) do
         local c = Workspace:FindFirstChild(name)
         if c then
             for _, obj in ipairs(c:GetDescendants()) do
-                if obj:IsA("BasePart") and obj.Transparency < 0.95 then
+                if obj:IsA("BasePart") and obj.Transparency < 0.95 and obj.CanTouch ~= false then
                     return c, obj
                 end
             end
@@ -1213,10 +1469,10 @@ local function runChestTask()
         return
     end
     if State.bossWasAlive and State.bossKilledAt == 0 then
-        State.bossKilledAt = State.time
+        State.bossKilledAt = tick()
         State.bossWasAlive = false
     end
-    if State.bossKilledAt == 0 or State.time - State.bossKilledAt < State.chestDelay then return end
+    if State.bossKilledAt == 0 or tick() - State.bossKilledAt < State.chestDelay then return end
     local chestModel, chestPart = isChestVisible()
     if not chestModel or not chestPart then return end
 
@@ -1251,7 +1507,7 @@ local function runChestTask()
     end
 end
 
--- 换包重生 / 吃蛋 / 送蛋
+-- 宠物数据
 local PETS_DATA = {
     ["Omega Overlord"] = { repSpeed = 20 },
     ["Swift Samurai"]  = { repSpeed = 15 },
@@ -1333,7 +1589,6 @@ local function equipRebirthPets()
     end
 end
 
--- ★ v26：换包重生不再使用 trainRate，统一用 fastRate
 local function performPackRebirth()
     local ev = getMuscleEvent(); if not ev then return end
     local ls = LocalPlayer:FindFirstChild("leaderstats")
@@ -1341,9 +1596,8 @@ local function performPackRebirth()
     local rebStat = ls and ls:FindFirstChild("Rebirths")
     if not (strStat and rebStat) then return end
     local target = 5000 + rebStat.Value * 2550
-    while strStat.Value < target and State.autoPackRebirth do
+    while strStat.Value < target and State.autoPackRebirth and not State.destroyed do
         pcall(function()
-            -- 与快速锻炼频率保持一致
             local burst = math.clamp(math.floor(State.fastRate / 10), 5, 50)
             for _ = 1, burst do ev:FireServer("rep") end
         end)
@@ -1360,7 +1614,7 @@ local function performPackRebirth()
     until rebStat.Value > before or tries > 20
 end
 local function packRebirthLoop()
-    while State.autoPackRebirth do
+    while State.autoPackRebirth and not State.destroyed do
         equipFarmingPets()
         performPackRebirth()
         task.wait(0.5)
@@ -1374,7 +1628,7 @@ local function findProteinEgg()
 end
 local function eatEggLoop()
     local ev = getMuscleEvent()
-    while State.autoEatEgg do
+    while State.autoEatEgg and not State.destroyed do
         pcall(function()
             local egg = findProteinEgg()
             if egg and ev then
@@ -1384,6 +1638,7 @@ local function eatEggLoop()
         task.wait(0.5)
     end
 end
+
 local function giftEggsTo(target, amount)
     local r = ReplicatedStorage:FindFirstChild("rEvents")
     local giftRemote = r and r:FindFirstChild("giftRemote")
@@ -1392,8 +1647,12 @@ local function giftEggsTo(target, amount)
     local sent = 0
     for _ = 1, amount do
         local egg = folder:FindFirstChild("Protein Egg")
-        if not egg then break end
-        local ok = pcall(function() giftRemote:InvokeServer("giftRequest", target, egg) end)
+        if not egg or not egg.Parent then break end
+        local ok = pcall(function()
+            if egg.Parent and target.Parent then
+                giftRemote:InvokeServer("giftRequest", target, egg)
+            end
+        end)
         if ok then sent = sent + 1 end
         task.wait(0.1)
     end
@@ -1402,19 +1661,18 @@ end
 
 -- 自适应
 local function cleanupTrainingState()
-    State.trainAccum = 0; State.degradeLevel = 0
-    State.fpsWinTime = 0; State.fpsWinFrames = 0
+    State.trainAccum = 0
     State.adaptiveStableCount = 0; State.adaptiveStep = 100
 end
 local function runAdaptive()
     if not State.adaptiveEnabled or not State.fastTrain then return end
-    if State.time - State.lastAdaptiveAt < 1 then return end
-    State.lastAdaptiveAt = State.time
+    if tick() - State.lastAdaptiveAt < 1 then return end
+    State.lastAdaptiveAt = tick()
     local fps = State.avgFps
     local th = State.adaptiveThreshold or 30
     if fps < th then
         local r = fps / th
-        local new = math.max(1, math.floor(State.fastRate * (r < 0.4 and 0.4 or r < 0.7 and 0.7 or 0.9)))
+        local new = math.max(10, math.floor(State.fastRate * (r < 0.4 and 0.4 or r < 0.7 and 0.7 or 0.9)))
         if new ~= State.fastRate then
             State.fastRate = new; State.adaptiveStep = 100; State.adaptiveStableCount = 0
             if State.ui.rateBox then State.ui.rateBox.Text = tostring(new) end
@@ -1431,54 +1689,195 @@ local function runAdaptive()
         else State.adaptiveStableCount = 0 end
     end
 end
-local function handleDegradation()
-    if State.time - State.lastDegradeAt < 3 then return end
-    State.lastDegradeAt = State.time
-    if State.degradeLevel == 0 then
-        State.degradeLevel = 1; State.fastRate = 500
-        if State.ui.rateBox then State.ui.rateBox.Text = "500" end
-        notify("卡顿已降至 500 次/秒", 3)
-    elseif State.degradeLevel == 1 then
-        State.degradeLevel = 2; State.fastRate = 100
-        if State.ui.rateBox then State.ui.rateBox.Text = "100" end
-        notify("仍卡顿，降至 100 次/秒", 3)
-    elseif State.degradeLevel == 2 then
-        State.degradeLevel = 3; State.fastTrain = false; State.autoTrain = false
-        if State.ui.fastToggle then State.ui.fastToggle.set(false) end
-        if State.ui.trainToggle then State.ui.trainToggle.set(false) end
-        cleanupTrainingState()
-        notify("设备太弱，已关闭锻炼", 6)
+
+-- ★ v30：长期运行保护（5h+ 后自动降速并清理）
+local function longRunProtection()
+    local uptime = tick() - State.startAt
+    State.sessionUptime = uptime
+    -- 超过 4 小时：如果 fastRate 过高，强制降速到安全值
+    if uptime > 4 * 3600 and State.fastTrain and State.fastRate > 2000 then
+        State.fastRate = 2000
+        if State.ui.rateBox then State.ui.rateBox.Text = "2000" end
+    end
+    -- 超过 5 小时：触发一次深度清理 + GC
+    if uptime > 5 * 3600 and not State._didDeepClean then
+        State._didDeepClean = true
+        pcall(sweepOverflow)
+        pcall(function() collectgarbage("collect") end)
+        -- 重置计时，避免反复触发
+        State.startAt = tick()
+    end
+end
+
+-- 自动重进
+local function getMemoryMb()
+    local ok, v = pcall(function() return Stats:GetTotalMemoryUsageMb() end)
+    if ok and type(v) == "number" then return math.floor(v) end
+    return 0
+end
+
+local function getHttpFn()
+    if syn and syn.request then return syn.request end
+    if http and http.request then return http.request end
+    if request then return request end
+    if http_request then return http_request end
+    if fluxus and fluxus.request then return fluxus.request end
+    return nil
+end
+
+local function fetchServers(sortOrder)
+    local httpFn = getHttpFn()
+    if not httpFn then return nil, "无 HTTP 请求函数" end
+    local url = string.format(
+        "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=%s&limit=100",
+        game.PlaceId, sortOrder
+    )
+    local ok, resp = pcall(httpFn, { Url = url, Method = "GET" })
+    if not ok or not resp then return nil, "请求失败" end
+    local body = resp.Body or resp.body
+    if not body then return nil, "无响应体" end
+    local ok2, data = pcall(HttpService.JSONDecode, HttpService, body)
+    if not ok2 or type(data) ~= "table" or not data.data then return nil, "解析失败" end
+    local result = {}
+    for _, srv in ipairs(data.data) do
+        if srv.id and srv.id ~= game.JobId then
+            local playing = tonumber(srv.playing) or 0
+            local maxP = tonumber(srv.maxPlayers) or 0
+            if playing < maxP then
+                table.insert(result, { id = srv.id, playing = playing, maxPlayers = maxP })
+            end
+        end
+    end
+    return result
+end
+
+local function parsePrivateServerCode(input)
+    if not input or input == "" then return nil end
+    local code = input:match("privateServerLinkCode=([%w%-_]+)")
+    if code then return code end
+    if input:match("^[%w%-_]+$") then return input end
+    return nil
+end
+
+local function rejoinGame(reason)
+    if State._rejoinTriggered then return end
+    State._rejoinTriggered = true
+    notify("【自动重进】" .. (reason or "") .. " 即将重进，请确保执行器已开启「自动执行」！", 8)
+    task.wait(3)
+
+    local mode = State.rejoinServerMode or "same"
+    local ok = false
+
+    if mode == "private" then
+        local code = parsePrivateServerCode(State.rejoinPrivateServerId)
+        if code then
+            ok = pcall(function()
+                TeleportService:TeleportToPrivateServer(game.PlaceId, code, {LocalPlayer})
+            end)
+        end
+        if not ok then
+            notify("私服 code 无效，回退到同服务器", 4)
+            pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+            end)
+        end
+    elseif mode == "crowded" then
+        local servers = fetchServers("Desc")
+        if servers and #servers > 0 then
+            local target = servers[1]
+            ok = pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, target.id, LocalPlayer)
+            end)
+        end
+        if not ok then
+            notify("获取人多的服务器失败，回退", 4)
+            pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+        end
+    elseif mode == "sparse" then
+        local servers = fetchServers("Asc")
+        if servers and #servers > 0 then
+            local target = servers[1]
+            ok = pcall(function()
+                TeleportService:TeleportToPlaceInstance(game.PlaceId, target.id, LocalPlayer)
+            end)
+        end
+        if not ok then
+            notify("获取人少的服务器失败，回退", 4)
+            pcall(function() TeleportService:Teleport(game.PlaceId, LocalPlayer) end)
+        end
+    else
+        pcall(function()
+            TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+        end)
+    end
+
+    task.wait(5)
+    pcall(function()
+        LocalPlayer:Kick("AutoRejoin: 请开启执行器自动执行以恢复脚本")
+    end)
+end
+
+local function checkRejoin()
+    if not State.autoRejoinEnabled or State._rejoinTriggered then return end
+    if tick() - State.rejoinCheckAt < 3 then return end
+    State.rejoinCheckAt = tick()
+
+    State.memMb = getMemoryMb()
+
+    local enabledCount = 0
+    local triggeredCount = 0
+    local triggers = {}
+
+    if State.rejoinEnableFps then
+        enabledCount = enabledCount + 1
+        if State.avgFps > 0 and State.avgFps < State.rejoinFpsThreshold then
+            triggeredCount = triggeredCount + 1
+            table.insert(triggers, string.format("帧率 %.1f<%d", State.avgFps, State.rejoinFpsThreshold))
+        end
+    end
+    if State.rejoinEnablePing then
+        enabledCount = enabledCount + 1
+        if State.ping > 0 and State.ping > State.rejoinPingThreshold then
+            triggeredCount = triggeredCount + 1
+            table.insert(triggers, string.format("延迟 %d>%d", State.ping, State.rejoinPingThreshold))
+        end
+    end
+    if State.rejoinEnableMem then
+        enabledCount = enabledCount + 1
+        if State.memMb > 0 and State.memMb > State.rejoinMemThreshold then
+            triggeredCount = triggeredCount + 1
+            table.insert(triggers, string.format("内存 %d>%d", State.memMb, State.rejoinMemThreshold))
+        end
+    end
+
+    if enabledCount == 0 then return end
+
+    local shouldRejoin = false
+    if State.rejoinCondition == "all" then
+        shouldRejoin = (triggeredCount == enabledCount)
+    else
+        shouldRejoin = (triggeredCount > 0)
+    end
+
+    if shouldRejoin then
+        rejoinGame(table.concat(triggers, " + "))
     end
 end
 
 -- 任务链
 local TaskPriority = {
-    AFK = 200,
-    CHEST = 195,
-    BOSS = 190,
-    KING_KILL = 180,
-    KILL = 150,
-    DUAL = 140,
-    REBIRTH = 120,
-    WHEEL = 110,
-    TELEPORT = 100,
-    CAMERA = 90,
-    INFO = 85,
-    PETBUY = 82,
-    TOOL = 80,
-    TRAIN = 60,
-    EGG = 58,
-    PACKREBIRTH = 56,
-    ANTILAG = 40,
-    CULL = 35,
-    HIDER = 30,
-    TEX = 25,
-    FRIEND = 22,
-    SWEEP = 20,
-    SAVE = 10,
+    AFK = 200, CHEST = 195, BOSS = 190, KING_KILL = 180,
+    KILL = 150, DUAL = 140, REBIRTH = 120, WHEEL = 110,
+    TELEPORT = 100, CAMERA = 90, INFO = 85, PETBUY = 82,
+    TOOL = 80, TRAIN = 60, EGG = 58, PACKREBIRTH = 56,
+    REJOIN = 50,
+    ANTILAG = 40, CULL = 35, HIDER = 30, TEX = 25,
+    FRIEND = 22, SWEEP = 20, SAVE = 10,
 }
 local TaskChain = {}
 local function register(t)
+    t._failCount = 0
+    t._disabledUntil = 0
     table.insert(TaskChain, t)
     table.sort(TaskChain, function(a, b) return a.priority > b.priority end)
 end
@@ -1486,8 +1885,8 @@ end
 register({ id = "afk", priority = TaskPriority.AFK,
     enabled = function() return true end,
     tick = function()
-        if State.time - State.lastAFKClick >= 60 then
-            State.lastAFKClick = State.time
+        if tick() - State.lastAFKClick >= 60 then
+            State.lastAFKClick = tick()
             local vp = Workspace.CurrentCamera and Workspace.CurrentCamera.ViewportSize or V2n(1920, 1080)
             local x, y = vp.X - 8, vp.Y - 8
             local ox, oy = 0, 0
@@ -1504,25 +1903,24 @@ register({ id = "afk", priority = TaskPriority.AFK,
         end
     end,
 })
-
 register({ id = "chest", priority = TaskPriority.CHEST,
     enabled = function() return State.autoChest end,
     tick = runChestTask,
 })
-
 register({ id = "boss", priority = TaskPriority.BOSS,
     enabled = function() return State.autoBoss end,
     onEnable = function()
-        if not bossPunchThread or coroutine.status(bossPunchThread) == "dead" then
+        if not State.threads.bossPunch then
             destroyPortals(); startBossHover()
-            bossPunchThread = task.spawn(bossPunchLoop)
-            bossScanThread = task.spawn(bossScanLoop)
+            spawnThread("bossPunch", bossPunchLoop)
+            spawnThread("bossScan", bossScanLoop)
         end
     end,
     onDisable = function()
         if bossHoverConn then pcall(function() bossHoverConn:Disconnect() end); bossHoverConn = nil end
-        if bossPunchThread then pcall(function() task.cancel(bossPunchThread) end); bossPunchThread = nil end
-        if bossScanThread then pcall(function() task.cancel(bossScanThread) end); bossScanThread = nil end
+        cancelThread("bossPunch")
+        cancelThread("bossScan")
+        setRebirthPauseReason("boss", false)
     end,
     tick = function()
         if isAnyBossAlive() and State.killEnabled then
@@ -1530,12 +1928,15 @@ register({ id = "boss", priority = TaskPriority.BOSS,
             if State.ui.killToggle then State.ui.killToggle.set(false) end
             notify("检测到 Boss，自动杀戮已暂停", 4)
         end
+        local bossAlive = isAnyBossAlive()
+        if bossAlive ~= State._lastBossAlive then
+            State._lastBossAlive = bossAlive
+            setRebirthPauseReason("boss", bossAlive)
+        end
     end,
 })
 register({ id = "kingKill", priority = TaskPriority.KING_KILL,
-    enabled = function()
-        return State.autoKingKill and not (State.autoBoss and isAnyBossAlive())
-    end,
+    enabled = function() return State.autoKingKill and not (State.autoBoss and isAnyBossAlive()) end,
     onDisable = function() State.kingKillTarget = nil; State.kingKillActive = false end,
     tick = runKingKillTick,
 })
@@ -1549,6 +1950,7 @@ register({ id = "kill", priority = TaskPriority.KILL,
         State.autoTeleport = false
         if State.ui.teleToggle then State.ui.teleToggle.set(false) end
         State.killTarget = nil; State.killScanAt = 0; State.dualCurrentMode = "punch"
+        setRebirthPauseReason("kill", true)
     end,
     onDisable = function()
         if State.killSavedState then
@@ -1557,6 +1959,7 @@ register({ id = "kill", priority = TaskPriority.KILL,
             State.killSavedState = nil
         end
         State.killTarget = nil; State.toolOwnedByKill = false; State.dualCurrentMode = "punch"
+        setRebirthPauseReason("kill", false)
     end,
     tick = runKillTick,
 })
@@ -1573,15 +1976,20 @@ register({ id = "rebirth", priority = TaskPriority.REBIRTH,
     enabled = function() return State.autoRebirth end,
     tick = function()
         local interval = 1 / math.max(1, State.rebirthRate)
-        if State.time - State.lastRebirthAt >= interval then
-            State.lastRebirthAt = State.time
+        if tick() - State.lastRebirthAt >= interval then
+            State.lastRebirthAt = tick()
             fireRebirth()
         end
     end,
 })
 register({ id = "wheel", priority = TaskPriority.WHEEL,
     enabled = function() return State.autoWheel end,
-    onEnable = function() task.spawn(function() while State.autoWheel do runWheel(); task.wait(1) end end) end,
+    onEnable = function()
+        spawnThread("wheel", function()
+            while State.autoWheel and not State.destroyed do runWheel(); task.wait(1) end
+        end)
+    end,
+    onDisable = function() cancelThread("wheel") end,
     tick = function() end,
 })
 register({ id = "teleport", priority = TaskPriority.TELEPORT,
@@ -1591,8 +1999,8 @@ register({ id = "teleport", priority = TaskPriority.TELEPORT,
             and not (State.autoBoss and isAnyBossAlive())
     end,
     tick = function()
-        if State.time - State.lastTeleportAt >= 0.05 then
-            State.lastTeleportAt = State.time
+        if tick() - State.lastTeleportAt >= 0.05 then
+            State.lastTeleportAt = tick()
             teleportMuscleKing()
         end
     end,
@@ -1600,8 +2008,8 @@ register({ id = "teleport", priority = TaskPriority.TELEPORT,
 register({ id = "camera", priority = TaskPriority.CAMERA,
     enabled = function() return State.killEnabled or State.autoTeleport or State.kingKillActive or State.autoBoss end,
     tick = function()
-        if State.time - State.lastCameraFix >= 0.5 then
-            State.lastCameraFix = State.time
+        if tick() - State.lastCameraFix >= 0.5 then
+            State.lastCameraFix = tick()
             local cam = Workspace.CurrentCamera
             local hum = Cache.hum
             if cam and hum and hum.Parent then
@@ -1616,8 +2024,8 @@ register({ id = "camera", priority = TaskPriority.CAMERA,
 register({ id = "info", priority = TaskPriority.INFO,
     enabled = function() return State.infoWindowEnabled end,
     tick = function()
-        if State.time - State.strengthCheckAt >= 1 then
-            State.strengthCheckAt = State.time
+        if tick() - State.strengthCheckAt >= 1 then
+            State.strengthCheckAt = tick()
             local s = myStrength()
             if State.sessionStartStrength == nil then
                 State.sessionStartStrength = s; State.lastStrengthSnapshot = s
@@ -1627,17 +2035,16 @@ register({ id = "info", priority = TaskPriority.INFO,
                 State.lastStrengthSnapshot = s
             end
         end
-        if State.time - RepCache.lastRefresh >= 1 then
-            RepCache.lastRefresh = State.time; refreshRepSpeed()
+        if tick() - RepCache.lastRefresh >= 1 then
+            RepCache.lastRefresh = tick(); refreshRepSpeed()
         end
-        if State.time - State.lastPingCheck >= 1 then
-            State.lastPingCheck = State.time
-            pcall(function()
-                State.ping = math.floor(game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue())
-            end)
+        -- ★ v30：ping 更新
+        if tick() - State.lastPingCheck >= 1 then
+            State.lastPingCheck = tick()
+            State.ping = updatePingSmooth()
         end
-        if State.time - State.infoLastRefresh >= 0.2 then
-            State.infoLastRefresh = State.time
+        if tick() - State.infoLastRefresh >= 0.2 then
+            State.infoLastRefresh = tick()
             refreshInfoWindow()
         end
     end,
@@ -1645,8 +2052,8 @@ register({ id = "info", priority = TaskPriority.INFO,
 register({ id = "petbuy", priority = TaskPriority.PETBUY,
     enabled = function() return State.autoPetBuy and State.selectedPet ~= "" end,
     tick = function()
-        if State.time - (State._petBuyLast or 0) >= 0.5 then
-            State._petBuyLast = State.time
+        if tick() - (State._petBuyLast or 0) >= 0.5 then
+            State._petBuyLast = tick()
             buyPet(State.selectedPet)
         end
     end,
@@ -1657,8 +2064,12 @@ register({ id = "tool", priority = TaskPriority.TOOL,
             and not State.toolCooldown and not State.toolOwnedByKill and not State.kingKillActive
     end,
     tick = function()
-        if State.time - State.lastToolCheck < 0.1 then return end
-        State.lastToolCheck = State.time
+        local interval = 0.1
+        if State.autoBoss and isAnyBossAlive() then
+            interval = 0.4
+        end
+        if tick() - State.lastToolCheck < interval then return end
+        State.lastToolCheck = tick()
         local sel = {}
         if State.toolPushups then table.insert(sel, TOOL_KW.pushups) end
         if State.toolHandstands then table.insert(sel, TOOL_KW.handstands) end
@@ -1671,10 +2082,10 @@ register({ id = "tool", priority = TaskPriority.TOOL,
         local anyExist = false
         for _, kw in ipairs(sel) do if toolExists(kw) then anyExist = true; break end end
         if anyExist then State._missingSince = 0; return end
-        if State._missingSince == 0 then State._missingSince = State.time end
-        if State.time - State._missingSince < 1.0 then return end
-        if State.time - State._lastSuicide < 60 then return end
-        State._lastSuicide = State.time
+        if State._missingSince == 0 then State._missingSince = tick() end
+        if tick() - State._missingSince < 1.0 then return end
+        if tick() - State._lastSuicide < 60 then return end
+        State._lastSuicide = tick()
         State._suicideCount = (State._suicideCount or 0) + 1
         if State._suicideCount <= 3 then
             State.toolCooldown = true
@@ -1708,33 +2119,38 @@ register({ id = "train", priority = TaskPriority.TRAIN,
 })
 register({ id = "packrebirth", priority = TaskPriority.PACKREBIRTH,
     enabled = function() return State.autoPackRebirth end,
-    onEnable = function() task.spawn(packRebirthLoop) end,
+    onEnable = function() spawnThread("packRebirth", packRebirthLoop) end,
+    onDisable = function() cancelThread("packRebirth") end,
     tick = function() end,
 })
--- ★ v26：删除了 fasttrain 任务（原来它和 train 任务重复发包，导致快速锻炼失效）
 register({ id = "egg", priority = TaskPriority.EGG,
     enabled = function() return State.autoEatEgg end,
-    onEnable = function() task.spawn(eatEggLoop) end,
+    onEnable = function() spawnThread("egg", eatEggLoop) end,
+    onDisable = function() cancelThread("egg") end,
     tick = function() end,
+})
+register({ id = "rejoin", priority = TaskPriority.REJOIN,
+    enabled = function() return State.autoRejoinEnabled end,
+    tick = checkRejoin,
 })
 register({ id = "antilag", priority = TaskPriority.ANTILAG,
     enabled = function() return State.antiLagEnabled end,
     onEnable = function() pcall(enableAntiLag) end,
     onDisable = function() pcall(disableAntiLag) end,
-    tick = function() if AntiLag.enabled and State.time >= AntiLag.rescanAt then rescanAntiLag() end end,
+    tick = function() if AntiLag.enabled and tick() >= AntiLag.rescanAt then rescanAntiLag() end end,
 })
 register({ id = "cull", priority = TaskPriority.CULL,
     enabled = function() return State.renderCullEnabled end,
     onEnable = function() RenderCull.rescanAt = 0 end,
     onDisable = function() pcall(disableRenderCull) end,
-    tick = function() if State.time >= RenderCull.rescanAt then scanRenderCull() end end,
+    tick = function() if tick() >= RenderCull.rescanAt then scanRenderCull() end end,
 })
 register({ id = "hider", priority = TaskPriority.HIDER,
     enabled = function() return State.hideOwnPets or State.hideAllPets or State.hideMachines end,
     onEnable = function() PetHider.rescanAt = 0 end,
     onDisable = function() pcall(restoreHiddenPets); pcall(restoreHiddenMachines) end,
     tick = function()
-        if State.time >= PetHider.rescanAt then
+        if tick() >= PetHider.rescanAt then
             pcall(restoreHiddenPets); pcall(restoreHiddenMachines)
             scanHidePets(); scanHideMachines()
         end
@@ -1744,7 +2160,7 @@ register({ id = "tex", priority = TaskPriority.TEX,
     enabled = function() return State.textureRemoverEnabled end,
     onEnable = function() pcall(enableTex) end,
     onDisable = function() pcall(disableTex) end,
-    tick = function() if TexRem.enabled and State.time >= TexRem.rescanAt then rescanTex() end end,
+    tick = function() if TexRem.enabled and tick() >= TexRem.rescanAt then rescanTex() end end,
 })
 register({ id = "friend", priority = TaskPriority.FRIEND,
     enabled = function() return State.friendWhitelist end,
@@ -1758,13 +2174,18 @@ register({ id = "friend", priority = TaskPriority.FRIEND,
 register({ id = "sweep", priority = TaskPriority.SWEEP,
     enabled = function() return true end,
     tick = function()
-        if State.time - State.lastSweepAt >= 30 then State.lastSweepAt = State.time; pcall(sweepOverflow) end
+        -- ★ v30：30 秒 → 15 秒
+        if tick() - State.lastSweepAt >= 15 then State.lastSweepAt = tick(); pcall(sweepOverflow) end
     end,
 })
 register({ id = "save", priority = TaskPriority.SAVE,
     enabled = function() return true end,
     tick = function()
-        if State.time - State.lastSaveAt >= 2 then State.lastSaveAt = State.time; task.spawn(saveConfig) end
+        if tick() - State.lastSaveAt >= 2 then State.lastSaveAt = tick(); task.spawn(saveConfig) end
+        -- ★ v30：GC + 内存看门狗 + 长时运行保护
+        pcall(runPeriodicGc)
+        pcall(runMemoryWatchdog)
+        pcall(longRunProtection)
     end,
 })
 
@@ -1782,9 +2203,8 @@ local function updateGlobal(dt)
     if State.fpsWinTime >= 0.5 then
         State.avgFps = State.fpsWinFrames / State.fpsWinTime
         State.fpsWinTime = 0; State.fpsWinFrames = 0
-        if State.fastTrain then
-            if State.adaptiveEnabled then runAdaptive()
-            elseif State.avgFps < 5 then handleDegradation() end
+        if State.fastTrain and State.adaptiveEnabled then
+            runAdaptive()
         end
     end
     if State.sessionStartStrength == nil then
@@ -1793,29 +2213,56 @@ local function updateGlobal(dt)
     end
 end
 
+local TASK_FAIL_LIMIT = 10
+local TASK_DISABLE_DURATION = 30
+
 local function onHeartbeat(dt)
     if State.destroyed then return end
-    State.time = State.time + dt
+    State.time = tick()
     refreshCache()
     updateGlobal(dt)
+    local now = tick()
     for i = 1, #TaskChain do
         local task = TaskChain[i]
-        local ok, en = pcall(task.enabled)
-        if not ok then en = false end
-        if not en then
-            if task._wasActive then
-                task._wasActive = false
-                if task.onDisable then pcall(task.onDisable) end
-            end
+        if task._disabledUntil > 0 and now < task._disabledUntil then
+            -- 跳过
         else
-            if not task._wasActive then
-                task._wasActive = true
-                if task.onEnable then pcall(task.onEnable) end
+            if task._disabledUntil > 0 and now >= task._disabledUntil then
+                task._disabledUntil = 0
+                task._failCount = 0
+                notify(string.format("任务 %s 已恢复", task.id), 3)
             end
-            local ok2, err = pcall(task.tick, dt)
-            if not ok2 and not task._errWarned then
-                task._errWarned = true
-                warn("[Task:" .. task.id .. "]", err)
+            local ok, en = pcall(task.enabled)
+            if not ok then en = false end
+            if not en then
+                if task._wasActive then
+                    task._wasActive = false
+                    if task.onDisable then pcall(task.onDisable) end
+                end
+            else
+                if not task._wasActive then
+                    task._wasActive = true
+                    if task.onEnable then pcall(task.onEnable) end
+                end
+                local ok2, err = pcall(task.tick, dt)
+                if not ok2 then
+                    task._failCount = (task._failCount or 0) + 1
+                    warn(string.format("[Task:%s] 第%d次失败: %s", task.id, task._failCount, tostring(err)))
+                    if task._failCount >= TASK_FAIL_LIMIT then
+                        task._disabledUntil = tick() + TASK_DISABLE_DURATION
+                        notify(string.format("任务 %s 连续失败，暂停 %d 秒", task.id, TASK_DISABLE_DURATION), 5)
+                        warn(string.format("[Task:%s] 连续失败 %d 次，暂停 %d 秒", task.id, TASK_FAIL_LIMIT, TASK_DISABLE_DURATION))
+                        task._failCount = 0
+                        if task._wasActive and task.onDisable then
+                            pcall(task.onDisable)
+                            task._wasActive = false
+                        end
+                    end
+                else
+                    if task._failCount and task._failCount > 0 then
+                        task._failCount = 0
+                    end
+                end
             end
         end
     end
@@ -1827,6 +2274,7 @@ local function destroy()
     State.destroyed = true
     for _, c in ipairs(State.conns) do pcall(function() c:Disconnect() end) end
     table.clear(State.conns)
+    cancelAllThreads()
     pcall(function() Workspace.Gravity = State.originalGravity end)
     pcall(disableAntiLag); pcall(disableRenderCull)
     pcall(restoreHiddenPets); pcall(restoreHiddenMachines)
@@ -1834,6 +2282,7 @@ local function destroy()
     if bossHoverConn then pcall(function() bossHoverConn:Disconnect() end) end
     if State.ui.screen then pcall(function() State.ui.screen:Destroy() end); State.ui.screen = nil end
     if State.ui.infoGui then pcall(function() State.ui.infoGui:Destroy() end); State.ui.infoGui = nil end
+    pcall(function() collectgarbage("collect") end)
     if _G[SCRIPT_ID] and _G[SCRIPT_ID].version == VERSION then _G[SCRIPT_ID] = nil end
 end
 
@@ -1845,62 +2294,22 @@ local function doResetAll()
     if Info.frames.frame then
         Info.frames.frame.Position = DEFAULT.infoPos
         Info.minimized = false
-        Info.frames.frame.Size = UD2o(300, 460)
+        Info.frames.frame.Size = DEFAULT.infoSize
         if Info.frames.playerBtn then Info.frames.playerBtn.Visible = true end
         if Info.frames.dataFrame then Info.frames.dataFrame.Visible = true end
     end
+    State.savedMainPos = nil
+    State.savedInfoPos = nil
+    State.savedInfoSize = nil
     applyUISize()
     pcall(saveConfig)
     notify("已复位", 3)
 end
-local function buildResetButton()
-    local screen = State.ui.screen; if not screen then return end
-    local btn = create("TextButton", {
-        Name = "ResetBtn", AnchorPoint = V2n(0, 1),
-        Position = UD2n(0, 16, 1, -16), Size = UD2o(44, 44),
-        BackgroundColor3 = Theme.Surface, BackgroundTransparency = 0.1,
-        BorderSizePixel = 0, Text = "复位",
-        Font = Font.GothamBold, TextColor3 = Theme.TextDim, TextSize = 12,
-        ZIndex = 150,
-    }, screen)
-    corner(btn, 22); stroke(btn, Theme.Border, 1, 0.4)
-    State.ui.resetBtn = btn
-    track(btn.InputBegan:Connect(function(input)
-        if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
-        ResetBtnState.pressAt = tick(); ResetBtnState.holding = true; ResetBtnState.lastStep = 0
-    end))
-    track(btn.InputEnded:Connect(function(input)
-        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then
-            ResetBtnState.holding = false; ResetBtnState.pressAt = 0
-            btn.BackgroundColor3 = Theme.Surface; btn.TextColor3 = Theme.TextDim; btn.Text = "复位"
-        end
-    end))
-end
-local function tickResetButton()
-    if not ResetBtnState.holding then return end
-    local btn = State.ui.resetBtn; if not btn then return end
-    local elapsed = tick() - ResetBtnState.pressAt
-    local step = math.floor(elapsed)
-    if step ~= ResetBtnState.lastStep and step <= 3 then
-        ResetBtnState.lastStep = step
-        btn.Text = tostring(3 - step) .. "s"
-        if step == 1 then btn.BackgroundColor3 = Theme.Warning; btn.TextColor3 = C3(20, 20, 20)
-        elseif step == 2 then btn.BackgroundColor3 = C3(240, 130, 60); btn.TextColor3 = C3(20, 20, 20) end
-    end
-    if elapsed >= 3 then
-        ResetBtnState.holding = false; ResetBtnState.pressAt = 0
-        btn.BackgroundColor3 = Theme.Success; btn.Text = "OK"; btn.TextColor3 = C3(20, 20, 20)
-        doResetAll()
-        task.delay(1, function()
-            if btn and btn.Parent then
-                btn.BackgroundColor3 = Theme.Surface; btn.TextColor3 = Theme.TextDim; btn.Text = "复位"
-            end
-        end)
-    end
-end
 
 -- 信息悬浮窗
 local Info = { viewingPlayer = nil, listOpen = false, minimized = false, rows = {}, frames = {} }
+_InfoRef = Info
+
 local function buildInfoWindow()
     local screen = create("ScreenGui", {
         Name = "MuscleKingInfoUI", ResetOnSpawn = false,
@@ -1914,7 +2323,8 @@ local function buildInfoWindow()
 
     local frame = create("Frame", {
         Name = "InfoFrame", AnchorPoint = V2n(0, 0),
-        Position = DEFAULT.infoPos, Size = UD2o(300, 460),
+        Position = deserializePos(State.savedInfoPos, DEFAULT.infoPos),
+        Size = deserializeSize(State.savedInfoSize, DEFAULT.infoSize),
         BackgroundColor3 = Theme.Bg, BorderSizePixel = 0,
         ClipsDescendants = true, Active = true,
     }, screen)
@@ -2013,6 +2423,8 @@ local function buildInfoWindow()
     Info.rows.perMonth   = createRow("每月预计", 13)
     Info.rows.pingRow    = createRow("网络延迟", 14)
     Info.rows.friendRow  = createRow("好友白名单", 15)
+    Info.rows.memRow     = createRow("内存占用", 16)
+    Info.rows.uptimeRow  = createRow("运行时长", 17)
 
     local dragging, dragStart, startPos = false, nil, nil
     track(tb.InputBegan:Connect(function(input)
@@ -2033,7 +2445,12 @@ local function buildInfoWindow()
                                startPos.Y.Scale, startPos.Y.Offset + d.Y)
     end))
     track(UIS_IE:Connect(function(input)
-        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then dragging = false end
+        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then
+            if dragging then
+                State.savedInfoPos = serializePos(frame.Position)
+                dragging = false
+            end
+        end
     end))
 
     local resizing, resizeStart, resizeStartSize = false, nil, nil
@@ -2050,7 +2467,12 @@ local function buildInfoWindow()
         frame.Size = UD2o(nw, nh)
     end))
     track(UIS_IE:Connect(function(input)
-        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then resizing = false end
+        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then
+            if resizing then
+                State.savedInfoSize = serializeSize(frame.Size)
+                resizing = false
+            end
+        end
     end))
 
     track(minBtn.MouseButton1Click:Connect(function()
@@ -2058,11 +2480,12 @@ local function buildInfoWindow()
         if Info.minimized then
             playerBtn.Visible = false; listFrame.Visible = false; dataFrame.Visible = false
             resizeHandle.Visible = false
-            frame.Size = UD2o(300, 34); minBtn.Text = "+"
+            frame.Size = UD2o(frame.Size.X.Offset, 34); minBtn.Text = "+"
         else
             playerBtn.Visible = true; dataFrame.Visible = true
             resizeHandle.Visible = true
-            frame.Size = UD2o(300, 460); minBtn.Text = "-"
+            frame.Size = deserializeSize(State.savedInfoSize, DEFAULT.infoSize)
+            minBtn.Text = "-"
         end
     end))
     track(closeBtn.MouseButton1Click:Connect(function()
@@ -2162,8 +2585,15 @@ function refreshInfoWindow()
             Info.rows.friendRow.Text = "关闭"
             Info.rows.friendRow.TextColor3 = Theme.TextDim
         end
+        Info.rows.memRow.Text = string.format("%d MB", State.memMb or 0)
+        Info.rows.memRow.TextColor3 = (State.memMb or 0) > State.rejoinMemThreshold and Theme.Danger or Theme.Text
+        -- 运行时长
+        local up = math.floor(State.sessionUptime or 0)
+        local uh = math.floor(up / 3600)
+        local um = math.floor((up % 3600) / 60)
+        Info.rows.uptimeRow.Text = string.format("%dh %dm", uh, um)
     else
-        for _, k in ipairs({"strengthDelta","petRep","ultRep","passRep","speedMul","perHour","perDay","perMonth","pingRow","friendRow"}) do
+        for _, k in ipairs({"strengthDelta","petRep","ultRep","passRep","speedMul","perHour","perDay","perMonth","pingRow","friendRow","memRow","uptimeRow"}) do
             Info.rows[k].Text = "-"
         end
     end
@@ -2186,15 +2616,9 @@ function applyUISize()
 end
 
 local function applyUIOpacity()
-    if State.ui.main then
-        State.ui.main.BackgroundTransparency = 1 - State.uiBgOpacity
-    end
-    if State.ui.contentArea then
-        State.ui.contentArea.BackgroundTransparency = 1 - State.uiPageOpacity
-    end
-    if Info.frames.frame then
-        Info.frames.frame.BackgroundTransparency = 1 - State.infoBgOpacity
-    end
+    if State.ui.main then State.ui.main.BackgroundTransparency = 1 - State.uiBgOpacity end
+    if State.ui.contentArea then State.ui.contentArea.BackgroundTransparency = 1 - State.uiPageOpacity end
+    if Info.frames.frame then Info.frames.frame.BackgroundTransparency = 1 - State.infoBgOpacity end
 end
 
 local function buildUI()
@@ -2206,7 +2630,7 @@ local function buildUI()
 
     local main = create("Frame", {
         Name = "Main", AnchorPoint = V2n(0, 0),
-        Position = DEFAULT.mainPos,
+        Position = deserializePos(State.savedMainPos, DEFAULT.mainPos),
         Size = UD2o(520, 380),
         BackgroundColor3 = Theme.Bg, BorderSizePixel = 0,
         ClipsDescendants = true, Active = true,
@@ -2426,6 +2850,43 @@ local function buildUI()
         return box
     end
 
+    local function addTextInput(parent, label, default, onChange, hint)
+        local row = create("Frame", {
+            Size = UD2n(1, 0, 0, hint and 54 or 42),
+            BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
+        }, parent)
+        corner(row, 8); stroke(row, Theme.Border, 1, 0.5)
+        create("TextLabel", {
+            BackgroundTransparency = 1, Position = UD2o(12, hint and 7 or 0),
+            Size = UD2n(1, -120, 0, hint and 22 or 42),
+            Font = Font.GothamMedium, Text = label,
+            TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
+        }, row)
+        if hint then
+            create("TextLabel", {
+                BackgroundTransparency = 1, Position = UD2o(12, 28),
+                Size = UD2n(1, -120, 0, 20),
+                Font = Font.Gotham, Text = hint,
+                TextColor3 = Theme.TextDim, TextSize = 11, TextXAlignment = E_TxtXL,
+                TextTruncate = Enum.TextTruncate.AtEnd,
+            }, row)
+        end
+        local box = create("TextBox", {
+            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -12, 0.5, 0),
+            Size = UD2o(160, 28), BackgroundColor3 = Theme.Bg,
+            BorderSizePixel = 0, Font = Font.GothamMedium,
+            Text = tostring(default or ""), TextColor3 = Theme.Text, TextSize = 11,
+            PlaceholderText = "链接或 code",
+            PlaceholderColor3 = Theme.TextMuted, ClearTextOnFocus = false,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+        }, row)
+        corner(box, 6); stroke(box, Theme.Border, 1)
+        track(box.FocusLost:Connect(function()
+            if onChange then onChange(box.Text) end
+        end))
+        return box
+    end
+
     local function addButton(parent, label, onClick, color)
         local btn = create("TextButton", {
             Size = UD2n(1, 0, 0, 36),
@@ -2633,7 +3094,7 @@ local function buildUI()
         State.fastTrain = v
         if v and State.autoTrain then State.autoTrain = false; trainToggle.set(false) end
         if v then cleanupTrainingState(); refreshRepSpeed() else cleanupTrainingState() end
-    end, "自定义频率 + 自适应")
+    end, "自定义频率 + 自适应（最低 10/s）")
     State.ui.rateBox = addInput(pTr, "频率（次/秒）", State.fastRate, 1, 50000, function(n)
         if State.adaptiveEnabled then
             if State.ui.rateBox then State.ui.rateBox.Text = tostring(State.fastRate) end
@@ -2650,7 +3111,7 @@ local function buildUI()
             State.ui.rateBox.TextColor3 = v and Theme.TextDim or Theme.Text
         end
         State.adaptiveStep = 100; State.adaptiveStableCount = 0
-    end)
+    end, "自动调节，永不关闭")
     addSlider(pTr, "目标帧率阈值", 10, 120, State.adaptiveThreshold, function(v) State.adaptiveThreshold = v end)
     divider(pTr)
     sectionLabel(pTr, "工具自动切换")
@@ -2709,11 +3170,13 @@ local function buildUI()
     -- 重生
     local pRe = pages.reb
     sectionLabel(pRe, "自动重生")
-    addToggle(pRe, "自动重生", State.autoRebirth, function(v) State.autoRebirth = v end)
+    State.ui.rebirthToggle = addToggle(pRe, "自动重生", State.autoRebirth, function(v)
+        State.autoRebirth = v
+        State.rebirthSavedBySystem = false
+    end, "Boss 存在 / 杀戮开启时会自动暂停，结束后恢复")
     addInput(pRe, "频率（次/秒）", State.rebirthRate, 1, 100, function(n) State.rebirthRate = n end)
     divider(pRe)
     sectionLabel(pRe, "换包重生")
-    -- ★ v26：删除了「训练速率」滑块，换包重生自动沿用「快速锻炼」的频率
     addToggle(pRe, "换包重生（练速装→重生装）", State.autoPackRebirth, function(v) State.autoPackRebirth = v end,
         "自动换宠并自动重生，使用快速锻炼的频率")
 
@@ -2721,9 +3184,15 @@ local function buildUI()
     local pKi = pages.kill
     sectionLabel(pKi, "全图杀戮")
     State.ui.killToggle = addToggle(pKi, "开启全图杀戮", State.killEnabled, function(v) State.killEnabled = v end,
-        "Boss 存在时自动暂停")
+        "Boss 存在时自动暂停；开启时会暂停自动重生")
     addInput(pKi, "力量/耐久 阈值", State.killThreshold, 1, 100, function(n) State.killThreshold = n end,
         "自己力量 × 阈值 ≥ 目标耐久才击杀")
+    divider(pKi)
+    sectionLabel(pKi, "善恶过滤")
+    addToggle(pKi, "只杀好人", State.killGoodOnly, function(v) State.killGoodOnly = v end,
+        "与「只杀坏人」都开或都关 = 全杀")
+    addToggle(pKi, "只杀坏人", State.killBadOnly, function(v) State.killBadOnly = v end,
+        "与「只杀好人」都开或都关 = 全杀")
     divider(pKi)
     sectionLabel(pKi, "好友白名单")
     addToggle(pKi, "不打好友（含好友王）", State.friendWhitelist, function(v)
@@ -2739,13 +3208,13 @@ local function buildUI()
     addToggle(pKi, "自动击杀其他肌肉之王", State.autoKingKill, function(v)
         State.autoKingKill = v
         if not v then State.kingKillTarget = nil; State.kingKillActive = false end
-    end, "自动跳过能反杀你的目标")
+    end, "只看打不打得过，不看善恶")
     addInput(pKi, "对方耐久/我力量 上限", State.kingKillThreshold, 1, 1000, function(n) State.kingKillThreshold = n end,
-        "超过倍数视为打不过；同时自动跳过能反杀你的目标")
+        "超过倍数视为打不过")
 
     -- 宠物
     local pPe = pages.pet
-    sectionLabel(pPe, "宠物商店")
+    sectionLabel(pPe, "宠物商店（★ 不持久化）")
     local petList = getPetShopList()
     local petDrop = addDropdown(pPe, "选择宠物", petList, State.selectedPet, function(v) State.selectedPet = v or "" end)
     addActionRow(pPe, {
@@ -2757,10 +3226,10 @@ local function buildUI()
             local _, msg = buyPet(State.selectedPet); notify(msg, 3)
         end },
     })
-    addToggle(pPe, "自动购买", State.autoPetBuy, function(v) State.autoPetBuy = v end, "每 0.5 秒购买一次")
+    addToggle(pPe, "自动购买", State.autoPetBuy, function(v) State.autoPetBuy = v end, "重启后不恢复")
     divider(pPe)
-    sectionLabel(pPe, "自动轮盘")
-    addToggle(pPe, "自动轮盘", State.autoWheel, function(v) State.autoWheel = v end, "每秒抽一次")
+    sectionLabel(pPe, "自动轮盘（★ 不持久化）")
+    addToggle(pPe, "自动轮盘", State.autoWheel, function(v) State.autoWheel = v end, "重启后不恢复")
     divider(pPe)
     sectionLabel(pPe, "蛋白蛋")
     addToggle(pPe, "自动吃蛋", State.autoEatEgg, function(v) State.autoEatEgg = v end, "每 0.5 秒吃 10 发蛋")
@@ -2800,7 +3269,11 @@ local function buildUI()
         if not v and bossHoverConn then
             pcall(function() bossHoverConn:Disconnect() end); bossHoverConn = nil
         end
-    end, "只在 Boss 存活时打；Boss 存在会暂停杀戮")
+        if not v then
+            State._lastBossAlive = false
+            setRebirthPauseReason("boss", false)
+        end
+    end, "Boss 存活时打；会暂停杀戮和自动重生；工具切换降到 0.4 秒")
     addSlider(pBo, "悬停高度", 0, 200, State.bossHeight, function(v) State.bossHeight = v end)
     divider(pBo)
     sectionLabel(pBo, "自动宝箱（Boss 死后）")
@@ -2827,6 +3300,7 @@ local function buildUI()
     addActionRow(pSe, {
         { label = "重置窗口位置", onClick = function()
             if State.ui.main then State.ui.main.Position = DEFAULT.mainPos end
+            State.savedMainPos = nil
             applyUISize(); notify("已重置窗口位置", 2)
         end },
     })
@@ -2843,6 +3317,47 @@ local function buildUI()
         State.infoBgOpacity = v / 100; applyUIOpacity()
     end)
     addToggle(pSe, "数字格式化显示", State.formatEnabled, function(v) State.formatEnabled = v end)
+    divider(pSe)
+    sectionLabel(pSe, "★ 自动重进游戏")
+    addToggle(pSe, "启用自动重进", State.autoRejoinEnabled, function(v)
+        State.autoRejoinEnabled = v
+        State._rejoinTriggered = false
+    end, "满足条件时自动切换服务器")
+    addDropdown(pSe, "触发条件", {"任意一个满足", "全部满足"},
+        State.rejoinCondition == "all" and "全部满足" or "任意一个满足",
+        function(v)
+            State.rejoinCondition = (v == "全部满足") and "all" or "any"
+        end)
+    addToggle(pSe, "☑ 内存触发器", State.rejoinEnableMem, function(v) State.rejoinEnableMem = v end, "启用内存阈值检测")
+    addInput(pSe, "  内存阈值（MB）", State.rejoinMemThreshold, 500, 100000, function(n) State.rejoinMemThreshold = n end, "超过则触发")
+    addToggle(pSe, "☑ 帧率触发器", State.rejoinEnableFps, function(v) State.rejoinEnableFps = v end, "启用帧率阈值检测")
+    addInput(pSe, "  帧率下限（FPS）", State.rejoinFpsThreshold, 1, 60, function(n) State.rejoinFpsThreshold = n end, "低于则触发")
+    addToggle(pSe, "☑ 延迟触发器", State.rejoinEnablePing, function(v) State.rejoinEnablePing = v end, "启用延迟阈值检测")
+    addInput(pSe, "  延迟上限（ms）", State.rejoinPingThreshold, 100, 5000, function(n) State.rejoinPingThreshold = n end, "超过则触发")
+
+    local serverModeMap = {
+        ["回原服务器"] = "same",
+        ["人多的服务器"] = "crowded",
+        ["私服"] = "private",
+        ["人少的服务器"] = "sparse",
+    }
+    local serverModeReverse = {
+        same = "回原服务器", crowded = "人多的服务器",
+        private = "私服", sparse = "人少的服务器",
+    }
+    addDropdown(pSe, "重进目标",
+        {"回原服务器", "人多的服务器", "私服", "人少的服务器"},
+        serverModeReverse[State.rejoinServerMode] or "回原服务器",
+        function(v) State.rejoinServerMode = serverModeMap[v] or "same" end)
+    addTextInput(pSe, "私服链接/code", State.rejoinPrivateServerId, function(s)
+        State.rejoinPrivateServerId = s
+    end, "仅「私服」模式使用")
+    addActionRow(pSe, {
+        { label = "手动重进", color = Theme.Warning, onClick = function()
+            State._rejoinTriggered = false
+            rejoinGame("手动触发")
+        end },
+    })
     divider(pSe)
     sectionLabel(pSe, "性能优化")
     addToggle(pSe, "深度防卡顿", State.antiLagEnabled, function(v) State.antiLagEnabled = v end, "关闭粒子/阴影/后处理/声音")
@@ -2896,7 +3411,12 @@ local function buildUI()
                              dragStartPos.Y.Scale, dragStartPos.Y.Offset + d.Y)
     end))
     track(UIS_IE:Connect(function(input)
-        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then dragging = false end
+        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then
+            if dragging then
+                State.savedMainPos = serializePos(main.Position)
+                dragging = false
+            end
+        end
     end))
 
     local minimized = false
@@ -2939,7 +3459,6 @@ end
 loadConfig()
 buildUI()
 buildInfoWindow()
-buildResetButton()
 applyUISize()
 applyUIOpacity()
 
@@ -2965,7 +3484,8 @@ track(LocalPlayer.CharacterAdded:Connect(function()
     State.dualCurrentMode = "punch"
     State.muscleEventRef = nil; State.rebirthEventRef = nil
     PortalCache = nil; PortalCacheAt = 0
-    State._missingSince = 0; State._lastSuicide = 0; State._suicideCount = 0
+    State._missingSince = 0; State._lastSuicide = 0
+    State._suicideCount = 0
     State.bossKilledAt = 0; State.bossWasAlive = false
     table.clear(RenderCull.hidden)
     table.clear(PetHider.own); table.clear(PetHider.all); table.clear(PetHider.machines)
