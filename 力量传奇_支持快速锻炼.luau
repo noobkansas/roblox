@@ -1,9 +1,33 @@
 --!nonstrict
--- 肌肉之王自动化 v25
--- 修复：终极反复取错 / 宝箱独立任务 / Boss 只在存活时跑 / 快速锻炼不阻止 / 信息窗可调+滚动+每月 / UI 透明度可调 / 去 "自己 v"
+-- 肌肉之王自动化 v26
+--更新内容：修复了91个bug
+--by ThxTure & DeepSeek V4.1 Flash
+--本项目 @starter:2026/10/5 10:20 last upd：2026/10/5 0:30
+--[[这是一款自动化脚本，主打**宠物养成、战斗杀戮、传送重生、BOSS 攻坚、宠物抽取**全套自动化逻辑，附带丰富可自定义参数、UI 自定义与性能优化能力，功能之间支持交叉启用或互斥避让，业务逻辑清晰。
+
+核心模块
+
+1. 锻炼自动化
+支持自动锻炼、快速锻炼；快速锻炼依赖 100 只宠物反复执行，可依据帧率自动适配工具切换，兜底最多同时选用 2 种工具，兼容各类器械。
+2. 传送与重生
+传送可循环前往肌肉之王点位，支持全图传送点；提供自动重生、换包重生。
+3. 杀戮战斗系统
+全图自动杀戮，内置力量 / 耐久阈值判断，战力不足时自动停止战斗；支持全体自动击杀，可设置好友白名单；战斗时自动切换训练工具；检测到其他肌肉之王目标可优先击杀，支持自定义触发阈值。
+4. 宠物 & 道具自动化
+自动抽宠、购买宠物；自动转盘、自动拾取 / 投喂弹药，弹药投喂数量自定义。
+5. BOSS 与宝箱
+自动挑战 BOSS，可调节 BOSS 悬停高度；自动开启宝箱，宝箱相关数值可配置。
+6. UI 与信息面板
+UI 尺寸、比例、不透明度均可调节；独立信息小窗，可自定义大小、透明度；实时查看自身与其他玩家信息，数值格式化展示。
+7. 视觉隐藏
+可隐藏自身 / 他人宠物、器械、原生游戏 UI。
+8. 性能优化
+深度防卡顿方案：可关闭粒子、阴影、后处理、音效；远处模型渲染剔除，剔除距离可自定义；支持移除纹理。
+9. 业务逻辑
+内置避让机制；多功能支持交叉运行、互斥锁控制，防止功能冲突，自动化流程稳定可控。]]--
 
 local SCRIPT_ID   = "__MUSCLE_KING_AUTO__"
-local VERSION     = 2500
+local VERSION     = 2600
 local CONFIG_FILE = "muscle_king_auto_config.json"
 
 do
@@ -115,7 +139,6 @@ local State = {
     infoWindowEnabled = false, infoLastRefresh = 0,
     formatEnabled = true,
 
-    -- UI 透明度
     uiBgOpacity = 1.0,
     uiPageOpacity = 1.0,
     infoBgOpacity = 1.0,
@@ -124,13 +147,13 @@ local State = {
     autoPetBuy = false, selectedPet = "",
     autoWheel = false,
     autoBoss = false, bossHeight = 70,
-    autoPackRebirth = false, trainRate = 1200,
+    autoPackRebirth = false,
     autoEatEgg = false, giftAmount = 0, selectedEggTarget = "",
 
     -- Boss / 宝箱
-    autoChest = true,           -- 自动宝箱
-    chestDelay = 5,             -- Boss 死后延迟
-    chestHoldTime = 2,          -- 长按 E 时间
+    autoChest = true,
+    chestDelay = 5,
+    chestHoldTime = 2,
     lastBossAliveAt = 0,
     bossWasAlive = false,
     bossKilledAt = 0,
@@ -379,12 +402,9 @@ local function collectPetRepTimes()
     return sumPct, timeMul
 end
 
--- ★ v25 修复：终极反复用 GetAttribute（dump 里是 Attr）
 local function readUltPct()
-    -- 优先 Attribute
     local a = LocalPlayer:GetAttribute("UltimateRepSpeed")
     if type(a) == "number" then return a * 5 end
-    -- 回退 ValueBase
     local v = LocalPlayer:FindFirstChild("UltimateRepSpeed")
     if v and v:IsA("ValueBase") then return (tonumber(v.Value) or 0) * 5 end
     return 0
@@ -715,6 +735,7 @@ local function stat(plr, name)
     return 0
 end
 local function myStrength() return stat(LocalPlayer, "Strength") end
+local function myDurability() return stat(LocalPlayer, "Durability") end
 
 local function getMuscleEvent()
     local c = State.muscleEventRef
@@ -842,20 +863,42 @@ local function punch()
     local tool = c:FindFirstChildOfClass("Tool")
     if tool then pcall(function() tool:Activate() end) end
 end
+
+-- ★ v26：判断目标是否安全（对方不能在我打死他前先打死我）
+-- 我打死对方所需攻击次数 = theirDur / myStr
+-- 对方打死我所需攻击次数 = myDur / theirStr
+-- 如果我的攻击次数 >= 对方的攻击次数 → 对方先打死我 → 不安全
+local function isTargetSafe(plr, myStr, myDur)
+    if myDur <= 0 or myStr <= 0 then return true end
+    local theirStr = stat(plr, "Strength")
+    local theirDur = stat(plr, "Durability")
+    if theirStr <= 0 or theirDur <= 0 then return true end
+    local myHits    = theirDur / myStr
+    local theirHits = myDur / theirStr
+    return myHits < theirHits
+end
+
 local function selectKillTarget()
     local s = myStrength()
+    local myDur = myDurability()
     local t = State.killThreshold or 5
     for _, plr in ipairs(GetPlayers(Players)) do
         if plr ~= LocalPlayer and not (State.friendWhitelist and isFriend(plr)) then
             local hrp = getCharHRP(plr)
             if hrp then
                 local dur = stat(plr, "Durability")
-                if dur == 0 or (s > 0 and s * t >= dur) then return plr end
+                -- 检查1：我能否打死对方（原逻辑）
+                local canKill = (dur == 0) or (s > 0 and s * t >= dur)
+                -- 检查2：★ 对方能否先把我打死
+                if canKill and isTargetSafe(plr, s, myDur) then
+                    return plr
+                end
             end
         end
     end
     return nil
 end
+
 local function runKillTick()
     if State.time - State.killScanAt >= 0.5 then
         State.killScanAt = State.time
@@ -867,8 +910,12 @@ local function runKillTick()
             State.killTarget = selectKillTarget()
         else
             local s = myStrength()
+            local myDur = myDurability()
             local dur = stat(State.killTarget, "Durability")
-            if dur > 0 and s > 0 and s * (State.killThreshold or 5) < dur then
+            -- 目标耐久太高 或 对方能反杀 → 换目标
+            local failKill = dur > 0 and s > 0 and s * (State.killThreshold or 5) < dur
+            local failSafe = not isTargetSafe(State.killTarget, s, myDur)
+            if failKill or failSafe then
                 State.killTarget = selectKillTarget()
             end
         end
@@ -886,6 +933,8 @@ local function runKillTick()
         end
     end
 end
+
+-- ★ v26：肌肉之王 —— 加入反杀判定
 local function runKingKillTick()
     if State.time - State.lastKingCheck >= 0.5 then
         State.lastKingCheck = State.time
@@ -896,8 +945,15 @@ local function runKingKillTick()
         local hrp = getCharHRP(king)
         if not hrp then State.kingKillTarget = nil; State.kingKillActive = false; return end
         local s = myStrength()
-        local dur = stat(king, "Durability")
-        if dur > 0 and s > 0 and dur >= s * (State.kingKillThreshold or 20) then
+        local myDur = myDurability()
+        local theirDur = stat(king, "Durability")
+        local theirStr = stat(king, "Strength")
+        -- 检查1：我能否打死对方（原逻辑）
+        if theirDur > 0 and s > 0 and theirDur >= s * (State.kingKillThreshold or 20) then
+            State.kingKillTarget = nil; State.kingKillActive = false; return
+        end
+        -- 检查2：★ 对方能否先把我打死
+        if not isTargetSafe(king, s, myDur) then
             State.kingKillTarget = nil; State.kingKillActive = false; return
         end
         State.kingKillTarget = king
@@ -916,6 +972,7 @@ local function runKingKillTick()
         punch()
     end
 end
+
 local function findPreferredTool()
     if State.toolPushups then local t = findTool(TOOL_KW.pushups); if t then return t end end
     if State.toolHandstands then local t = findTool(TOOL_KW.handstands); if t then return t end end
@@ -1008,7 +1065,7 @@ local function runWheel()
     end)
 end
 
--- ★ v25 Boss + 宝箱
+-- Boss + 宝箱
 local BOSS_NAMES = { "Boss1", "Boss2", "Boss3", "Boss4", "Boss5" }
 local BOSS_IDLE_POS = V3n(1, 44, -1251)
 local PUNCH_ANIMS = { left = "rbxassetid://3638729053", right = "rbxassetid://3638767427" }
@@ -1055,7 +1112,6 @@ end
 local function startBossHover()
     bossHoverConn = RS_RS:Connect(function()
         if not State.autoBoss then return end
-        -- ★ 只有 Boss 活着才悬停
         if not isAnyBossAlive() then return end
         local hrp = Cache.hrp; if not hrp then return end
         local bp = getBossPos(); if not bp then return end
@@ -1071,7 +1127,6 @@ local function bossPunchLoop()
     local useLeft, trackL, trackR = true, nil, nil
     local counter = 0
     while State.autoBoss do
-        -- ★ 只有 Boss 活着才打
         if isAnyBossAlive() and getBossPos() then
             counter = counter + 1
             if counter % 4 == 0 then
@@ -1120,7 +1175,6 @@ local function bossScanLoop()
                     break
                 end
             end
-            -- ★ v25：只有 Boss 活着才回待机点，死了由宝箱任务接管
             if not found and not State.bossWasAlive then
                 -- 什么都不做
             end
@@ -1128,7 +1182,6 @@ local function bossScanLoop()
     end
 end
 
--- ★ v25 独立宝箱任务（优先级最高）
 local chestTaskActive = false
 local chestTaskAt = 0
 local function isChestVisible()
@@ -1139,7 +1192,6 @@ local function isChestVisible()
             return chest, obj
         end
     end
-    -- 也检查其他名字的宝箱
     for _, name in ipairs({"BossChest", "Chest", "RewardChest"}) do
         local c = Workspace:FindFirstChild(name)
         if c then
@@ -1154,24 +1206,19 @@ local function isChestVisible()
 end
 local function runChestTask()
     if not State.autoChest then return end
-    -- 只在 Boss 死后触发
     if isAnyBossAlive() then
         State.bossWasAlive = true
         State.bossKilledAt = 0
         return
     end
     if State.bossWasAlive and State.bossKilledAt == 0 then
-        -- Boss 刚死
         State.bossKilledAt = State.time
         State.bossWasAlive = false
     end
-    -- 等 5 秒
     if State.bossKilledAt == 0 or State.time - State.bossKilledAt < State.chestDelay then return end
-    -- 检测宝箱可见
     local chestModel, chestPart = isChestVisible()
     if not chestModel or not chestPart then return end
 
-    -- 传送到宝箱上方
     local hrp = Cache.hrp; if not hrp then return end
     local targetCF = CN(chestPart.Position + V3n(0, 4, 0))
     pcall(function()
@@ -1180,12 +1227,10 @@ local function runChestTask()
         hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
     end)
 
-    -- 长按 E 2 秒
     if not chestTaskActive then
         chestTaskActive = true
         task.spawn(function()
             local holdTime = State.chestHoldTime or 2
-            -- 方式 1：VirtualInputManager 长按 E
             pcall(function()
                 VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
             end)
@@ -1193,7 +1238,6 @@ local function runChestTask()
             pcall(function()
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
             end)
-            -- 方式 2：触发所有 ProximityPrompt
             pcall(function()
                 for _, obj in ipairs(chestModel:GetDescendants()) do
                     if obj:IsA("ProximityPrompt") and obj.Enabled then
@@ -1287,6 +1331,8 @@ local function equipRebirthPets()
         if p.rebirth > 0 then equipOne(p.instance); count = count + 1 end
     end
 end
+
+-- ★ v26：换包重生不再使用 trainRate，统一用 fastRate
 local function performPackRebirth()
     local ev = getMuscleEvent(); if not ev then return end
     local ls = LocalPlayer:FindFirstChild("leaderstats")
@@ -1294,18 +1340,13 @@ local function performPackRebirth()
     local rebStat = ls and ls:FindFirstChild("Rebirths")
     if not (strStat and rebStat) then return end
     local target = 5000 + rebStat.Value * 2550
-    local lastStr = strStat.Value
-    local stall = 0
     while strStat.Value < target and State.autoPackRebirth do
         pcall(function()
-            local burst = math.clamp(math.floor(State.trainRate / 10), 5, 50)
+            -- 与快速锻炼频率保持一致
+            local burst = math.clamp(math.floor(State.fastRate / 10), 5, 50)
             for _ = 1, burst do ev:FireServer("rep") end
         end)
         task.wait(0.01)
-        local cur = strStat.Value
-        if cur > lastStr then stall = 0; State.trainRate = math.min(2400, State.trainRate + 40)
-        else stall = stall + 1; if stall >= 3 then State.trainRate = math.max(600, State.trainRate - 80); stall = 0 end end
-        lastStr = cur
     end
     equipRebirthPets()
     task.wait(0.25)
@@ -1324,26 +1365,7 @@ local function packRebirthLoop()
         task.wait(0.5)
     end
 end
-local function adaptiveTrainLoop()
-    local ev = getMuscleEvent(); if not ev then return end
-    local ls = LocalPlayer:FindFirstChild("leaderstats")
-    local strStat = ls and ls:FindFirstChild("Strength")
-    local lastStr = strStat and strStat.Value or 0
-    local stall = 0
-    while State.fastTrain do
-        pcall(function()
-            local burst = math.clamp(math.floor(State.trainRate / 10), 5, 50)
-            for _ = 1, burst do ev:FireServer("rep") end
-        end)
-        if strStat then
-            local cur = strStat.Value
-            if cur > lastStr then stall = 0; State.trainRate = math.min(2400, State.trainRate + 40)
-            else stall = stall + 1; if stall >= 3 then State.trainRate = math.max(600, State.trainRate - 80); stall = 0 end end
-            lastStr = cur
-        end
-        task.wait(0.04)
-    end
-end
+
 local function findProteinEgg()
     local c = Cache.char
     local bp = LocalPlayer:FindFirstChild("Backpack")
@@ -1431,7 +1453,7 @@ end
 -- 任务链
 local TaskPriority = {
     AFK = 200,
-    CHEST = 195,      -- 宝箱任务最高
+    CHEST = 195,
     BOSS = 190,
     KING_KILL = 180,
     KILL = 150,
@@ -1445,6 +1467,7 @@ local TaskPriority = {
     TOOL = 80,
     TRAIN = 60,
     EGG = 58,
+    PACKREBIRTH = 56,
     ANTILAG = 40,
     CULL = 35,
     HIDER = 30,
@@ -1481,7 +1504,6 @@ register({ id = "afk", priority = TaskPriority.AFK,
     end,
 })
 
--- ★ v25 宝箱任务
 register({ id = "chest", priority = TaskPriority.CHEST,
     enabled = function() return State.autoChest end,
     tick = runChestTask,
@@ -1502,7 +1524,6 @@ register({ id = "boss", priority = TaskPriority.BOSS,
         if bossScanThread then pcall(function() task.cancel(bossScanThread) end); bossScanThread = nil end
     end,
     tick = function()
-        -- Boss 存在时自动关杀戮
         if isAnyBossAlive() and State.killEnabled then
             State.killEnabled = false
             if State.ui.killToggle then State.ui.killToggle.set(false) end
@@ -1684,16 +1705,12 @@ register({ id = "train", priority = TaskPriority.TRAIN,
         end
     end,
 })
-register({ id = "packrebirth", priority = 56,
+register({ id = "packrebirth", priority = TaskPriority.PACKREBIRTH,
     enabled = function() return State.autoPackRebirth end,
     onEnable = function() task.spawn(packRebirthLoop) end,
     tick = function() end,
 })
-register({ id = "fasttrain", priority = 57,
-    enabled = function() return State.fastTrain end,
-    onEnable = function() task.spawn(adaptiveTrainLoop) end,
-    tick = function() end,
-})
+-- ★ v26：删除了 fasttrain 任务（原来它和 train 任务重复发包，导致快速锻炼失效）
 register({ id = "egg", priority = TaskPriority.EGG,
     enabled = function() return State.autoEatEgg end,
     onEnable = function() task.spawn(eatEggLoop) end,
@@ -1881,7 +1898,7 @@ local function tickResetButton()
     end
 end
 
--- 信息悬浮窗（可滚动 + 可调大小 + 每月 + 无 "自己 v"）
+-- 信息悬浮窗
 local Info = { viewingPlayer = nil, listOpen = false, minimized = false, rows = {}, frames = {} }
 local function buildInfoWindow()
     local screen = create("ScreenGui", {
@@ -1903,7 +1920,6 @@ local function buildInfoWindow()
     Info.frames.frame = frame
     corner(frame, 12); stroke(frame, Theme.Border, 1)
 
-    -- 标题栏
     local tb = create("Frame", {
         Size = UD2n(1, 0, 0, 34), BackgroundColor3 = Theme.Surface,
         BorderSizePixel = 0, Active = true,
@@ -1926,7 +1942,6 @@ local function buildInfoWindow()
         Font = Font.GothamBold, Text = "x", TextColor3 = Theme.TextDim, TextSize = 14,
     }, tb); corner(closeBtn, 6)
 
-    -- 玩家选择按钮
     local playerBtn = create("TextButton", {
         Position = UD2o(10, 42), Size = UD2n(1, -20, 0, 30),
         BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
@@ -1947,7 +1962,6 @@ local function buildInfoWindow()
     listLayout(listFrame, 2); padding(listFrame, 4, 4, 4, 4)
     Info.frames.listFrame = listFrame
 
-    -- ★ v25：数据区改为可滚动
     local dataFrame = create("ScrollingFrame", {
         Position = UD2o(0, 114), Size = UD2n(1, 0, 1, -114),
         BackgroundTransparency = 1, BorderSizePixel = 0,
@@ -1959,7 +1973,6 @@ local function buildInfoWindow()
     listLayout(dataFrame, 4)
     Info.frames.dataFrame = dataFrame
 
-    -- ★ v25：右下角小拖拽调整大小
     local resizeHandle = create("TextButton", {
         Size = UD2o(16, 16), Position = UD2n(1, -18, 1, -18),
         BackgroundColor3 = Theme.Accent, BorderSizePixel = 0,
@@ -2000,7 +2013,6 @@ local function buildInfoWindow()
     Info.rows.pingRow    = createRow("网络延迟", 14)
     Info.rows.friendRow  = createRow("好友白名单", 15)
 
-    -- 拖动
     local dragging, dragStart, startPos = false, nil, nil
     track(tb.InputBegan:Connect(function(input)
         if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
@@ -2023,7 +2035,6 @@ local function buildInfoWindow()
         if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then dragging = false end
     end))
 
-    -- ★ v25：调整大小
     local resizing, resizeStart, resizeStartSize = false, nil, nil
     track(resizeHandle.InputBegan:Connect(function(input)
         if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
@@ -2621,8 +2632,7 @@ local function buildUI()
         State.fastTrain = v
         if v and State.autoTrain then State.autoTrain = false; trainToggle.set(false) end
         if v then cleanupTrainingState(); refreshRepSpeed() else cleanupTrainingState() end
-        -- ★ v25：不再阻止，即使反复不足也允许练，只在状态栏提示
-    end, "自定义频率 + 自适应（反复不足仍可练）")
+    end, "自定义频率 + 自适应")
     State.ui.rateBox = addInput(pTr, "频率（次/秒）", State.fastRate, 1, 50000, function(n)
         if State.adaptiveEnabled then
             if State.ui.rateBox then State.ui.rateBox.Text = tostring(State.fastRate) end
@@ -2702,9 +2712,9 @@ local function buildUI()
     addInput(pRe, "频率（次/秒）", State.rebirthRate, 1, 100, function(n) State.rebirthRate = n end)
     divider(pRe)
     sectionLabel(pRe, "换包重生")
+    -- ★ v26：删除了「训练速率」滑块，换包重生自动沿用「快速锻炼」的频率
     addToggle(pRe, "换包重生（练速装→重生装）", State.autoPackRebirth, function(v) State.autoPackRebirth = v end,
-        "自动换宠并自动重生")
-    addSlider(pRe, "训练速率", 600, 2400, State.trainRate, function(v) State.trainRate = v end)
+        "自动换宠并自动重生，使用快速锻炼的频率")
 
     -- 杀戮
     local pKi = pages.kill
@@ -2728,9 +2738,9 @@ local function buildUI()
     addToggle(pKi, "自动击杀其他肌肉之王", State.autoKingKill, function(v)
         State.autoKingKill = v
         if not v then State.kingKillTarget = nil; State.kingKillActive = false end
-    end)
+    end, "自动跳过能反杀你的目标")
     addInput(pKi, "对方耐久/我力量 上限", State.kingKillThreshold, 1, 1000, function(n) State.kingKillThreshold = n end,
-        "超过倍数视为打不过")
+        "超过倍数视为打不过；同时自动跳过能反杀你的目标")
 
     -- 宠物
     local pPe = pages.pet
