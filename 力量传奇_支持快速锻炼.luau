@@ -1,12 +1,13 @@
 --!nonstrict
--- 肌肉之王自动化 v31
--- v31 修复：
---  - 解决 "Out of local registers ... exceeded limit 200"
---  - 把所有动态表合并到 State，减少顶层 local
---  - 保留 v30 所有功能
+-- 肌肉之王自动化 v32
+-- v32 修复：
+--  - Boss 死后不再掉虚空
+--  - 宝箱任务每帧持续锁定位置（防掉落）
+--  - Boss 死后 30 秒内保持零重力
+--  - 开箱混合单按 E + 长按 E + ProximityPrompt
 
 local SCRIPT_ID   = "__MUSCLE_KING_AUTO__"
-local VERSION     = 3100
+local VERSION     = 3200
 local CONFIG_FILE = "muscle_king_auto_config.json"
 
 do
@@ -49,7 +50,6 @@ local LocalPlayer = Players.LocalPlayer
 local PlayerGui = LocalPlayer:WaitForChild("PlayerGui", 60)
 waitForGame(60)
 
--- ★ v31：把所有枚举和常量压缩到局部表，减少独立 local
 local E = {
     Sibling = Enum.ZIndexBehavior.Sibling,
     AutoY = Enum.AutomaticSize.Y,
@@ -70,14 +70,12 @@ local E = {
     FillV = Enum.FillDirection.Vertical,
 }
 
--- 常用 API 别名压缩
 local RS_HB = RunService.Heartbeat
 local RS_RS = RunService.RenderStepped
 local UIS_IC = UserInputService.InputChanged
 local UIS_IB = UserInputService.InputBegan
 local UIS_IE = UserInputService.InputEnded
 local UIS_GML = UserInputService.GetMouseLocation
-local UIS_Touch = UserInputService.TouchEnabled
 local GetPlayers = Players.GetPlayers
 
 local UD2n = UDim2.new
@@ -110,10 +108,8 @@ local DEFAULT = {
     infoSize = UD2o(300, 460),
 }
 
--- ★ v31：所有动态表都挂在 State 下
 local State = {
     destroyed = false, conns = {}, ui = {}, threads = {},
-    -- 表合并
     Info = { viewingPlayer = nil, listOpen = false, minimized = false, rows = {}, frames = {} },
     pingHistory = {},
     activeNotifies = {},
@@ -147,10 +143,11 @@ local State = {
     bossHoverConn = nil,
     bossCurrent = "Boss1",
     chestTaskActive = false,
+    chestOpenUntil = 0,           -- ★ v32：宝箱结束后冷却
+    chestLastPos = nil,           -- ★ v32：宝箱上次位置
     bossAliveCache = false,
     bossAliveCacheAt = 0,
 
-    -- 状态
     autoTrain = false, fastTrain = false, fastRate = 20,
     toolDumbbell = false, toolPushups = false,
     toolHandstands = false, toolSitups = false,
@@ -192,6 +189,7 @@ local State = {
 
     autoChest = true, chestDelay = 5, chestHoldTime = 2,
     lastBossAliveAt = 0, bossWasAlive = false, bossKilledAt = 0,
+    bossDeathPos = nil,           -- ★ v32：记录 Boss 死时玩家位置
 
     autoRejoinEnabled = false, rejoinCondition = "any",
     rejoinEnableMem = true, rejoinEnableFps = true, rejoinEnablePing = true,
@@ -220,7 +218,6 @@ local State = {
     _didDeepClean = false,
 }
 
--- 工具函数
 local function spawnThread(key, fn)
     if State.threads[key] then pcall(function() task.cancel(State.threads[key]) end) end
     State.threads[key] = task.spawn(fn)
@@ -548,7 +545,6 @@ local function loadConfig()
     State.rejoinPingThreshold = n("rejoinPingThreshold", State.rejoinPingThreshold, 100, 5000)
 end
 
--- 反复速度
 local function collectPetRepTimes()
     local sumPct, timeMul = 0, 1
     local own = Workspace:FindFirstChild(LocalPlayer.Name)
@@ -613,7 +609,6 @@ local function refreshRepSpeed()
     RC.speedMul = 1 / tt
 end
 
--- 性能：AntiLag
 local POST = { BloomEffect = true, BlurEffect = true, SunRaysEffect = true, ColorCorrectionEffect = true, DepthOfFieldEffect = true }
 local function scanAntiLag()
     local AL = State.antiLag
@@ -677,7 +672,6 @@ local function disableAntiLag()
     end
 end
 
--- RenderCull
 local function cullModel(m)
     local s = {}
     for _, p in ipairs(m:GetDescendants()) do
@@ -722,7 +716,6 @@ local function disableRenderCull()
     table.clear(State.renderCull.hidden)
 end
 
--- PetHider
 local function hidePart(m)
     if not m or not m.Parent then return end
     for _, p in ipairs(m:GetDescendants()) do
@@ -787,7 +780,6 @@ local function restoreHiddenMachines()
     table.clear(PH.machines)
 end
 
--- 纹理移除
 local function scanTextures()
     local TR = State.texRem
     for _, obj in ipairs(Workspace:GetDescendants()) do
@@ -832,7 +824,6 @@ local function disableTex()
     table.clear(TR.saved); table.clear(TR.seen)
 end
 
--- 隐藏 UI
 local function hideAllUI()
     local HU = State.hiddenUIs
     table.clear(HU)
@@ -867,7 +858,6 @@ local function sweepOverflow()
     while #State.pingHistory > 10 do table.remove(State.pingHistory, 1) end
 end
 
--- 工具
 local function matchKw(n, list)
     n = n:lower()
     for i = 1, #list do if n:find(list[i]) then return true end end
@@ -1289,21 +1279,35 @@ local function destroyPortals()
         end
     end)
 end
+
+-- ★ v32：Boss 悬停 —— Boss 死后 30 秒内持续清速度，防掉虚空
 local function startBossHover()
     if State.bossHoverConn then pcall(function() State.bossHoverConn:Disconnect() end) end
     State.bossHoverConn = RS_RS:Connect(function()
         if not State.autoBoss then return end
-        if not isAnyBossAlive() then return end
-        local hrp = State.cache.hrp; if not hrp then return end
-        local bp = getBossPos(); if not bp then return end
-        local hoverPos = bp + V3n(0, State.bossHeight, 0)
-        local flat = V3n(bp.X - hoverPos.X, 0, bp.Z - hoverPos.Z)
-        if flat.Magnitude < 0.1 then flat = V3n(0, 0, -1) end
-        hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
-        hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
-        hrp.CFrame = CFrame.lookAt(hoverPos, hoverPos + (flat.Unit + V3n(0, -1, 0)).Unit)
+
+        -- Boss 存活：正常悬停
+        if isAnyBossAlive() then
+            local hrp = State.cache.hrp; if not hrp then return end
+            local bp = getBossPos(); if not bp then return end
+            local hoverPos = bp + V3n(0, State.bossHeight, 0)
+            local flat = V3n(bp.X - hoverPos.X, 0, bp.Z - hoverPos.Z)
+            if flat.Magnitude < 0.1 then flat = V3n(0, 0, -1) end
+            hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+            hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
+            hrp.CFrame = CFrame.lookAt(hoverPos, hoverPos + (flat.Unit + V3n(0, -1, 0)).Unit)
+            return
+        end
+
+        -- ★ v32：Boss 死后 30 秒内持续清速度，防止掉虚空
+        if State.bossKilledAt > 0 and (tick() - State.bossKilledAt) < 30 then
+            local hrp = State.cache.hrp; if not hrp then return end
+            hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+            hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
+        end
     end)
 end
+
 local function bossPunchLoop()
     local useLeft, trackL, trackR = true, nil, nil
     local counter = 0
@@ -1371,27 +1375,109 @@ local function isChestVisible()
     end
     return nil
 end
+
+-- ★ v32：宝箱任务重写 —— 每帧锁定位置，防掉虚空
 local function runChestTask()
     if not State.autoChest then return end
+
+    -- Boss 活着：重置宝箱状态
     if isAnyBossAlive() then
-        State.bossWasAlive = true; State.bossKilledAt = 0; return
+        State.bossWasAlive = true
+        State.bossKilledAt = 0
+        State.chestTaskActive = false
+        State.bossDeathPos = nil
+        return
     end
+
+    -- 检测到 Boss 刚死
     if State.bossWasAlive and State.bossKilledAt == 0 then
-        State.bossKilledAt = tick(); State.bossWasAlive = false
+        State.bossKilledAt = tick()
+        State.bossWasAlive = false
+        -- ★ 记录死亡时玩家位置
+        local hrp = State.cache.hrp
+        if hrp then
+            State.bossDeathPos = hrp.Position
+            pcall(function()
+                hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+                hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
+            end)
+        end
     end
-    if State.bossKilledAt == 0 or tick() - State.bossKilledAt < State.chestDelay then return end
+
+    if State.bossKilledAt == 0 then return end
+    local sinceDeath = tick() - State.bossKilledAt
+
+    -- ★ 等待延迟期间：持续清零速度，防掉落
+    if sinceDeath < State.chestDelay then
+        local hrp = State.cache.hrp
+        if hrp then
+            pcall(function()
+                hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+                hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
+            end)
+        end
+        return
+    end
+
+    -- 尝试查找宝箱
     local chestModel, chestPart = isChestVisible()
-    if not chestModel or not chestPart then return end
+
+    if not chestModel or not chestPart then
+        -- 宝箱还没出现：保持锁定死亡位置，防止掉落
+        if sinceDeath < 30 then
+            local hrp = State.cache.hrp
+            if hrp and State.bossDeathPos then
+                pcall(function()
+                    hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+                    hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
+                    -- 只在玩家掉了 5 stud 以上才拉回，避免抖动
+                    if (hrp.Position - State.bossDeathPos).Magnitude > 5 then
+                        hrp.CFrame = CN(State.bossDeathPos)
+                    end
+                end)
+            end
+        else
+            -- 30 秒后彻底结束
+            State.bossKilledAt = 0
+            State.bossDeathPos = nil
+        end
+        return
+    end
+
+    -- ★ 找到宝箱：每帧持续传送到宝箱上方（不只是第一次）
     local hrp = State.cache.hrp; if not hrp then return end
-    local targetCF = CN(chestPart.Position + V3n(0, 4, 0))
+    local targetPos = chestPart.Position + V3n(0, 4, 0)
     pcall(function()
-        hrp.CFrame = targetCF
+        hrp.CFrame = CN(targetPos)
         hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
         hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
     end)
+
+    -- 兜底：如果位置异常低（已经掉了一大截），强拉回来
+    if hrp.Position.Y < chestPart.Position.Y - 20 then
+        pcall(function()
+            hrp.CFrame = CN(targetPos)
+            hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+        end)
+    end
+
+    -- 开始开箱流程
     if not State.chestTaskActive then
         State.chestTaskActive = true
         task.spawn(function()
+            -- 阶段1：单按 E 几次
+            for _ = 1, 5 do
+                pcall(function()
+                    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+                end)
+                task.wait(0.05)
+                pcall(function()
+                    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+                end)
+                task.wait(0.1)
+            end
+
+            -- 阶段2：长按 E
             local holdTime = State.chestHoldTime or 2
             pcall(function()
                 VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
@@ -1400,6 +1486,8 @@ local function runChestTask()
             pcall(function()
                 VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
             end)
+
+            -- 阶段3：触发 ProximityPrompt
             pcall(function()
                 for _, obj in ipairs(chestModel:GetDescendants()) do
                     if obj:IsA("ProximityPrompt") and obj.Enabled then
@@ -1407,6 +1495,9 @@ local function runChestTask()
                     end
                 end
             end)
+
+            -- 冷却 5 秒后允许再次尝试（宝箱未消失时）
+            task.wait(5)
             State.chestTaskActive = false
         end)
     end
@@ -1592,7 +1683,6 @@ local function runAdaptive()
     end
 end
 
--- ★ v31：内存看门狗 + GC + 长时运行保护
 local function runMemoryWatchdog()
     local now = tick()
     if now - State.lastMemCheckAt < 30 then return end
@@ -1637,7 +1727,6 @@ local function longRunProtection()
     end
 end
 
--- ★ v31：Ping 用 GetNetworkPing + 滑动平均
 local function readRawPing()
     local ok, v = pcall(function() return LocalPlayer:GetNetworkPing() end)
     if ok and type(v) == "number" and v > 0 then return v * 1000 end
@@ -1839,6 +1928,11 @@ register({ id = "boss", priority = TP.BOSS,
         cancelThread("bossPunch")
         cancelThread("bossScan")
         setRebirthPauseReason("boss", false)
+        -- ★ v32：关闭自动打 Boss 时清空宝箱状态
+        State.bossKilledAt = 0
+        State.bossWasAlive = false
+        State.chestTaskActive = false
+        State.bossDeathPos = nil
     end,
     tick = function()
         if isAnyBossAlive() and State.killEnabled then
@@ -1850,6 +1944,16 @@ register({ id = "boss", priority = TP.BOSS,
         if bossAlive ~= State._lastBossAlive then
             State._lastBossAlive = bossAlive
             setRebirthPauseReason("boss", bossAlive)
+            -- ★ v32：Boss 刚死瞬间清零速度
+            if not bossAlive then
+                local hrp = State.cache.hrp
+                if hrp then
+                    pcall(function()
+                        hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+                        hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
+                    end)
+                end
+            end
         end
     end,
 })
@@ -2106,7 +2210,11 @@ local TASK_FAIL_LIMIT = 10
 local TASK_DISABLE_DURATION = 30
 
 local function updateGlobal(dt)
-    local wantZero = State.killEnabled or State.autoTeleport or State.kingKillActive
+    -- ★ v32：Boss 死后的宝箱阶段保持零重力
+    local chestPhase = State.autoBoss and State.autoChest
+        and State.bossKilledAt > 0
+        and (tick() - State.bossKilledAt) < 30
+    local wantZero = State.killEnabled or State.autoTeleport or State.kingKillActive or chestPhase
     if wantZero then
         if Workspace.Gravity ~= 0 then pcall(function() Workspace.Gravity = 0 end) end
     else
@@ -2212,7 +2320,6 @@ local function doResetAll()
     notify("已复位", 3)
 end
 
--- 信息悬浮窗
 local function buildInfoWindow()
     local Info = State.Info
     local screen = create("ScreenGui", {
@@ -3377,6 +3484,8 @@ track(LocalPlayer.CharacterAdded:Connect(function()
     State._missingSince = 0; State._lastSuicide = 0
     State._suicideCount = 0
     State.bossKilledAt = 0; State.bossWasAlive = false
+    State.chestTaskActive = false
+    State.bossDeathPos = nil
     table.clear(State.renderCull.hidden)
     table.clear(State.petHider.own); table.clear(State.petHider.all); table.clear(State.petHider.machines)
 end))
