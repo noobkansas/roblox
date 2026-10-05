@@ -1,13 +1,10 @@
 --!nonstrict
--- 肌肉之王自动化 v23
--- UI 完全重写（紧凑顶栏+Tab，专业深色主题，可调窗口大小）
--- 修复：信息任务报错、无工具时误自杀
+-- 肌肉之王自动化 v25
+-- 修复：终极反复取错 / 宝箱独立任务 / Boss 只在存活时跑 / 快速锻炼不阻止 / 信息窗可调+滚动+每月 / UI 透明度可调 / 去 "自己 v"
 
 local SCRIPT_ID   = "__MUSCLE_KING_AUTO__"
-local VERSION     = 2300
+local VERSION     = 2500
 local CONFIG_FILE = "muscle_king_auto_config.json"
--- __VERSION__ = 2300
--- __CHANGELOG__ = "UI 完全重写（紧凑顶栏 + Tab）/ 修复信息任务报错 / 修复无工具时误自杀 / 移除 emoji"
 
 do
     local existing = _G[SCRIPT_ID]
@@ -27,7 +24,7 @@ local HttpService       = game:GetService("HttpService")
 local SoundService      = game:GetService("SoundService")
 local MarketplaceService= game:GetService("MarketplaceService")
 local VirtualUser       = game:GetService("VirtualUser")
-local StarterGui        = game:GetService("StarterGui")
+local VirtualInputManager = game:GetService("VirtualInputManager")
 
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
@@ -63,39 +60,36 @@ local E_CamCustom  = Enum.CameraType.Custom
 
 local isMobile = UIS_Touch and not UIS_Kb
 
--- 新配色（专业深色蓝紫）
 local Theme = {
-    Bg         = C3(17, 19, 26),
-    Surface    = C3(23, 26, 34),
-    SurfaceAlt = C3(30, 34, 45),
-    Border     = C3(43, 48, 62),
-    Accent     = C3(88, 130, 255),
-    AccentDim  = C3(38, 58, 110),
-    Success    = C3(96, 212, 144),
-    Warning    = C3(244, 184, 96),
-    Danger     = C3(230, 96, 96),
-    Text       = C3(226, 230, 240),
-    TextDim    = C3(140, 148, 168),
-    TextMuted  = C3(90, 98, 116),
+    Bg         = C3(15, 17, 23),
+    Surface    = C3(24, 27, 36),
+    SurfaceAlt = C3(34, 38, 50),
+    Border     = C3(52, 58, 74),
+    Accent     = C3(102, 145, 255),
+    AccentDim  = C3(45, 65, 120),
+    Success    = C3(105, 210, 145),
+    Warning    = C3(240, 185, 100),
+    Danger     = C3(230, 100, 100),
+    Text       = C3(238, 242, 250),
+    TextDim    = C3(165, 172, 190),
+    TextMuted  = C3(110, 120, 140),
 }
 
 local DEFAULT = {
-    uiWidthPct = 40,   -- 窗口宽度占屏幕比例
-    uiHeightPct = 46,  -- 窗口高度占屏幕比例
+    uiWidthPct = 40,
+    uiHeightPct = 46,
     mainPos = UD2n(0.5, -260, 0.5, -190),
-    infoPos = UD2n(1, -300, 1, -420),
+    infoPos = UD2n(1, -300, 1, -440),
 }
 
--- ============================================================
--- 状态
--- ============================================================
 local State = {
     destroyed = false, conns = {}, ui = {},
 
     autoTrain = false, fastTrain = false, fastRate = 20,
     toolDumbbell = false, toolPushups = false,
     toolHandstands = false, toolSitups = false,
-    lastToolCheck = 0, toolCooldown = false, _noToolWarned = false,
+    lastToolCheck = 0, toolCooldown = false,
+    _missingSince = 0, _lastSuicide = 0, _suicideCount = 0,
 
     autoTeleport = false, lastTeleportAt = 0, lastCameraFix = 0,
     autoRebirth = false, rebirthRate = 2, lastRebirthAt = 0,
@@ -121,15 +115,28 @@ local State = {
     infoWindowEnabled = false, infoLastRefresh = 0,
     formatEnabled = true,
 
+    -- UI 透明度
+    uiBgOpacity = 1.0,
+    uiPageOpacity = 1.0,
+    infoBgOpacity = 1.0,
+    infoScale = 100,
+
     autoPetBuy = false, selectedPet = "",
     autoWheel = false,
     autoBoss = false, bossHeight = 70,
     autoPackRebirth = false, trainRate = 1200,
     autoEatEgg = false, giftAmount = 0, selectedEggTarget = "",
 
+    -- Boss / 宝箱
+    autoChest = true,           -- 自动宝箱
+    chestDelay = 5,             -- Boss 死后延迟
+    chestHoldTime = 2,          -- 长按 E 时间
+    lastBossAliveAt = 0,
+    bossWasAlive = false,
+    bossKilledAt = 0,
+
     petRepBonus = 0, petRepBonusCheckedAt = 0, petRepBonusDetail = {},
-    uiWidthPct = DEFAULT.uiWidthPct,
-    uiHeightPct = DEFAULT.uiHeightPct,
+    uiWidthPct = DEFAULT.uiWidthPct, uiHeightPct = DEFAULT.uiHeightPct,
     originalGravity = Workspace.Gravity,
     muscleEventRef = nil, rebirthEventRef = nil, lastRebirthScan = 0,
 
@@ -141,7 +148,6 @@ local State = {
     lastStrengthSnapshot = 0, strengthPerSec = 0,
     ping = 0, lastPingCheck = 0,
     friendCount = 0,
-    _lastSuicide = 0, _suicideCount = 0,
 }
 
 local FriendWhitelist = { ids = {}, loaded = false, refreshing = false, lastRefresh = 0 }
@@ -220,19 +226,16 @@ local function listLayout(p, spacing, h)
         SortOrder = E_SortL,
     }, p)
 end
-local function gradient(p, c1, c2, rot)
-    return create("UIGradient", { Color = ColorSequence.new(c1, c2 or c1), Rotation = rot or 0 }, p)
-end
 
 local function notify(text, duration)
     duration = duration or 3
     if State.destroyed or not State.ui.screen then return end
     local label = create("TextLabel", {
         AnchorPoint = V2n(0.5, 0), Position = UD2n(0.5, 0, 0.04, 0),
-        Size = UD2o(400, 40), BackgroundColor3 = Theme.Surface,
+        Size = UD2o(420, 42), BackgroundColor3 = Theme.Surface,
         BorderSizePixel = 0, Font = Font.GothamMedium,
         Text = text, TextColor3 = Theme.Text,
-        TextSize = 13, TextWrapped = true, ZIndex = 500,
+        TextSize = 14, TextWrapped = true, ZIndex = 500,
     }, State.ui.screen)
     corner(label, 10); stroke(label, Theme.Accent, 1.5, 0.3)
     task.delay(duration, function() pcall(function() label:Destroy() end) end)
@@ -251,9 +254,6 @@ local function formatNumber(n)
     return (neg and "-" or "") .. string.format("%.3f%s", n, SUFFIXES[idx])
 end
 
--- ============================================================
--- 配置
--- ============================================================
 local function saveConfig()
     if State.destroyed or type(writefile) ~= "function" then return end
     local data = {
@@ -272,6 +272,9 @@ local function saveConfig()
         hideUIEnabled = State.hideUIEnabled,
         infoWindowEnabled = State.infoWindowEnabled,
         formatEnabled = State.formatEnabled,
+        uiBgOpacity = State.uiBgOpacity, uiPageOpacity = State.uiPageOpacity,
+        infoBgOpacity = State.infoBgOpacity, infoScale = State.infoScale,
+        autoChest = State.autoChest, chestDelay = State.chestDelay, chestHoldTime = State.chestHoldTime,
         selectedPet = State.selectedPet, bossHeight = State.bossHeight,
         giftAmount = State.giftAmount,
         uiWidthPct = State.uiWidthPct, uiHeightPct = State.uiHeightPct,
@@ -292,6 +295,12 @@ local function loadConfig()
     local function n(k, f, lo, hi)
         local v = tonumber(data[k]) if not v then return f end
         v = math.floor(v)
+        if lo then v = math.max(lo, v) end
+        if hi then v = math.min(hi, v) end
+        return v
+    end
+    local function fl(k, f, lo, hi)
+        local v = tonumber(data[k]) if not v then return f end
         if lo then v = math.max(lo, v) end
         if hi then v = math.min(hi, v) end
         return v
@@ -322,6 +331,13 @@ local function loadConfig()
     State.hideUIEnabled = b("hideUIEnabled", State.hideUIEnabled)
     State.infoWindowEnabled = b("infoWindowEnabled", State.infoWindowEnabled)
     State.formatEnabled = b("formatEnabled", State.formatEnabled)
+    State.uiBgOpacity = fl("uiBgOpacity", State.uiBgOpacity, 0.3, 1.0)
+    State.uiPageOpacity = fl("uiPageOpacity", State.uiPageOpacity, 0.3, 1.0)
+    State.infoBgOpacity = fl("infoBgOpacity", State.infoBgOpacity, 0.3, 1.0)
+    State.infoScale = n("infoScale", State.infoScale, 60, 200)
+    State.autoChest = b("autoChest", State.autoChest)
+    State.chestDelay = n("chestDelay", State.chestDelay, 0, 30)
+    State.chestHoldTime = n("chestHoldTime", State.chestHoldTime, 1, 10)
     if type(data.selectedPet) == "string" then State.selectedPet = data.selectedPet end
     State.bossHeight = n("bossHeight", State.bossHeight, 0, 200)
     State.giftAmount = n("giftAmount", State.giftAmount, 0, 9999)
@@ -329,9 +345,7 @@ local function loadConfig()
     State.uiHeightPct = n("uiHeightPct", State.uiHeightPct, 30, 90)
 end
 
--- ============================================================
 -- 反复速度
--- ============================================================
 local function collectPetRepTimes()
     local sumPct, timeMul = 0, 1
     local own = Workspace:FindFirstChild(LocalPlayer.Name)
@@ -364,11 +378,18 @@ local function collectPetRepTimes()
     end
     return sumPct, timeMul
 end
+
+-- ★ v25 修复：终极反复用 GetAttribute（dump 里是 Attr）
 local function readUltPct()
+    -- 优先 Attribute
+    local a = LocalPlayer:GetAttribute("UltimateRepSpeed")
+    if type(a) == "number" then return a * 5 end
+    -- 回退 ValueBase
     local v = LocalPlayer:FindFirstChild("UltimateRepSpeed")
     if v and v:IsA("ValueBase") then return (tonumber(v.Value) or 0) * 5 end
     return 0
 end
+
 local function checkX2Pass()
     local now = tick()
     if now - RepCache.lastPassCheck < 60 then return RepCache.x2 end
@@ -392,9 +413,7 @@ local function refreshRepSpeed()
     RepCache.speedMul = 1 / tt
 end
 
--- ============================================================
--- 性能 / 隐藏
--- ============================================================
+-- 性能
 local AntiLag = { enabled = false, rescanAt = 0, particles = {}, shadows = {}, sounds = {}, lighting = nil, postEffects = {}, atmospheres = {} }
 local POST = { BloomEffect = true, BlurEffect = true, SunRaysEffect = true, ColorCorrectionEffect = true, DepthOfFieldEffect = true }
 local function scanAntiLag()
@@ -469,9 +488,7 @@ end
 local function uncullModel(m)
     local s = RenderCull.hidden[m]; if not s then return end
     for p, v in pairs(s) do
-        if p.Parent then
-            pcall(function() p.LocalTransparencyModifier = v.ltm; p.Transparency = v.tr end)
-        end
+        if p.Parent then pcall(function() p.LocalTransparencyModifier = v.ltm; p.Transparency = v.tr end) end
     end
     RenderCull.hidden[m] = nil
 end
@@ -493,9 +510,7 @@ local function scanRenderCull()
             end
         end
     end
-    for m in pairs(RenderCull.hidden) do
-        if not m.Parent then RenderCull.hidden[m] = nil end
-    end
+    for m in pairs(RenderCull.hidden) do if not m.Parent then RenderCull.hidden[m] = nil end end
     RenderCull.rescanAt = State.time + 1
 end
 local function disableRenderCull()
@@ -507,17 +522,13 @@ local PetHider = { own = {}, all = {}, machines = {}, rescanAt = 0 }
 local function hidePart(m)
     if not m or not m.Parent then return end
     for _, p in ipairs(m:GetDescendants()) do
-        if p:IsA("BasePart") then
-            pcall(function() p.LocalTransparencyModifier = 1; p.Transparency = 1 end)
-        end
+        if p:IsA("BasePart") then pcall(function() p.LocalTransparencyModifier = 1; p.Transparency = 1 end) end
     end
 end
 local function showPart(m)
     if not m or not m.Parent then return end
     for _, p in ipairs(m:GetDescendants()) do
-        if p:IsA("BasePart") then
-            pcall(function() p.LocalTransparencyModifier = 0; p.Transparency = 0 end)
-        end
+        if p:IsA("BasePart") then pcall(function() p.LocalTransparencyModifier = 0; p.Transparency = 0 end) end
     end
 end
 local function scanHidePets()
@@ -638,9 +649,7 @@ local function sweepOverflow()
     for i = #HiddenUIs, 1, -1 do if not HiddenUIs[i].Parent then table.remove(HiddenUIs, i) end end
 end
 
--- ============================================================
--- 工具切换（修复：无选中工具时不自杀）
--- ============================================================
+-- 工具
 local TOOL_KW = {
     dumbbell   = { "barbell", "dumbbell", "weight", "哑铃", "杠铃" },
     pushups    = { "pushup", "push up", "push-up", "俯卧撑" },
@@ -757,9 +766,7 @@ local function getMuscleKing()
     return nil
 end
 
--- ============================================================
 -- 传送
--- ============================================================
 local PortalCache, PortalCacheAt = nil, 0
 local function getPortal()
     if PortalCache and PortalCache.Parent and State.time - PortalCacheAt < 5 then return PortalCache end
@@ -805,9 +812,7 @@ local function teleportTo(pos)
     end)
 end
 
--- ============================================================
 -- 杀戮
--- ============================================================
 local function getCharHRP(plr)
     local c = plr and plr.Character
     if not c then return nil end
@@ -941,9 +946,7 @@ local function updateDualTool()
     end
 end
 
--- ============================================================
 -- 宠物商店
--- ============================================================
 local FALLBACK_PETS = {
     "不稳定幻影", "以太仙灵小兔", "伏特爪", "冰波传奇企鹅", "反应堆兽",
     "地狱火", "地狱火龙", "大超新星", "幻影创世龙", "星界电光",
@@ -990,9 +993,6 @@ local function buyPet(name)
     return false, tostring(err)
 end
 
--- ============================================================
--- 自动轮盘
--- ============================================================
 local function runWheel()
     pcall(function()
         local r = ReplicatedStorage:FindFirstChild("rEvents")
@@ -1008,15 +1008,14 @@ local function runWheel()
     end)
 end
 
--- ============================================================
--- Boss 战
--- ============================================================
+-- ★ v25 Boss + 宝箱
 local BOSS_NAMES = { "Boss1", "Boss2", "Boss3", "Boss4", "Boss5" }
 local BOSS_IDLE_POS = V3n(1, 44, -1251)
 local PUNCH_ANIMS = { left = "rbxassetid://3638729053", right = "rbxassetid://3638767427" }
 local bossHoverConn = nil
-local bossPunchThread, bossScanThread, bossChestThread
+local bossPunchThread, bossScanThread
 local bossCurrent = "Boss1"
+local _bossAliveCache, _bossAliveCacheAt = false, 0
 
 local function findBossModel(name)
     local events = Workspace:FindFirstChild("Events")
@@ -1031,6 +1030,15 @@ local function isBossAlive(name)
         return h ~= nil and h.Health > 0
     end
     return b:IsA("BasePart") and b.Transparency < 1
+end
+local function isAnyBossAlive()
+    if State.time - _bossAliveCacheAt < 0.5 then return _bossAliveCache end
+    _bossAliveCacheAt = State.time
+    for _, n in ipairs(BOSS_NAMES) do
+        if isBossAlive(n) then _bossAliveCache = true; return true end
+    end
+    _bossAliveCache = false
+    return false
 end
 local function getBossPos()
     local b = findBossModel(); if not b then return nil end
@@ -1047,6 +1055,8 @@ end
 local function startBossHover()
     bossHoverConn = RS_RS:Connect(function()
         if not State.autoBoss then return end
+        -- ★ 只有 Boss 活着才悬停
+        if not isAnyBossAlive() then return end
         local hrp = Cache.hrp; if not hrp then return end
         local bp = getBossPos(); if not bp then return end
         local hoverPos = bp + V3n(0, State.bossHeight, 0)
@@ -1061,7 +1071,8 @@ local function bossPunchLoop()
     local useLeft, trackL, trackR = true, nil, nil
     local counter = 0
     while State.autoBoss do
-        if getBossPos() then
+        -- ★ 只有 Boss 活着才打
+        if isAnyBossAlive() and getBossPos() then
             counter = counter + 1
             if counter % 4 == 0 then
                 pcall(function()
@@ -1109,37 +1120,93 @@ local function bossScanLoop()
                     break
                 end
             end
-            if not found then
-                local hrp = Cache.hrp
-                if hrp then hrp.CFrame = CN(BOSS_IDLE_POS) end
-            end
-        end
-    end
-end
-local function bossChestLoop()
-    while State.autoBoss do
-        task.wait(0.4)
-        if State.autoBoss then
-            local hrp = Cache.hrp
-            local chest = Workspace:FindFirstChild("BossChest")
-            if hrp and chest then
-                for _, obj in ipairs(chest:GetDescendants()) do
-                    pcall(function()
-                        if obj:IsA("ProximityPrompt") and obj.Enabled then fireproximityprompt(obj)
-                        elseif obj:IsA("ClickDetector") then fireclickdetector(obj)
-                        elseif obj:IsA("BasePart") and obj.CanTouch and obj.Transparency < 1 then
-                            firetouchinterest(obj, hrp, 0); task.wait(0.05); firetouchinterest(obj, hrp, 1)
-                        end
-                    end)
-                end
+            -- ★ v25：只有 Boss 活着才回待机点，死了由宝箱任务接管
+            if not found and not State.bossWasAlive then
+                -- 什么都不做
             end
         end
     end
 end
 
--- ============================================================
+-- ★ v25 独立宝箱任务（优先级最高）
+local chestTaskActive = false
+local chestTaskAt = 0
+local function isChestVisible()
+    local chest = Workspace:FindFirstChild("BossChest")
+    if not chest then return nil end
+    for _, obj in ipairs(chest:GetDescendants()) do
+        if obj:IsA("BasePart") and obj.Transparency < 0.95 and obj.CanTouch ~= false then
+            return chest, obj
+        end
+    end
+    -- 也检查其他名字的宝箱
+    for _, name in ipairs({"BossChest", "Chest", "RewardChest"}) do
+        local c = Workspace:FindFirstChild(name)
+        if c then
+            for _, obj in ipairs(c:GetDescendants()) do
+                if obj:IsA("BasePart") and obj.Transparency < 0.95 then
+                    return c, obj
+                end
+            end
+        end
+    end
+    return nil
+end
+local function runChestTask()
+    if not State.autoChest then return end
+    -- 只在 Boss 死后触发
+    if isAnyBossAlive() then
+        State.bossWasAlive = true
+        State.bossKilledAt = 0
+        return
+    end
+    if State.bossWasAlive and State.bossKilledAt == 0 then
+        -- Boss 刚死
+        State.bossKilledAt = State.time
+        State.bossWasAlive = false
+    end
+    -- 等 5 秒
+    if State.bossKilledAt == 0 or State.time - State.bossKilledAt < State.chestDelay then return end
+    -- 检测宝箱可见
+    local chestModel, chestPart = isChestVisible()
+    if not chestModel or not chestPart then return end
+
+    -- 传送到宝箱上方
+    local hrp = Cache.hrp; if not hrp then return end
+    local targetCF = CN(chestPart.Position + V3n(0, 4, 0))
+    pcall(function()
+        hrp.CFrame = targetCF
+        hrp.AssemblyLinearVelocity = V3n(0, 0, 0)
+        hrp.AssemblyAngularVelocity = V3n(0, 0, 0)
+    end)
+
+    -- 长按 E 2 秒
+    if not chestTaskActive then
+        chestTaskActive = true
+        task.spawn(function()
+            local holdTime = State.chestHoldTime or 2
+            -- 方式 1：VirtualInputManager 长按 E
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+            end)
+            task.wait(holdTime)
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+            end)
+            -- 方式 2：触发所有 ProximityPrompt
+            pcall(function()
+                for _, obj in ipairs(chestModel:GetDescendants()) do
+                    if obj:IsA("ProximityPrompt") and obj.Enabled then
+                        fireproximityprompt(obj)
+                    end
+                end
+            end)
+            chestTaskActive = false
+        end)
+    end
+end
+
 -- 换包重生 / 吃蛋 / 送蛋
--- ============================================================
 local PETS_DATA = {
     ["Omega Overlord"] = { repSpeed = 20 },
     ["Swift Samurai"]  = { repSpeed = 15 },
@@ -1310,9 +1377,7 @@ local function giftEggsTo(target, amount)
     return sent
 end
 
--- ============================================================
--- 自适应 / 降级
--- ============================================================
+-- 自适应
 local function cleanupTrainingState()
     State.trainAccum = 0; State.degradeLevel = 0
     State.fpsWinTime = 0; State.fpsWinFrames = 0
@@ -1363,15 +1428,30 @@ local function handleDegradation()
     end
 end
 
--- ============================================================
 -- 任务链
--- ============================================================
 local TaskPriority = {
-    AFK = 200, KING_KILL = 160, KILL = 150, DUAL = 140, REBIRTH = 120,
-    WHEEL = 110, TELEPORT = 100, BOSS = 95, CAMERA = 90, INFO = 85,
-    PETBUY = 82, TOOL = 80, TRAIN = 60, EGG = 58, RESET = 55,
-    ANTILAG = 40, CULL = 35, HIDER = 30, TEX = 25, FRIEND = 22,
-    SWEEP = 20, SAVE = 10,
+    AFK = 200,
+    CHEST = 195,      -- 宝箱任务最高
+    BOSS = 190,
+    KING_KILL = 180,
+    KILL = 150,
+    DUAL = 140,
+    REBIRTH = 120,
+    WHEEL = 110,
+    TELEPORT = 100,
+    CAMERA = 90,
+    INFO = 85,
+    PETBUY = 82,
+    TOOL = 80,
+    TRAIN = 60,
+    EGG = 58,
+    ANTILAG = 40,
+    CULL = 35,
+    HIDER = 30,
+    TEX = 25,
+    FRIEND = 22,
+    SWEEP = 20,
+    SAVE = 10,
 }
 local TaskChain = {}
 local function register(t)
@@ -1400,13 +1480,48 @@ register({ id = "afk", priority = TaskPriority.AFK,
         end
     end,
 })
+
+-- ★ v25 宝箱任务
+register({ id = "chest", priority = TaskPriority.CHEST,
+    enabled = function() return State.autoChest end,
+    tick = runChestTask,
+})
+
+register({ id = "boss", priority = TaskPriority.BOSS,
+    enabled = function() return State.autoBoss end,
+    onEnable = function()
+        if not bossPunchThread or coroutine.status(bossPunchThread) == "dead" then
+            destroyPortals(); startBossHover()
+            bossPunchThread = task.spawn(bossPunchLoop)
+            bossScanThread = task.spawn(bossScanLoop)
+        end
+    end,
+    onDisable = function()
+        if bossHoverConn then pcall(function() bossHoverConn:Disconnect() end); bossHoverConn = nil end
+        if bossPunchThread then pcall(function() task.cancel(bossPunchThread) end); bossPunchThread = nil end
+        if bossScanThread then pcall(function() task.cancel(bossScanThread) end); bossScanThread = nil end
+    end,
+    tick = function()
+        -- Boss 存在时自动关杀戮
+        if isAnyBossAlive() and State.killEnabled then
+            State.killEnabled = false
+            if State.ui.killToggle then State.ui.killToggle.set(false) end
+            notify("检测到 Boss，自动杀戮已暂停", 4)
+        end
+    end,
+})
 register({ id = "kingKill", priority = TaskPriority.KING_KILL,
-    enabled = function() return State.autoKingKill end,
+    enabled = function()
+        return State.autoKingKill and not (State.autoBoss and isAnyBossAlive())
+    end,
     onDisable = function() State.kingKillTarget = nil; State.kingKillActive = false end,
     tick = runKingKillTick,
 })
 register({ id = "kill", priority = TaskPriority.KILL,
-    enabled = function() return State.killEnabled and not State.kingKillActive end,
+    enabled = function()
+        return State.killEnabled and not State.kingKillActive
+            and not (State.autoBoss and isAnyBossAlive())
+    end,
     onEnable = function()
         State.killSavedState = { autoTeleport = State.autoTeleport }
         State.autoTeleport = false
@@ -1427,6 +1542,7 @@ register({ id = "dual", priority = TaskPriority.DUAL,
     enabled = function()
         return State.dualEnabled and State.killEnabled and State.killTarget ~= nil
             and (State.autoTrain or State.fastTrain) and not State.kingKillActive
+            and not (State.autoBoss and isAnyBossAlive())
     end,
     onDisable = function() State.dualCurrentMode = "punch" end,
     tick = updateDualTool,
@@ -1447,7 +1563,11 @@ register({ id = "wheel", priority = TaskPriority.WHEEL,
     tick = function() end,
 })
 register({ id = "teleport", priority = TaskPriority.TELEPORT,
-    enabled = function() return State.autoTeleport and not State.killEnabled and not State.kingKillActive end,
+    enabled = function()
+        return State.autoTeleport and not State.killEnabled
+            and not State.kingKillActive
+            and not (State.autoBoss and isAnyBossAlive())
+    end,
     tick = function()
         if State.time - State.lastTeleportAt >= 0.05 then
             State.lastTeleportAt = State.time
@@ -1455,26 +1575,8 @@ register({ id = "teleport", priority = TaskPriority.TELEPORT,
         end
     end,
 })
-register({ id = "boss", priority = TaskPriority.BOSS,
-    enabled = function() return State.autoBoss end,
-    onEnable = function()
-        if not bossPunchThread or coroutine.status(bossPunchThread) == "dead" then
-            destroyPortals(); startBossHover()
-            bossPunchThread = task.spawn(bossPunchLoop)
-            bossScanThread = task.spawn(bossScanLoop)
-            bossChestThread = task.spawn(bossChestLoop)
-        end
-    end,
-    onDisable = function()
-        if bossHoverConn then pcall(function() bossHoverConn:Disconnect() end); bossHoverConn = nil end
-        if bossPunchThread then pcall(function() task.cancel(bossPunchThread) end); bossPunchThread = nil end
-        if bossScanThread then pcall(function() task.cancel(bossScanThread) end); bossScanThread = nil end
-        if bossChestThread then pcall(function() task.cancel(bossChestThread) end); bossChestThread = nil end
-    end,
-    tick = function() end,
-})
 register({ id = "camera", priority = TaskPriority.CAMERA,
-    enabled = function() return State.killEnabled or State.autoTeleport or State.kingKillActive end,
+    enabled = function() return State.killEnabled or State.autoTeleport or State.kingKillActive or State.autoBoss end,
     tick = function()
         if State.time - State.lastCameraFix >= 0.5 then
             State.lastCameraFix = State.time
@@ -1529,52 +1631,43 @@ register({ id = "petbuy", priority = TaskPriority.PETBUY,
 })
 register({ id = "tool", priority = TaskPriority.TOOL,
     enabled = function()
-        return (State.autoTrain or State.fastTrain) and not State.toolCooldown
-            and not State.toolOwnedByKill and not State.kingKillActive
+        return (State.autoTrain or State.fastTrain)
+            and not State.toolCooldown and not State.toolOwnedByKill and not State.kingKillActive
     end,
     tick = function()
         if State.time - State.lastToolCheck < 0.1 then return end
         State.lastToolCheck = State.time
-        -- 收集用户主动选中的工具
         local sel = {}
         if State.toolPushups then table.insert(sel, TOOL_KW.pushups) end
         if State.toolHandstands then table.insert(sel, TOOL_KW.handstands) end
         if State.toolSitups then table.insert(sel, TOOL_KW.situps) end
         if State.toolDumbbell then table.insert(sel, TOOL_KW.dumbbell) end
-        if #sel == 0 then return end -- 一个都没选，什么都不做
-
-        -- 优先特殊工具，兜底哑铃
+        if #sel == 0 then State._missingSince = 0; return end
         local equipped = false
-        for _, kw in ipairs(sel) do
-            if tryEquip(kw) then equipped = true; break end
-        end
-
-        -- 所有选中的工具是否都不存在
-        if not equipped then
-            local anyExist = false
-            for _, kw in ipairs(sel) do
-                if toolExists(kw) then anyExist = true; break end
-            end
-            if not anyExist then
-                -- 所有选中工具都不存在，尝试自杀重生（有次数限制避免循环自杀）
-                if State.time - State._lastSuicide > 60 then
-                    State._lastSuicide = State.time
-                    State._suicideCount = (State._suicideCount or 0) + 1
-                    if State._suicideCount <= 3 then
-                        State.toolCooldown = true
-                        notify(string.format("未找到训练工具，第 %d 次自杀重生", State._suicideCount), 4)
-                        suicide()
-                        task.delay(15, function() if not State.destroyed then State.toolCooldown = false end end)
-                    else
-                        notify("连续找不到工具，已停止自动切换，请检查背包", 6)
-                    end
-                end
-            end
+        for _, kw in ipairs(sel) do if tryEquip(kw) then equipped = true; break end end
+        if equipped then State._missingSince = 0; return end
+        local anyExist = false
+        for _, kw in ipairs(sel) do if toolExists(kw) then anyExist = true; break end end
+        if anyExist then State._missingSince = 0; return end
+        if State._missingSince == 0 then State._missingSince = State.time end
+        if State.time - State._missingSince < 1.0 then return end
+        if State.time - State._lastSuicide < 60 then return end
+        State._lastSuicide = State.time
+        State._suicideCount = (State._suicideCount or 0) + 1
+        if State._suicideCount <= 3 then
+            State.toolCooldown = true
+            notify(string.format("未找到训练工具，第 %d 次重生", State._suicideCount), 4)
+            suicide()
+            task.delay(15, function() if not State.destroyed then State.toolCooldown = false end end)
+        else
+            notify("连续找不到工具，已停止自动切换", 6)
         end
     end,
 })
 register({ id = "train", priority = TaskPriority.TRAIN,
-    enabled = function() return (State.autoTrain or State.fastTrain) and not State.kingKillActive and not State.autoPackRebirth end,
+    enabled = function()
+        return (State.autoTrain or State.fastTrain) and not State.kingKillActive and not State.autoPackRebirth
+    end,
     tick = function(dt)
         local rate = State.fastTrain and State.fastRate or (State.autoTrain and 10 or 0)
         if rate <= 0 then return end
@@ -1726,9 +1819,6 @@ local function destroy()
     if _G[SCRIPT_ID] and _G[SCRIPT_ID].version == VERSION then _G[SCRIPT_ID] = nil end
 end
 
--- ============================================================
--- 复位
--- ============================================================
 local ResetBtnState = { pressAt = 0, holding = false, lastStep = 0 }
 local function doResetAll()
     State.uiWidthPct = DEFAULT.uiWidthPct
@@ -1737,7 +1827,7 @@ local function doResetAll()
     if Info.frames.frame then
         Info.frames.frame.Position = DEFAULT.infoPos
         Info.minimized = false
-        Info.frames.frame.Size = UD2o(300, 420)
+        Info.frames.frame.Size = UD2o(300, 460)
         if Info.frames.playerBtn then Info.frames.playerBtn.Visible = true end
         if Info.frames.dataFrame then Info.frames.dataFrame.Visible = true end
     end
@@ -1750,12 +1840,12 @@ local function buildResetButton()
     local btn = create("TextButton", {
         Name = "ResetBtn", AnchorPoint = V2n(0, 1),
         Position = UD2n(0, 16, 1, -16), Size = UD2o(44, 44),
-        BackgroundColor3 = Theme.Surface, BackgroundTransparency = 0.15,
+        BackgroundColor3 = Theme.Surface, BackgroundTransparency = 0.1,
         BorderSizePixel = 0, Text = "复位",
-        Font = Font.GothamBold, TextColor3 = Theme.TextDim, TextSize = 11,
+        Font = Font.GothamBold, TextColor3 = Theme.TextDim, TextSize = 12,
         ZIndex = 150,
     }, screen)
-    corner(btn, 22); stroke(btn, Theme.Border, 1, 0.5)
+    corner(btn, 22); stroke(btn, Theme.Border, 1, 0.4)
     State.ui.resetBtn = btn
     track(btn.InputBegan:Connect(function(input)
         if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
@@ -1791,9 +1881,7 @@ local function tickResetButton()
     end
 end
 
--- ============================================================
--- 信息悬浮窗
--- ============================================================
+-- 信息悬浮窗（可滚动 + 可调大小 + 每月 + 无 "自己 v"）
 local Info = { viewingPlayer = nil, listOpen = false, minimized = false, rows = {}, frames = {} }
 local function buildInfoWindow()
     local screen = create("ScreenGui", {
@@ -1808,15 +1896,16 @@ local function buildInfoWindow()
 
     local frame = create("Frame", {
         Name = "InfoFrame", AnchorPoint = V2n(0, 0),
-        Position = DEFAULT.infoPos, Size = UD2o(280, 420),
+        Position = DEFAULT.infoPos, Size = UD2o(300, 460),
         BackgroundColor3 = Theme.Bg, BorderSizePixel = 0,
         ClipsDescendants = true, Active = true,
     }, screen)
     Info.frames.frame = frame
     corner(frame, 12); stroke(frame, Theme.Border, 1)
 
+    -- 标题栏
     local tb = create("Frame", {
-        Size = UD2n(1, 0, 0, 32), BackgroundColor3 = Theme.Surface,
+        Size = UD2n(1, 0, 0, 34), BackgroundColor3 = Theme.Surface,
         BorderSizePixel = 0, Active = true,
     }, frame)
     corner(tb, 12)
@@ -1824,30 +1913,31 @@ local function buildInfoWindow()
         BackgroundTransparency = 1, Position = UD2o(12, 0),
         Size = UD2n(1, -80, 1, 0),
         Font = Font.GothamBold, Text = "实时信息",
-        TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
+        TextColor3 = Theme.Text, TextSize = 14, TextXAlignment = E_TxtXL,
     }, tb)
     local minBtn = create("TextButton", {
-        Size = UD2o(22, 22), Position = UD2n(1, -50, 0, 5),
+        Size = UD2o(22, 22), Position = UD2n(1, -50, 0, 6),
         BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
         Font = Font.GothamBold, Text = "-", TextColor3 = Theme.TextDim, TextSize = 14,
     }, tb); corner(minBtn, 6)
     local closeBtn = create("TextButton", {
-        Size = UD2o(22, 22), Position = UD2n(1, -26, 0, 5),
+        Size = UD2o(22, 22), Position = UD2n(1, -26, 0, 6),
         BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
         Font = Font.GothamBold, Text = "x", TextColor3 = Theme.TextDim, TextSize = 14,
     }, tb); corner(closeBtn, 6)
 
+    -- 玩家选择按钮
     local playerBtn = create("TextButton", {
-        Position = UD2o(10, 40), Size = UD2n(1, -20, 0, 30),
+        Position = UD2o(10, 42), Size = UD2n(1, -20, 0, 30),
         BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
-        Font = Font.GothamMedium, Text = "查看：自己 v",
-        TextColor3 = Theme.Text, TextSize = 12,
+        Font = Font.GothamMedium, Text = "查看：自己",
+        TextColor3 = Theme.Text, TextSize = 13,
     }, frame)
     corner(playerBtn, 8); stroke(playerBtn, Theme.Border, 1, 0.5)
     Info.frames.playerBtn = playerBtn
 
     local listFrame = create("ScrollingFrame", {
-        Position = UD2o(10, 74), Size = UD2n(1, -20, 0, 150),
+        Position = UD2o(10, 76), Size = UD2n(1, -20, 0, 150),
         BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
         ScrollBarThickness = 4, ScrollBarImageColor3 = Theme.Accent,
         CanvasSize = UD2n(0, 0, 0, 0), AutomaticCanvasSize = E_AS_Y,
@@ -1857,28 +1947,40 @@ local function buildInfoWindow()
     listLayout(listFrame, 2); padding(listFrame, 4, 4, 4, 4)
     Info.frames.listFrame = listFrame
 
-    local dataFrame = create("Frame", {
-        Position = UD2o(0, 112), Size = UD2n(1, 0, 1, -112),
-        BackgroundTransparency = 1,
+    -- ★ v25：数据区改为可滚动
+    local dataFrame = create("ScrollingFrame", {
+        Position = UD2o(0, 114), Size = UD2n(1, 0, 1, -114),
+        BackgroundTransparency = 1, BorderSizePixel = 0,
+        ScrollBarThickness = 5, ScrollBarImageColor3 = Theme.Accent,
+        CanvasSize = UD2n(0, 0, 0, 0), AutomaticCanvasSize = E_AS_Y,
+        ScrollingDirection = E_ScrollY, ClipsDescendants = true,
     }, frame)
     padding(dataFrame, 6, 6, 10, 10)
     listLayout(dataFrame, 4)
     Info.frames.dataFrame = dataFrame
 
+    -- ★ v25：右下角小拖拽调整大小
+    local resizeHandle = create("TextButton", {
+        Size = UD2o(16, 16), Position = UD2n(1, -18, 1, -18),
+        BackgroundColor3 = Theme.Accent, BorderSizePixel = 0,
+        Text = "", ZIndex = 10,
+    }, frame)
+    corner(resizeHandle, 4)
+
     local function createRow(label, order)
         local row = create("Frame", {
-            Size = UD2n(1, 0, 0, 22), BackgroundTransparency = 1, LayoutOrder = order,
+            Size = UD2n(1, 0, 0, 23), BackgroundTransparency = 1, LayoutOrder = order,
         }, dataFrame)
         create("TextLabel", {
             BackgroundTransparency = 1, Size = UD2n(0.55, 0, 1, 0),
             Font = Font.GothamMedium, Text = label,
-            TextColor3 = Theme.TextDim, TextSize = 12, TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.TextDim, TextSize = 13, TextXAlignment = E_TxtXL,
         }, row)
         local val = create("TextLabel", {
             BackgroundTransparency = 1, Position = UD2n(0.55, 0, 0, 0),
             Size = UD2n(0.45, 0, 1, 0),
             Font = Font.GothamBold, Text = "-",
-            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXR,
+            TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXR,
         }, row)
         return val
     end
@@ -1894,9 +1996,11 @@ local function buildInfoWindow()
     Info.rows.speedMul   = createRow("综合速度", 10)
     Info.rows.perHour    = createRow("每小时预计", 11)
     Info.rows.perDay     = createRow("每天预计", 12)
-    Info.rows.pingRow    = createRow("网络延迟", 13)
-    Info.rows.friendRow  = createRow("好友白名单", 14)
+    Info.rows.perMonth   = createRow("每月预计", 13)
+    Info.rows.pingRow    = createRow("网络延迟", 14)
+    Info.rows.friendRow  = createRow("好友白名单", 15)
 
+    -- 拖动
     local dragging, dragStart, startPos = false, nil, nil
     track(tb.InputBegan:Connect(function(input)
         if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
@@ -1919,14 +2023,34 @@ local function buildInfoWindow()
         if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then dragging = false end
     end))
 
+    -- ★ v25：调整大小
+    local resizing, resizeStart, resizeStartSize = false, nil, nil
+    track(resizeHandle.InputBegan:Connect(function(input)
+        if input.UserInputType ~= E_UI_MB1 and input.UserInputType ~= E_UI_Touch then return end
+        resizing = true; resizeStart = input.Position; resizeStartSize = frame.Size
+    end))
+    track(UIS_IC:Connect(function(input)
+        if not resizing then return end
+        if input.UserInputType ~= E_UI_MMove and input.UserInputType ~= E_UI_Touch then return end
+        local d = input.Position - resizeStart
+        local nw = math.max(220, math.min(600, resizeStartSize.X.Offset + d.X))
+        local nh = math.max(200, math.min(700, resizeStartSize.Y.Offset + d.Y))
+        frame.Size = UD2o(nw, nh)
+    end))
+    track(UIS_IE:Connect(function(input)
+        if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then resizing = false end
+    end))
+
     track(minBtn.MouseButton1Click:Connect(function()
         Info.minimized = not Info.minimized
         if Info.minimized then
             playerBtn.Visible = false; listFrame.Visible = false; dataFrame.Visible = false
-            frame.Size = UD2o(280, 32); minBtn.Text = "+"
+            resizeHandle.Visible = false
+            frame.Size = UD2o(300, 34); minBtn.Text = "+"
         else
             playerBtn.Visible = true; dataFrame.Visible = true
-            frame.Size = UD2o(280, 420); minBtn.Text = "-"
+            resizeHandle.Visible = true
+            frame.Size = UD2o(300, 460); minBtn.Text = "-"
         end
     end))
     track(closeBtn.MouseButton1Click:Connect(function()
@@ -1942,17 +2066,20 @@ local function buildInfoWindow()
             local ord = 0
             local function addRow(plr)
                 ord = ord + 1
-                local nm = plr == LocalPlayer and (plr.Name .. " (自己)") or plr.Name
+                local nm
+                if plr == LocalPlayer then nm = plr.Name .. " (自己)"
+                else nm = plr.Name end
                 if State.friendWhitelist and plr ~= LocalPlayer and isFriend(plr) then nm = nm .. " [友]" end
                 local b = create("TextButton", {
-                    Size = UD2n(1, 0, 0, 24), BackgroundColor3 = Theme.SurfaceAlt,
+                    Size = UD2n(1, 0, 0, 25), BackgroundColor3 = Theme.SurfaceAlt,
                     BorderSizePixel = 0, Font = Font.GothamMedium,
-                    Text = nm, TextColor3 = Theme.Text, TextSize = 12, LayoutOrder = ord,
+                    Text = nm, TextColor3 = Theme.Text, TextSize = 13, LayoutOrder = ord,
                 }, listFrame)
                 corner(b, 6)
                 track(b.MouseButton1Click:Connect(function()
                     Info.viewingPlayer = plr
-                    playerBtn.Text = "查看：" .. (plr == LocalPlayer and "自己" or plr.Name) .. " v"
+                    if plr == LocalPlayer then playerBtn.Text = "查看：自己"
+                    else playerBtn.Text = "查看：" .. plr.Name end
                     Info.listOpen = false; listFrame.Visible = false
                 end))
             end
@@ -1981,7 +2108,7 @@ function refreshInfoWindow()
     local plr = Info.viewingPlayer
     if not plr or not plr.Parent then
         Info.viewingPlayer = LocalPlayer; plr = LocalPlayer
-        if Info.frames.playerBtn then Info.frames.playerBtn.Text = "查看：自己 v" end
+        if Info.frames.playerBtn then Info.frames.playerBtn.Text = "查看：自己" end
     end
     Info.rows.strength.Text = formatNumber(stat(plr, "Strength"))
     Info.rows.gems.Text = formatNumber(stat(plr, "Gems"))
@@ -2002,8 +2129,10 @@ function refreshInfoWindow()
         Info.rows.passRep.TextColor3 = RepCache.x2 and Theme.Success or Theme.TextDim
         Info.rows.speedMul.Text = string.format("%.2fx", RepCache.speedMul)
         Info.rows.speedMul.TextColor3 = RepCache.speedMul >= 2 and Theme.Success or Theme.Text
-        Info.rows.perHour.Text = formatNumber(State.strengthPerSec * 3600)
-        Info.rows.perDay.Text = formatNumber(State.strengthPerSec * 86400)
+        local s = State.strengthPerSec
+        Info.rows.perHour.Text = formatNumber(s * 3600)
+        Info.rows.perDay.Text = formatNumber(s * 86400)
+        Info.rows.perMonth.Text = formatNumber(s * 2592000)
         local p = State.ping
         Info.rows.pingRow.Text = p > 0 and (math.floor(p) .. " ms") or "-"
         if p > 0 then
@@ -2022,15 +2151,12 @@ function refreshInfoWindow()
             Info.rows.friendRow.TextColor3 = Theme.TextDim
         end
     else
-        for _, k in ipairs({"strengthDelta","petRep","ultRep","passRep","speedMul","perHour","perDay","pingRow","friendRow"}) do
+        for _, k in ipairs({"strengthDelta","petRep","ultRep","passRep","speedMul","perHour","perDay","perMonth","pingRow","friendRow"}) do
             Info.rows[k].Text = "-"
         end
     end
 end
 
--- ============================================================
--- 窗口大小自适应
--- ============================================================
 function applyUISize()
     if not State.ui.main then return end
     local cam = Workspace.CurrentCamera; if not cam then return end
@@ -2042,17 +2168,24 @@ function applyUISize()
         State.ui.contentArea.Size = UD2n(1, 0, 1, -(44 + 36))
     end
     if State.ui.infoScale then
-        local s = math.clamp(vp.Y / 900, 0.7, 1.6)
+        local s = math.clamp(vp.Y / 900, 0.7, 1.6) * (State.infoScale / 100)
         State.ui.infoScale.Scale = s
     end
 end
 
--- ============================================================
--- 主 UI（顶栏 + 横向 Tab，紧凑专业风）
--- ============================================================
-local buildUI -- 前向声明
+local function applyUIOpacity()
+    if State.ui.main then
+        State.ui.main.BackgroundTransparency = 1 - State.uiBgOpacity
+    end
+    if State.ui.contentArea then
+        State.ui.contentArea.BackgroundTransparency = 1 - State.uiPageOpacity
+    end
+    if Info.frames.frame then
+        Info.frames.frame.BackgroundTransparency = 1 - State.infoBgOpacity
+    end
+end
 
-buildUI = function()
+local function buildUI()
     local screen = create("ScreenGui", {
         Name = "MuscleKingAutoUI", ResetOnSpawn = false,
         ZIndexBehavior = E_ZIdx, DisplayOrder = 99999,
@@ -2069,7 +2202,6 @@ buildUI = function()
     State.ui.main = main
     corner(main, 12); stroke(main, Theme.Border, 1)
 
-    -- 标题栏 44px
     local titleBar = create("Frame", {
         Name = "TitleBar", Size = UD2n(1, 0, 0, 44),
         Position = UD2o(0, 0), BackgroundColor3 = Theme.Surface,
@@ -2080,37 +2212,35 @@ buildUI = function()
         Size = UD2n(1, 0, 0, 12), Position = UD2n(0, 0, 1, -12),
         BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
     }, titleBar)
-
     create("TextLabel", {
         BackgroundTransparency = 1, Position = UD2o(16, 0),
         Size = UD2n(1, -110, 1, 0),
         Font = Font.GothamBold, Text = "肌肉之王自动化",
-        TextColor3 = Theme.Text, TextSize = 15, TextXAlignment = E_TxtXL,
+        TextColor3 = Theme.Text, TextSize = 16, TextXAlignment = E_TxtXL,
     }, titleBar)
     create("TextLabel", {
         BackgroundTransparency = 1, Position = UD2n(1, -220, 0, 0),
         Size = UD2n(0, 100, 1, 0),
         Font = Font.GothamMedium, Text = string.format("v%d", math.floor(VERSION/100)),
-        TextColor3 = Theme.TextMuted, TextSize = 11, TextXAlignment = E_TxtXR,
+        TextColor3 = Theme.TextMuted, TextSize = 12, TextXAlignment = E_TxtXR,
     }, titleBar)
 
     local minBtn = create("TextButton", {
         Size = UD2o(28, 26), Position = UD2n(1, -96, 0, 9),
         BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
-        Font = Font.GothamBold, Text = "-", TextColor3 = Theme.TextDim, TextSize = 16,
+        Font = Font.GothamBold, Text = "-", TextColor3 = Theme.TextDim, TextSize = 17,
     }, titleBar); corner(minBtn, 6)
     local hideBtn = create("TextButton", {
         Size = UD2o(28, 26), Position = UD2n(1, -64, 0, 9),
         BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
-        Font = Font.GothamBold, Text = "_", TextColor3 = Theme.TextDim, TextSize = 14,
+        Font = Font.GothamBold, Text = "_", TextColor3 = Theme.TextDim, TextSize = 15,
     }, titleBar); corner(hideBtn, 6)
     local closeBtn = create("TextButton", {
         Size = UD2o(28, 26), Position = UD2n(1, -32, 0, 9),
         BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
-        Font = Font.GothamBold, Text = "x", TextColor3 = Theme.TextDim, TextSize = 14,
+        Font = Font.GothamBold, Text = "x", TextColor3 = Theme.TextDim, TextSize = 15,
     }, titleBar); corner(closeBtn, 6)
 
-    -- Tab 栏 36px
     local tabBar = create("Frame", {
         Name = "TabBar", Size = UD2n(1, 0, 0, 36),
         Position = UD2o(0, 44), BackgroundColor3 = Theme.SurfaceAlt,
@@ -2121,7 +2251,6 @@ buildUI = function()
         BackgroundColor3 = Theme.Border, BorderSizePixel = 0,
     }, tabBar)
 
-    -- 内容区
     local contentArea = create("Frame", {
         Name = "ContentArea", Size = UD2n(1, 0, 1, -80),
         Position = UD2o(0, 80), BackgroundTransparency = 1,
@@ -2144,7 +2273,6 @@ buildUI = function()
         BackgroundColor3 = Theme.Accent, BorderSizePixel = 0, ZIndex = 3,
         Position = UD2o(0, 34),
     }, tabBar)
-    gradient(tabIndicator, Theme.Accent, Theme.Accent, 0)
 
     for i, tab in ipairs(TABS) do
         local btn = create("TextButton", {
@@ -2153,13 +2281,12 @@ buildUI = function()
             Position = UD2n((i-1)/#TABS, 0, 0, 0),
             BackgroundTransparency = 1, BorderSizePixel = 0,
             Font = Font.GothamMedium, Text = tab.label,
-            TextColor3 = Theme.TextDim, TextSize = 12, ZIndex = 2,
+            TextColor3 = Theme.TextDim, TextSize = 13, ZIndex = 2,
             AutoButtonColor = false,
         }, tabBar)
         tabButtons[i] = btn
     end
 
-    -- 内容页
     local function newPage(name)
         local page = create("ScrollingFrame", {
             Name = name, Size = UD2n(1, 0, 1, 0),
@@ -2174,48 +2301,46 @@ buildUI = function()
         return page
     end
 
-    -- 通用控件
     local function sectionLabel(parent, text)
         return create("TextLabel", {
-            Size = UD2n(1, 0, 0, 18), BackgroundTransparency = 1,
+            Size = UD2n(1, 0, 0, 20), BackgroundTransparency = 1,
             Font = Font.GothamBold, Text = text,
-            TextColor3 = Theme.TextMuted, TextSize = 11,
+            TextColor3 = Theme.TextMuted, TextSize = 12,
             TextXAlignment = E_TxtXL,
         }, parent)
     end
 
     local function divider(parent)
-        local d = create("Frame", {
+        return create("Frame", {
             Size = UD2n(1, 0, 0, 1), BackgroundColor3 = Theme.Border,
             BorderSizePixel = 0,
         }, parent)
-        return d
     end
 
     local function addToggle(parent, label, default, onChange, hint)
         local row = create("Frame", {
-            Size = UD2n(1, 0, 0, hint and 52 or 40),
+            Size = UD2n(1, 0, 0, hint and 54 or 42),
             BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
         }, parent)
         corner(row, 8); stroke(row, Theme.Border, 1, 0.5)
         create("TextLabel", {
-            BackgroundTransparency = 1, Position = UD2o(12, hint and 6 or 0),
-            Size = UD2n(1, -80, 0, hint and 22 or 40),
+            BackgroundTransparency = 1, Position = UD2o(12, hint and 7 or 0),
+            Size = UD2n(1, -80, 0, hint and 22 or 42),
             Font = Font.GothamMedium, Text = label,
-            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
         }, row)
         if hint then
             create("TextLabel", {
-                BackgroundTransparency = 1, Position = UD2o(12, 26),
+                BackgroundTransparency = 1, Position = UD2o(12, 28),
                 Size = UD2n(1, -80, 0, 20),
                 Font = Font.Gotham, Text = hint,
-                TextColor3 = Theme.TextMuted, TextSize = 10, TextXAlignment = E_TxtXL,
+                TextColor3 = Theme.TextDim, TextSize = 11, TextXAlignment = E_TxtXL,
                 TextTruncate = Enum.TextTruncate.AtEnd,
             }, row)
         end
         local tb = create("Frame", {
-            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -10, 0.5, 0),
-            Size = UD2o(40, 22), BackgroundColor3 = Theme.SurfaceAlt,
+            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -12, 0.5, 0),
+            Size = UD2o(42, 22), BackgroundColor3 = Theme.SurfaceAlt,
             BorderSizePixel = 0,
         }, row)
         corner(tb, 11)
@@ -2251,30 +2376,30 @@ buildUI = function()
 
     local function addInput(parent, label, default, minV, maxV, onChange, hint)
         local row = create("Frame", {
-            Size = UD2n(1, 0, 0, hint and 52 or 40),
+            Size = UD2n(1, 0, 0, hint and 54 or 42),
             BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
         }, parent)
         corner(row, 8); stroke(row, Theme.Border, 1, 0.5)
         create("TextLabel", {
-            BackgroundTransparency = 1, Position = UD2o(12, hint and 6 or 0),
-            Size = UD2n(1, -120, 0, hint and 22 or 40),
+            BackgroundTransparency = 1, Position = UD2o(12, hint and 7 or 0),
+            Size = UD2n(1, -120, 0, hint and 22 or 42),
             Font = Font.GothamMedium, Text = label,
-            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
         }, row)
         if hint then
             create("TextLabel", {
-                BackgroundTransparency = 1, Position = UD2o(12, 26),
+                BackgroundTransparency = 1, Position = UD2o(12, 28),
                 Size = UD2n(1, -120, 0, 20),
                 Font = Font.Gotham, Text = hint,
-                TextColor3 = Theme.TextMuted, TextSize = 10, TextXAlignment = E_TxtXL,
+                TextColor3 = Theme.TextDim, TextSize = 11, TextXAlignment = E_TxtXL,
                 TextTruncate = Enum.TextTruncate.AtEnd,
             }, row)
         end
         local box = create("TextBox", {
-            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -10, 0.5, 0),
-            Size = UD2o(90, 26), BackgroundColor3 = Theme.Bg,
+            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -12, 0.5, 0),
+            Size = UD2o(90, 28), BackgroundColor3 = Theme.Bg,
             BorderSizePixel = 0, Font = Font.GothamMedium,
-            Text = tostring(default), TextColor3 = Theme.Text, TextSize = 12,
+            Text = tostring(default), TextColor3 = Theme.Text, TextSize = 13,
             PlaceholderText = string.format("%d-%d", minV, maxV),
             PlaceholderColor3 = Theme.TextMuted, ClearTextOnFocus = false,
         }, row)
@@ -2291,10 +2416,10 @@ buildUI = function()
 
     local function addButton(parent, label, onClick, color)
         local btn = create("TextButton", {
-            Size = UD2n(1, 0, 0, 34),
+            Size = UD2n(1, 0, 0, 36),
             BackgroundColor3 = color or Theme.SurfaceAlt,
             BorderSizePixel = 0, Font = Font.GothamBold,
-            Text = label, TextColor3 = Theme.Text, TextSize = 12,
+            Text = label, TextColor3 = Theme.Text, TextSize = 13,
             AutoButtonColor = true,
         }, parent)
         corner(btn, 8); stroke(btn, Theme.Border, 1, 0.5)
@@ -2304,25 +2429,25 @@ buildUI = function()
 
     local function addSlider(parent, label, minV, maxV, default, onChange)
         local row = create("Frame", {
-            Size = UD2n(1, 0, 0, 44),
+            Size = UD2n(1, 0, 0, 46),
             BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
         }, parent)
         corner(row, 8); stroke(row, Theme.Border, 1, 0.5)
         create("TextLabel", {
-            BackgroundTransparency = 1, Position = UD2o(12, 4),
+            BackgroundTransparency = 1, Position = UD2o(12, 5),
             Size = UD2n(1, -100, 0, 16),
             Font = Font.GothamMedium, Text = label,
-            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
         }, row)
         local vl = create("TextLabel", {
             BackgroundTransparency = 1, AnchorPoint = V2n(1, 0),
-            Position = UD2n(1, -12, 0, 4),
+            Position = UD2n(1, -12, 0, 5),
             Size = UD2o(80, 16),
             Font = Font.GothamBold, Text = tostring(default),
-            TextColor3 = Theme.Accent, TextSize = 12, TextXAlignment = E_TxtXR,
+            TextColor3 = Theme.Accent, TextSize = 13, TextXAlignment = E_TxtXR,
         }, row)
         local trackBar = create("Frame", {
-            Position = UD2o(12, 26), Size = UD2n(1, -24, 0, 6),
+            Position = UD2o(12, 28), Size = UD2n(1, -24, 0, 6),
             BackgroundColor3 = Theme.SurfaceAlt, BorderSizePixel = 0,
         }, row)
         corner(trackBar, 3)
@@ -2332,7 +2457,7 @@ buildUI = function()
         }, trackBar)
         corner(fill, 3)
         local sb = create("TextButton", {
-            Size = UD2n(1, 0, 1, 16), Position = UD2o(0, -5),
+            Size = UD2n(1, 0, 1, 18), Position = UD2o(0, -6),
             BackgroundTransparency = 1, Text = "",
         }, trackBar)
         local active = false
@@ -2360,7 +2485,7 @@ buildUI = function()
 
     local function addDropdown(parent, label, values, default, onChange)
         local row = create("Frame", {
-            Size = UD2n(1, 0, 0, 40),
+            Size = UD2n(1, 0, 0, 42),
             BackgroundColor3 = Theme.Surface, BorderSizePixel = 0,
         }, parent)
         corner(row, 8); stroke(row, Theme.Border, 1, 0.5)
@@ -2368,24 +2493,26 @@ buildUI = function()
             BackgroundTransparency = 1, Position = UD2o(12, 0),
             Size = UD2n(0.4, 0, 1, 0),
             Font = Font.GothamMedium, Text = label,
-            TextColor3 = Theme.Text, TextSize = 12, TextXAlignment = E_TxtXL,
+            TextColor3 = Theme.Text, TextSize = 13, TextXAlignment = E_TxtXL,
         }, row)
         local dropBtn = create("TextButton", {
-            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -10, 0.5, 0),
-            Size = UD2o(160, 28), BackgroundColor3 = Theme.Bg,
+            AnchorPoint = V2n(1, 0.5), Position = UD2n(1, -12, 0.5, 0),
+            Size = UD2o(170, 30), BackgroundColor3 = Theme.Bg,
             BorderSizePixel = 0, Font = Font.GothamMedium,
-            Text = tostring(default or "请选择"),
-            TextColor3 = Theme.Text, TextSize = 11,
+            Text = (default and tostring(default) or "无人") .. "  v",
+            TextColor3 = Theme.Text, TextSize = 12,
             TextTruncate = Enum.TextTruncate.AtEnd,
         }, row)
         corner(dropBtn, 6); stroke(dropBtn, Theme.Border, 1)
 
         local modal = create("Frame", {
-            AnchorPoint = V2n(1, 0), Position = UD2n(1, -10, 1, 4),
-            Size = UD2o(160, 200), BackgroundColor3 = Theme.Surface,
-            BorderSizePixel = 0, Visible = false, ZIndex = 100,
-        }, row)
-        corner(modal, 8); stroke(modal, Theme.Accent, 1.5, 0.3)
+            Name = "DropModal_" .. tostring(math.random(1, 1e9)),
+            Size = UD2o(170, 220),
+            BackgroundColor3 = Theme.Surface,
+            BorderSizePixel = 0, Visible = false, ZIndex = 300,
+        }, State.ui.main)
+        corner(modal, 8); stroke(modal, Theme.Accent, 1.5, 0.2)
+
         local list = create("ScrollingFrame", {
             Size = UD2n(1, 0, 1, 0), BackgroundTransparency = 1,
             BorderSizePixel = 0, ScrollBarThickness = 4,
@@ -2395,34 +2522,66 @@ buildUI = function()
         }, modal)
         padding(list, 4, 4, 4, 4)
         listLayout(list, 2)
+
         local function draw()
             for _, c in ipairs(list:GetChildren()) do
                 if c:IsA("TextButton") then c:Destroy() end
             end
             for i, v in ipairs(values) do
                 local opt = create("TextButton", {
-                    Size = UD2n(1, 0, 0, 24), BackgroundColor3 = Theme.SurfaceAlt,
+                    Size = UD2n(1, 0, 0, 26), BackgroundColor3 = Theme.SurfaceAlt,
                     BorderSizePixel = 0, Font = Font.GothamMedium,
                     Text = tostring(v), TextColor3 = Theme.Text,
-                    TextSize = 11, LayoutOrder = i,
-                    TextXAlignment = E_TxtXL,
+                    TextSize = 12, LayoutOrder = i,
+                    TextXAlignment = E_TxtXL, TextTruncate = Enum.TextTruncate.AtEnd,
                 }, list)
-                corner(opt, 5); padding(opt, 0, 0, 8, 0)
+                corner(opt, 5); padding(opt, 0, 0, 8, 8)
                 track(opt.MouseButton1Click:Connect(function()
-                    dropBtn.Text = tostring(v)
+                    dropBtn.Text = tostring(v) .. "  v"
                     modal.Visible = false
                     if onChange then onChange(v) end
                 end))
             end
         end
         draw()
+
+        local function positionModal()
+            local m = State.ui.main; if not m then return end
+            local bp = dropBtn.AbsolutePosition
+            local bs = dropBtn.AbsoluteSize
+            local mp = m.AbsolutePosition
+            local ms = m.AbsoluteSize
+            local scale = (State.ui.mainScale and State.ui.mainScale.Scale) or 1
+            local mx = (bp.X - mp.X) / scale + (bs.X / scale) - 170
+            local my = (bp.Y - mp.Y) / scale + (bs.Y / scale) + 4
+            if mx < 4 then mx = 4 end
+            if mx + 170 > (ms.X / scale) - 4 then mx = (ms.X / scale) - 174 end
+            if my + 220 > (ms.Y / scale) - 4 then my = (bp.Y - mp.Y) / scale - 224 end
+            modal.Position = UD2o(mx, my)
+        end
+
         track(dropBtn.MouseButton1Click:Connect(function()
-            modal.Visible = not modal.Visible
+            if modal.Visible then modal.Visible = false; return end
+            positionModal(); modal.Visible = true
         end))
+        track(UIS_IB:Connect(function(i)
+            if not modal.Visible then return end
+            if i.UserInputType ~= E_UI_MB1 and i.UserInputType ~= E_UI_Touch then return end
+            local ap = modal.AbsolutePosition; local as = modal.AbsoluteSize
+            local ip = i.Position
+            local inM = ip.X >= ap.X and ip.X <= ap.X + as.X and ip.Y >= ap.Y and ip.Y <= ap.Y + as.Y
+            local bp = dropBtn.AbsolutePosition; local bs = dropBtn.AbsoluteSize
+            local inB = ip.X >= bp.X and ip.X <= bp.X + bs.X and ip.Y >= bp.Y and ip.Y <= bp.Y + bs.Y
+            if not inM and not inB then modal.Visible = false end
+        end))
+
         return {
             refresh = function(newV, clear)
                 values = newV
-                if clear then dropBtn.Text = "请选择"; if onChange then onChange(nil) end end
+                if clear then
+                    dropBtn.Text = "无人  v"
+                    if onChange then onChange(nil) end
+                end
                 draw()
             end,
         }
@@ -2430,7 +2589,7 @@ buildUI = function()
 
     local function addActionRow(parent, actions)
         local row = create("Frame", {
-            Size = UD2n(1, 0, 0, 34), BackgroundTransparency = 1,
+            Size = UD2n(1, 0, 0, 36), BackgroundTransparency = 1,
         }, parent)
         listLayout(row, 6, true)
         for _, a in ipairs(actions) do
@@ -2438,7 +2597,7 @@ buildUI = function()
                 Size = UD2n(1/#actions, -4, 1, 0),
                 BackgroundColor3 = a.color or Theme.SurfaceAlt,
                 BorderSizePixel = 0, Font = Font.GothamBold,
-                Text = a.label, TextColor3 = Theme.Text, TextSize = 12,
+                Text = a.label, TextColor3 = Theme.Text, TextSize = 13,
             }, row)
             corner(btn, 8); stroke(btn, Theme.Border, 1, 0.5)
             track(btn.MouseButton1Click:Connect(a.onClick))
@@ -2446,9 +2605,6 @@ buildUI = function()
         return row
     end
 
-    -- ============================================================
-    -- 各页
-    -- ============================================================
     local pages = {}
     for _, tab in ipairs(TABS) do pages[tab.id] = newPage("Page_" .. tab.id) end
 
@@ -2464,13 +2620,9 @@ buildUI = function()
     fastToggle = addToggle(pTr, "快速锻炼", State.fastTrain, function(v)
         State.fastTrain = v
         if v and State.autoTrain then State.autoTrain = false; trainToggle.set(false) end
-        if v then
-            cleanupTrainingState(); refreshRepSpeed()
-            if RepCache.pet < 100 then
-                notify(string.format("宠物反复不足 %d%%（综合 %.2fx）", RepCache.pet, RepCache.speedMul), 5)
-            end
-        else cleanupTrainingState() end
-    end, "自定义频率 + 自适应")
+        if v then cleanupTrainingState(); refreshRepSpeed() else cleanupTrainingState() end
+        -- ★ v25：不再阻止，即使反复不足也允许练，只在状态栏提示
+    end, "自定义频率 + 自适应（反复不足仍可练）")
     State.ui.rateBox = addInput(pTr, "频率（次/秒）", State.fastRate, 1, 50000, function(n)
         if State.adaptiveEnabled then
             if State.ui.rateBox then State.ui.rateBox.Text = tostring(State.fastRate) end
@@ -2513,7 +2665,7 @@ buildUI = function()
     local pTe = pages.tele
     sectionLabel(pTe, "自动传送")
     State.ui.teleToggle = addToggle(pTe, "循环前往肌肉之王", State.autoTeleport, function(v) State.autoTeleport = v end,
-        "每 0.05 秒传送一次，禁用重力")
+        "Boss 存在时自动暂停")
     addButton(pTe, "强制传送肌肉之王", function()
         teleportMuscleKing(true); notify("已传送", 2)
     end)
@@ -2524,7 +2676,7 @@ buildUI = function()
         AutomaticSize = Enum.AutomaticSize.Y,
     }, pTe)
     create("UIGridLayout", {
-        CellSize = UDim2.new(0.5, -4, 0, 32),
+        CellSize = UDim2.new(0.5, -4, 0, 34),
         CellPadding = UDim2.new(0, 8, 0, 6),
         SortOrder = E_SortL,
     }, grid)
@@ -2533,7 +2685,7 @@ buildUI = function()
             LayoutOrder = i, BackgroundColor3 = Theme.SurfaceAlt,
             BorderSizePixel = 0, Font = Font.GothamMedium,
             Text = tp.name, TextColor3 = Theme.Text,
-            TextSize = 11, TextTruncate = Enum.TextTruncate.AtEnd,
+            TextSize = 12, TextTruncate = Enum.TextTruncate.AtEnd,
         }, grid)
         corner(btn, 6); stroke(btn, Theme.Border, 1, 0.4)
         padding(btn, 0, 0, 8, 8)
@@ -2557,7 +2709,8 @@ buildUI = function()
     -- 杀戮
     local pKi = pages.kill
     sectionLabel(pKi, "全图杀戮")
-    addToggle(pKi, "开启全图杀戮", State.killEnabled, function(v) State.killEnabled = v end)
+    State.ui.killToggle = addToggle(pKi, "开启全图杀戮", State.killEnabled, function(v) State.killEnabled = v end,
+        "Boss 存在时自动暂停")
     addInput(pKi, "力量/耐久 阈值", State.killThreshold, 1, 100, function(n) State.killThreshold = n end,
         "自己力量 × 阈值 ≥ 目标耐久才击杀")
     divider(pKi)
@@ -2636,8 +2789,14 @@ buildUI = function()
         if not v and bossHoverConn then
             pcall(function() bossHoverConn:Disconnect() end); bossHoverConn = nil
         end
-    end, "自动扫描 + 悬停连拳 + 自动开箱")
+    end, "只在 Boss 存活时打；Boss 存在会暂停杀戮")
     addSlider(pBo, "悬停高度", 0, 200, State.bossHeight, function(v) State.bossHeight = v end)
+    divider(pBo)
+    sectionLabel(pBo, "自动宝箱（Boss 死后）")
+    addToggle(pBo, "自动开宝箱", State.autoChest, function(v) State.autoChest = v end,
+        "Boss 死后自动传送宝箱上方 + 长按 E")
+    addSlider(pBo, "宝箱延迟（秒）", 0, 30, State.chestDelay, function(v) State.chestDelay = v end)
+    addSlider(pBo, "长按 E 时间（秒）", 1, 10, State.chestHoldTime, function(v) State.chestHoldTime = v end)
 
     -- 设置
     local pSe = pages.set
@@ -2647,6 +2806,12 @@ buildUI = function()
     end)
     addSlider(pSe, "窗口高度比例(%)", 30, 90, State.uiHeightPct, function(v)
         State.uiHeightPct = v; applyUISize()
+    end)
+    addSlider(pSe, "主窗口不透明度(%)", 30, 100, math.floor(State.uiBgOpacity * 100), function(v)
+        State.uiBgOpacity = v / 100; applyUIOpacity()
+    end)
+    addSlider(pSe, "内容页不透明度(%)", 30, 100, math.floor(State.uiPageOpacity * 100), function(v)
+        State.uiPageOpacity = v / 100; applyUIOpacity()
     end)
     addActionRow(pSe, {
         { label = "重置窗口位置", onClick = function()
@@ -2659,6 +2824,12 @@ buildUI = function()
     State.ui.infoToggle = addToggle(pSe, "显示实时信息", State.infoWindowEnabled, function(v)
         State.infoWindowEnabled = v
         if State.ui.infoGui then State.ui.infoGui.Enabled = v end
+    end)
+    addSlider(pSe, "信息窗大小(%)", 60, 200, State.infoScale, function(v)
+        State.infoScale = v; applyUISize()
+    end)
+    addSlider(pSe, "信息窗不透明度(%)", 30, 100, math.floor(State.infoBgOpacity * 100), function(v)
+        State.infoBgOpacity = v / 100; applyUIOpacity()
     end)
     addToggle(pSe, "数字格式化显示", State.formatEnabled, function(v) State.formatEnabled = v end)
     divider(pSe)
@@ -2682,16 +2853,12 @@ buildUI = function()
     end)
 
     -- Tab 切换
-    local currentTab = "train"
     local function switchTab(id)
-        currentTab = id
         for tid, p in pairs(pages) do p.Visible = (tid == id) end
         for i, tab in ipairs(TABS) do
             local on = (tab.id == id)
             tabButtons[i].TextColor3 = on and C3(255, 255, 255) or Theme.TextDim
-            if on then
-                tabIndicator.Position = UD2n((i-1)/#TABS, 0, 0, 34)
-            end
+            if on then tabIndicator.Position = UD2n((i-1)/#TABS, 0, 0, 34) end
         end
     end
     for i, btn in ipairs(tabButtons) do
@@ -2721,7 +2888,6 @@ buildUI = function()
         if input.UserInputType == E_UI_MB1 or input.UserInputType == E_UI_Touch then dragging = false end
     end))
 
-    -- 最小化 / 隐藏 / 关闭
     local minimized = false
     track(minBtn.MouseButton1Click:Connect(function()
         minimized = not minimized
@@ -2735,14 +2901,12 @@ buildUI = function()
             minBtn.Text = "-"
         end
     end))
-
     track(hideBtn.MouseButton1Click:Connect(function()
         main.Visible = false
         if State.ui.restoreBtn then State.ui.restoreBtn.Visible = true end
     end))
     track(closeBtn.MouseButton1Click:Connect(destroy))
 
-    -- 恢复悬浮按钮
     local restore = create("TextButton", {
         Name = "RestoreBtn", AnchorPoint = V2n(0.5, 0.5),
         Position = UD2s(0.5, 0.5), Size = UD2o(130, 40),
@@ -2758,16 +2922,15 @@ buildUI = function()
     end))
 
     applyUISize()
+    applyUIOpacity()
 end
 
--- ============================================================
--- 启动
--- ============================================================
 loadConfig()
 buildUI()
 buildInfoWindow()
 buildResetButton()
 applyUISize()
+applyUIOpacity()
 
 if State.ui.rateBox then
     State.ui.rateBox.TextEditable = not State.adaptiveEnabled
@@ -2791,7 +2954,8 @@ track(LocalPlayer.CharacterAdded:Connect(function()
     State.dualCurrentMode = "punch"
     State.muscleEventRef = nil; State.rebirthEventRef = nil
     PortalCache = nil; PortalCacheAt = 0
-    State._lastSuicide = 0; State._suicideCount = 0
+    State._missingSince = 0; State._lastSuicide = 0; State._suicideCount = 0
+    State.bossKilledAt = 0; State.bossWasAlive = false
     table.clear(RenderCull.hidden)
     table.clear(PetHider.own); table.clear(PetHider.all); table.clear(PetHider.machines)
 end))
